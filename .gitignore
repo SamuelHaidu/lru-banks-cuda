@@ -28,7 +28,6 @@ tokenizers/
 *.npz
 *.bin
 *.parquet
-uv.lock
 
 # Pre-refactor codebase, kept on disk for reference only
 archive/
