@@ -1,0 +1,993 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rnn-research</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --page:#F6F7F9; --surface:#FFFFFF; --ink:#1C2026; --muted:#6B7380; --faint:#9AA1AC; --line:#E2E5EA;
+    --accent:#0E7068; --accent-soft:#E3F1EF; --bubble:#EEF0F3; --code:#F3F4F6;
+    --sans:"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; font:15px/1.6 var(--sans); color:var(--ink); background:var(--page); display:flex; flex-direction:column; }
+  button, input, select, textarea { font:inherit; color:inherit; }
+  button { cursor:pointer; border:0; background:none; padding:0; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .muted { color:var(--muted); }
+  [hidden] { display:none !important; }
+
+  /* top bar */
+  .bar { height:52px; flex:0 0 auto; display:flex; align-items:center; gap:14px; padding:0 18px; background:var(--surface);
+         border-bottom:1px solid var(--line); position:relative; z-index:5; }
+  .brand { font-weight:600; letter-spacing:-.01em; margin-right:6px; }
+  .picker { position:relative; }
+  .model-btn { display:flex; align-items:baseline; gap:8px; padding:6px 10px; border-radius:8px; max-width:420px; }
+  .model-btn:hover, .model-btn[aria-expanded="true"] { background:var(--page); }
+  .model-btn b { font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .model-btn span { font-size:13px; white-space:nowrap; }
+  .caret { color:var(--faint); font-size:11px; }
+  .pop { position:absolute; top:44px; left:0; width:440px; background:var(--surface); border:1px solid var(--line);
+         border-radius:10px; box-shadow:0 12px 32px rgba(28,32,38,.12); padding:8px; }
+  .pop input { width:100%; border:1px solid var(--line); border-radius:8px; padding:7px 10px; outline:none; }
+  .pop input:focus { border-color:var(--accent); }
+  .run-list { max-height:360px; overflow-y:auto; margin-top:6px; }
+  .run { display:block; width:100%; text-align:left; padding:7px 10px; border-radius:6px; }
+  .run:hover, .run.active { background:var(--page); }
+  .run.current b { color:var(--accent); }
+  .run b { font-weight:500; display:block; } .run span { font-size:12.5px; color:var(--muted); }
+  .ckpt { border:1px solid var(--line); border-radius:8px; padding:4px 8px; background:var(--surface); font-size:13.5px; }
+  .seg { display:flex; background:var(--page); border-radius:8px; padding:3px; margin-left:auto; }
+  .seg button { padding:4px 14px; border-radius:6px; font-size:14px; color:var(--muted); }
+  .seg button.on { background:var(--surface); color:var(--ink); box-shadow:0 1px 2px rgba(28,32,38,.08); }
+  .seg button:disabled { opacity:.4; cursor:default; }
+  .ghost { padding:6px 10px; border-radius:8px; font-size:14px; color:var(--muted); }
+  .ghost:hover, .ghost.on { background:var(--page); color:var(--ink); }
+
+  /* layout */
+  .body { flex:1; min-height:0; display:flex; }
+  .view { flex:1; min-width:0; display:flex; flex-direction:column; }
+  .drawer { width:340px; flex:0 0 auto; background:var(--surface); border-left:1px solid var(--line); overflow-y:auto; padding:6px 18px 24px; }
+
+  /* chat */
+  .scroll { flex:1; overflow-y:auto; }
+  .col { max-width:780px; margin:0 auto; padding:28px 24px 12px; }
+  .empty { padding-top:12vh; }
+  .empty h1 { font-size:24px; font-weight:500; letter-spacing:-.015em; margin:0 0 6px; }
+  .empty p { margin:0 0 22px; color:var(--muted); }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { text-align:left; padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:var(--surface);
+          font-size:14px; max-width:100%; }
+  .chip:hover { border-color:var(--accent); }
+  .context { font-size:13px; color:var(--muted); margin-bottom:22px; }
+  .context details { display:inline-block; margin-right:14px; }
+  .context summary { cursor:pointer; list-style:none; } .context summary::after { content:" \25BE"; color:var(--faint); }
+  .context pre { font:12.5px/1.5 var(--mono); white-space:pre-wrap; background:var(--code); border-radius:8px; padding:10px 12px;
+                 margin:8px 0 0; color:var(--ink); }
+  .msg { margin:0 0 22px; white-space:pre-wrap; word-wrap:break-word; }
+  .msg.user { display:flex; justify-content:flex-end; }
+  .bubble { background:var(--bubble); padding:9px 14px; border-radius:16px; max-width:82%; }
+  .msg.user .edit { align-self:center; margin-right:6px; font-size:13px; padding:4px 8px; opacity:0; }
+  .msg.user:hover .edit, .msg.user .edit:focus-visible { opacity:1; }
+  @media (hover: none) { .msg.user .edit { opacity:1; } }
+  .edit-box { width:82%; background:var(--surface); border:1px solid var(--accent); border-radius:14px; padding:10px 12px 8px; }
+  .edit-box textarea { width:100%; border:0; outline:none; resize:vertical; background:none; line-height:1.5; min-height:48px; }
+  .edit-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:6px; }
+  .think { color:var(--muted); font-size:14px; margin:0 0 8px; }
+  .think summary { cursor:pointer; list-style:none; } .think summary::before { content:"\25B8  "; } .think[open] summary::before { content:"\25BE  "; }
+  .think div { border-left:2px solid var(--line); padding:2px 0 2px 12px; margin-top:4px; }
+  .call, .result { font:13px/1.55 var(--mono); border-radius:8px; padding:8px 12px; margin:6px 0; white-space:pre-wrap; }
+  .call { background:var(--accent-soft); color:#0B4F49; }
+  .result { background:var(--code); color:#3D4450; max-height:260px; overflow:auto; }
+  .call i, .result i { display:block; font:500 12px var(--sans); font-style:normal; color:var(--muted); margin-bottom:2px; }
+  .cursor::after { content:""; display:inline-block; width:7px; height:15px; background:var(--accent); vertical-align:-2px;
+                   margin-left:2px; animation:blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  @media (prefers-reduced-motion: reduce) { .cursor::after { animation:none; } }
+  .turn-actions { display:flex; align-items:center; gap:12px; margin:-12px 0 22px; font-size:13px; color:var(--muted); }
+  .turn-actions .ghost { font-size:13px; padding:4px 8px; margin-left:-8px; }
+  .turn-actions input { width:56px; border:1px solid var(--line); border-radius:6px; padding:2px 6px; background:var(--surface); }
+  .cmp textarea { width:100%; border:1px solid var(--line); border-radius:12px; padding:12px 14px; line-height:1.55;
+                  resize:vertical; background:var(--surface); outline:none; font-size:15px; }
+  .cmp textarea:focus { border-color:#C5CBD3; }
+  .cbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }
+  .cbar .ghost:disabled { opacity:.45; cursor:default; }
+  .cset { margin-left:auto; display:flex; flex-wrap:wrap; gap:12px; font-size:13px; color:var(--muted); }
+  .cset input { width:58px; border:1px solid var(--line); border-radius:6px; padding:2px 6px; background:var(--surface); margin-left:4px; }
+  .cout { white-space:pre-wrap; word-wrap:break-word; line-height:1.7; font-size:15.5px; }
+  .cout .p { color:var(--muted); }
+  .cstart { margin-top:26px; } .cstart p { font-size:13px; margin:0 0 8px; }
+  .cstart h4 { font-size:12.5px; font-weight:500; color:var(--muted); margin:12px 0 6px; }
+  .raw { font:13px/1.6 var(--mono); white-space:pre-wrap; color:var(--muted); }
+  .composer-wrap { padding:0 24px 14px; }
+  .composer { max-width:780px; margin:0 auto; display:flex; align-items:flex-end; gap:8px; background:var(--surface);
+              border:1px solid var(--line); border-radius:14px; padding:8px 8px 8px 16px; box-shadow:0 2px 10px rgba(28,32,38,.05); }
+  .composer:focus-within { border-color:#C5CBD3; }
+  .composer textarea { flex:1; border:0; outline:none; resize:none; background:none; padding:6px 0; max-height:220px; line-height:1.5; }
+  .send { background:var(--ink); color:#fff; border-radius:10px; padding:7px 14px; font-size:14px; font-weight:500; }
+  .send:disabled { background:#C9CED6; cursor:default; }
+  .stop { border:1px solid var(--line); border-radius:10px; padding:6px 13px; font-size:14px; }
+  .status { max-width:780px; margin:6px auto 0; font-size:12.5px; color:var(--faint); min-height:18px; padding-left:4px; }
+
+  /* setup drawer */
+  .drawer details { border-bottom:1px solid var(--line); padding:10px 0; }
+  .drawer details:last-of-type { border-bottom:0; }
+  .drawer summary { cursor:pointer; font-weight:500; list-style:none; display:flex; justify-content:space-between; }
+  .drawer summary::after { content:"+"; color:var(--faint); } .drawer details[open] summary::after { content:"\2212"; }
+  .drawer .inner { padding-top:8px; font-size:14px; }
+  .field { display:block; margin:8px 0; } .field > span { display:block; font-size:13px; color:var(--muted); margin-bottom:3px; }
+  .field select, .field textarea, .field input { width:100%; border:1px solid var(--line); border-radius:8px; padding:6px 9px; background:var(--surface); }
+  .field textarea { resize:vertical; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 10px; }
+  .tool { display:flex; gap:8px; align-items:flex-start; padding:3px 0; font-size:13.5px; cursor:pointer; }
+  .tool input { margin-top:4px; accent-color:var(--accent); }
+  .tool code { font:12.5px var(--mono); }
+  .tool .desc { color:var(--muted); display:block; font-size:12.5px; line-height:1.4; }
+  .ex { display:block; width:100%; text-align:left; padding:6px 8px; border-radius:6px; font-size:13.5px; line-height:1.4; }
+  .ex:hover { background:var(--page); }
+  .small-btn { border:1px solid var(--line); border-radius:8px; padding:4px 10px; font-size:13px; background:var(--surface); }
+  .small-btn:hover { border-color:var(--accent); }
+  .files div { font:12.5px var(--mono); padding:2px 0; cursor:pointer; } .files div:hover { color:var(--accent); }
+  .view-box { font:12px/1.5 var(--mono); background:var(--code); border-radius:8px; padding:8px 10px; white-space:pre-wrap;
+              max-height:200px; overflow:auto; margin:8px 0 0; }
+
+  /* inspect */
+  .ins { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0, 1fr) 360px; }
+  .ins-main { min-width:0; display:flex; flex-direction:column; padding:16px 22px 16px; gap:10px; }
+  .ins-source { display:flex; gap:8px; align-items:flex-start; }
+  .ins-source textarea { flex:1; border:1px solid var(--line); border-radius:10px; padding:8px 12px; resize:vertical;
+                         font:13px/1.5 var(--mono); background:var(--surface); min-height:42px; }
+  .ins-source select { border:1px solid var(--line); border-radius:8px; padding:6px 8px; background:var(--surface); max-width:280px; }
+  .primary { background:var(--accent); color:#fff; border-radius:8px; padding:7px 14px; font-weight:500; font-size:14px; }
+  .ins-controls { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  .ins-controls .seg { margin-left:0; }
+  .ins-controls label { font-size:13.5px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  .ins-controls select, .ins-controls input { border:1px solid var(--line); border-radius:8px; padding:3px 8px; background:var(--surface); }
+  .ins-controls input { width:64px; }
+  .summary { font-size:14px; color:var(--muted); min-height:22px; }
+  .summary b { color:var(--ink); font-weight:500; }
+  .tokens { flex:1; min-height:0; overflow-y:auto; background:var(--surface); border:1px solid var(--line); border-radius:10px;
+            padding:14px 16px; font:13.5px/2 var(--mono); }
+  .tk { white-space:pre-wrap; border-radius:3px; cursor:pointer; padding:1px 0; }
+  .tk.tag { color:var(--faint); font-size:12px; }
+  .tk.after { opacity:.35; }
+  .tk.sel { outline:2px solid var(--ink); outline-offset:1px; }
+  .tk.mem { color:#A0A6B0; cursor:default; }
+  .tk.off { color:#9AA1AC; }
+  .legend { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--muted); }
+  .legend i { display:inline-block; width:90px; height:8px; border-radius:4px; }
+  .side { border-left:1px solid var(--line); background:var(--surface); overflow-y:auto; padding:18px 20px; font-size:14px; }
+  .side h3 { font-size:13px; font-weight:600; margin:22px 0 8px; color:var(--ink); }
+  .side h3:first-child { margin-top:0; }
+  .big-tok { font:500 20px var(--mono); white-space:pre; background:var(--page); border-radius:8px; padding:2px 10px; display:inline-block; }
+  .facts { color:var(--muted); font-size:13.5px; margin-top:6px; } .facts b { color:var(--ink); font-weight:500; }
+  .pill { font:12.5px var(--mono); background:var(--page); border-radius:5px; padding:1px 6px; margin:2px 3px 2px 0;
+          display:inline-block; white-space:pre; }
+  .pill.hit { background:var(--accent-soft); color:#0B4F49; }
+  button.pill:hover { background:var(--line); }
+  .lens { width:100%; border-collapse:collapse; font-size:13px; }
+  .lens td { padding:5px 0; vertical-align:top; border-top:1px solid var(--page); }
+  .lens td:first-child { color:var(--muted); width:74px; white-space:nowrap; padding-right:8px; }
+  .lens tr.final td { font-weight:500; }
+  .cand { display:flex; align-items:center; gap:8px; }
+  .cand .pill { margin:0; min-width:0; overflow:hidden; text-overflow:ellipsis; max-width:150px; }
+  .cand .bar { flex:1; height:4px; background:var(--page); border-radius:2px; position:relative; }
+  .cand .bar i { position:absolute; left:0; top:0; bottom:0; background:var(--faint); border-radius:2px; }
+  .cand .p { width:38px; text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .note { color:var(--muted); font-size:13.5px; }
+  .agrid { display:grid; gap:3px; font:11.5px var(--mono); }
+  .agrid .hd { color:var(--muted); text-align:center; font-size:11px; font-family:inherit; }
+  .agrid .ln { color:var(--muted); font-size:11px; align-self:center; }
+  .acell { border:1px solid var(--line); border-radius:5px; padding:2px 4px; background:var(--surface); min-width:0; text-align:left; }
+  .acell:hover { border-color:var(--accent); }
+  .acell.on { border-color:var(--accent); background:var(--accent-soft); }
+  .acell .tt { display:block; white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  .acell .pc { color:var(--muted); font-size:10.5px; }
+  .asplit { display:flex; height:3px; border-radius:2px; overflow:hidden; margin-top:2px; background:var(--page); }
+  .asplit i:nth-child(1) { background:#0E7068; } .asplit i:nth-child(2) { background:#7FBFB8; } .asplit i:nth-child(3) { background:#C9CDD3; }
+  @media (max-width: 1100px) { .ins { grid-template-columns:1fr; } .side { border-left:0; border-top:1px solid var(--line); max-height:45vh; } }
+  @media (max-width: 900px) { .drawer { position:fixed; right:0; top:52px; bottom:0; z-index:4; box-shadow:-8px 0 24px rgba(28,32,38,.1); }
+                              .model-btn span { display:none; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">rnn-research</div>
+  <div class="picker">
+    <button id="modelBtn" class="model-btn" aria-haspopup="listbox" aria-expanded="false">
+      <b id="modelName">Choose a model</b><span id="modelMeta" class="muted"></span><span class="caret">&#9662;</span></button>
+    <div id="modelPop" class="pop" hidden>
+      <input id="modelSearch" placeholder="Search runs, archs, datasets" autocomplete="off">
+      <div id="runList" class="run-list" role="listbox"></div>
+    </div>
+  </div>
+  <select id="ckpt" class="ckpt" title="Checkpoint"></select>
+  <nav class="seg"><button id="tabChat" class="on">Chat</button><button id="tabComplete">Complete</button><button id="tabInspect">Inspect</button></nav>
+  <button id="newChat" class="ghost">New chat</button>
+  <button id="setupBtn" class="ghost on" aria-pressed="true">Setup</button>
+</header>
+
+<div class="body">
+  <section id="chatView" class="view">
+    <div id="chatScroll" class="scroll"><div id="msgs" class="col"></div></div>
+    <div class="composer-wrap">
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Message the model"></textarea>
+        <button id="stop" class="stop" hidden>Stop</button>
+        <button id="send" class="send">Send</button>
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+  </section>
+
+  <section id="completeView" class="view" hidden>
+    <div class="scroll"><div class="col cmp">
+      <textarea id="cPrompt" rows="5" placeholder="Write the beginning of a text. The model continues it (Ctrl+Enter)."></textarea>
+      <div class="cbar">
+        <button id="cGen" class="send">Generate</button><button id="cStop" class="stop" hidden>Stop</button>
+        <button id="cCont" class="ghost" disabled title="Generate more after the text so far">Continue</button>
+        <button id="cRegen" class="ghost" disabled title="Sample a new continuation of the same prompt">Regenerate</button>
+        <button id="cUse" class="ghost" disabled title="Put the prompt and the continuation in the box to edit">Edit as prompt</button>
+        <span class="cset">
+          <label>Temperature <input id="cTemp" type="number" step="0.1" min="0" value="0.8"></label>
+          <label>Top-k <input id="cTopk" type="number" min="0" value="50"></label>
+          <label>Repetition <input id="cRep" type="number" step="0.05" min="1" value="1.1"></label>
+          <label>Max tokens <input id="cMax" type="number" min="1" value="256"></label>
+        </span>
+      </div>
+      <div id="cOut" class="cout"></div>
+      <div id="cStatus" class="status" style="margin:6px 0 0; padding:0"></div>
+      <div id="cStartWrap" class="cstart"><p class="muted">Or start from the beginning of a validation text</p><div id="cStarters"></div></div>
+    </div></div>
+  </section>
+
+  <section id="inspectView" class="view" hidden>
+    <div class="ins">
+      <div class="ins-main">
+        <div class="ins-source">
+          <textarea id="insText" rows="1" placeholder="Paste a document to inspect (tags like <user> are kept), or load one"></textarea>
+          <select id="insDoc"><option value="">Load a validation document</option></select>
+          <button id="insFromChat" class="small-btn" style="padding:7px 10px">Use this chat</button>
+          <button id="insRun" class="primary">Inspect</button>
+        </div>
+        <div class="ins-controls">
+          <nav class="seg" id="insMode">
+            <button data-mode="loss" class="on">Loss</button><button data-mode="stored">Stored</button><button data-mode="recall">Recall</button><button data-mode="attention" hidden>Attention</button>
+          </nav>
+          <label hidden>Layer <select id="insLayer"></select></label>
+          <label id="headWrap" hidden>Head <select id="insHead"></select></label>
+          <label id="measureWrap" hidden>Show <select id="insMeasure"><option value="share">share of the read</option><option value="c">weight on the value</option></select></label>
+          <label id="hideWrap" hidden>Ignore the last <input id="insHide" type="number" min="0" value="8"> tokens</label>
+          <span id="legend" class="legend"></span>
+        </div>
+        <div id="insSummary" class="summary">Inspect a document to see how the model predicts it, what its states hold, and what it reads from its memories.</div>
+        <div id="insTokens" class="tokens"></div>
+      </div>
+      <aside id="insSide" class="side"><p class="note">Select a token to see its prediction.</p></aside>
+    </div>
+  </section>
+
+  <aside id="setup" class="drawer">
+    <details open><summary>System prompt</summary><div class="inner">
+      <label class="field"><span>Preset</span><select id="sysPreset"></select></label>
+      <label class="field"><textarea id="sys" rows="3" placeholder="No system prompt"></textarea></label>
+    </div></details>
+    <details open><summary>Tools</summary><div class="inner">
+      <label class="field"><span>Set</span><select id="toolSet"></select></label>
+      <div id="tools"></div>
+      <details style="border:0; padding:6px 0 0"><summary class="muted" style="font-weight:400; font-size:13.5px">Atum09 tools (the model thinks with these)</summary>
+        <div id="atumTools" style="padding-top:4px"></div></details>
+      <details style="border:0; padding:6px 0 0"><summary class="muted" style="font-weight:400; font-size:13.5px">Unneeded tools to list</summary>
+        <div id="decoys" style="padding-top:4px"></div></details>
+    </div></details>
+    <details><summary>Example requests</summary><div class="inner">
+      <label class="field"><select id="exCat"></select></label>
+      <div id="examples"></div>
+    </div></details>
+    <details><summary>Generation</summary><div class="inner grid2">
+      <label class="field"><span>Temperature</span><input id="temp" type="number" step="0.1" min="0" value="0"></label>
+      <label class="field"><span>Top-k</span><input id="topk" type="number" min="0" value="0"></label>
+      <label class="field"><span>Max new tokens</span><input id="maxtok" type="number" min="1" value="300"></label>
+      <label class="field"><span>Repetition penalty</span><input id="rep" type="number" step="0.05" min="1" value="1"></label>
+      <label class="field"><span>Tool rounds per turn</span><input id="rounds" type="number" min="0" value="4"></label>
+    </div></details>
+    <details><summary>Workspace</summary><div class="inner">
+      <p class="note" style="margin:0 0 6px">Files the simulated shell tools see.</p>
+      <div id="files" class="files"></div>
+      <pre id="fileView" class="view-box" hidden></pre>
+      <p style="margin:10px 0 4px"><button id="resetFs" class="small-btn">New random workspace</button></p>
+      <p class="note" style="margin:14px 0 4px">Saved memories (memory tools)</p>
+      <pre id="memory" class="view-box"></pre>
+      <p style="margin:8px 0 0"><button id="clearMem" class="small-btn">Clear memories</button></p>
+    </div></details>
+    <details><summary>Raw document</summary><div class="inner">
+      <p class="note" style="margin:0 0 8px">The exact text the model reads, special tags included.</p>
+      <button id="rawBtn" class="small-btn">Show raw document</button>
+    </div></details>
+  </aside>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const showTok = s => s.replace(/\n/g, "↵\n").replace(/\t/g, "→");
+let runs = [], current = null, presets = null, header = null, doc = "", busy = false, abort = null, rawMode = false;
+let editing = null, editDraft = "";  // the user message being edited (its index in the conversation) and its text
+const IMPLEMENTED = new Set(["run","read_file","write_file","calculator","python","memory_save","memory_search",
+  "memory_store","memory_recall","remember","recall","save_note","get_note"]);
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"},
+                                                           body:JSON.stringify(body)});
+  return r.json();
+}
+
+// ---------- model picker ----------
+async function init() {
+  runs = await api("/api/runs");
+  const saved = localStorage.getItem("run");
+  const pick = runs.find(r => r.run === saved) || runs.find(r => r.arch.startsWith("min-gru")) || runs[0];
+  if (pick) await selectRun(pick.run, localStorage.getItem("ckpt:" + pick.run));
+  refreshWorkspace();
+}
+
+function renderRunList() {
+  const q = $("modelSearch").value.trim().toLowerCase();
+  const list = runs.filter(r => !q || `${r.run} ${r.arch} ${r.dataset}`.toLowerCase().includes(q));
+  $("runList").innerHTML = list.map((r, i) => `<button class="run${i === 0 ? " active" : ""}${current && r.run === current.run ? " current" : ""}"
+      role="option" data-run="${esc(r.run)}"><b>${esc(r.run)}</b><span>${esc(r.arch)}, ${esc(r.dataset)}, ${r.checkpoints.length} checkpoint${r.checkpoints.length > 1 ? "s" : ""}</span></button>`).join("")
+    || `<p class="note" style="padding:6px 10px">No run matches "${esc(q)}".</p>`;
+  $("runList").querySelectorAll(".run").forEach(b => b.onclick = () => { closePicker(); selectRun(b.dataset.run); });
+}
+function openPicker() { $("modelPop").hidden = false; $("modelBtn").setAttribute("aria-expanded", "true");
+  $("modelSearch").value = ""; renderRunList(); $("modelSearch").focus(); }
+function closePicker() { $("modelPop").hidden = true; $("modelBtn").setAttribute("aria-expanded", "false"); }
+$("modelBtn").onclick = () => $("modelPop").hidden ? openPicker() : closePicker();
+$("modelSearch").oninput = renderRunList;
+$("modelSearch").onkeydown = e => {
+  const items = [...$("runList").querySelectorAll(".run")]; let i = items.findIndex(x => x.classList.contains("active"));
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); items[i]?.classList.remove("active");
+    i = Math.max(0, Math.min(items.length - 1, i + (e.key === "ArrowDown" ? 1 : -1))); items[i]?.classList.add("active"); items[i]?.scrollIntoView({block:"nearest"}); }
+  if (e.key === "Enter" && items[i]) { closePicker(); selectRun(items[i].dataset.run); }
+  if (e.key === "Escape") closePicker();
+};
+document.addEventListener("click", e => { if (!e.target.closest(".picker")) closePicker(); });
+
+async function selectRun(name, ckpt) {
+  const r = runs.find(x => x.run === name); if (!r) return;
+  const changed = !current || current.run !== r.run;
+  current = r; localStorage.setItem("run", r.run);
+  $("modelName").textContent = r.run; $("modelMeta").textContent = r.arch;
+  $("ckpt").innerHTML = r.checkpoints.map(c => `<option value="${esc(c)}">${c === "latest" ? "latest" : c === "best" ? "best" : "epoch " + esc(c)}</option>`).join("");
+  if (ckpt && r.checkpoints.includes(ckpt)) $("ckpt").value = ckpt;
+  if (!changed) return;
+  presets = await api("/api/presets?dataset=" + encodeURIComponent(r.dataset));
+  const opts = ['<option value="">No system prompt</option>'];
+  for (const [kind, list] of Object.entries(presets.system))
+    opts.push(`<optgroup label="${esc(kind)}">` + list.map(s => `<option value="${esc(s)}">${esc(s.slice(0, 64))}${s.length > 64 ? "..." : ""}</option>`).join("") + "</optgroup>");
+  $("sysPreset").innerHTML = opts.join("");
+  $("toolSet").innerHTML = Object.keys(presets.tool_sets).map(k => `<option>${esc(k)}</option>`).join("");
+  $("tools").innerHTML = Object.entries(presets.tool_lines).map(([name, line]) =>
+    `<label class="tool"><input type="checkbox" data-line="${esc(line)}" data-name="${esc(name)}"><span><code>${esc(name)}</code>
+     <span class="desc">${esc(line.split("): ")[1] || "")}${IMPLEMENTED.has(name) ? "" : " (not available here)"}</span></span></label>`).join("");
+  const atumOk = new Set(presets.atum_implemented || []);
+  $("atumTools").innerHTML = Object.entries(presets.atum_tool_lines || {}).map(([name, line]) =>
+    `<label class="tool"><input type="checkbox" data-line="${esc(line)}" data-name="atum:${esc(name)}"><span><code>${esc(name)}</code>
+     <span class="desc">${esc(line.split("): ")[1] || "")}${atumOk.has(name) ? "" : " (not available here)"}</span></span></label>`).join("");
+  $("decoys").innerHTML = presets.decoys.map(line =>
+    `<label class="tool"><input type="checkbox" data-line="${esc(line)}"><span><code>${esc(line.split("(")[0])}</code>
+     <span class="desc">${esc(line.split("): ")[1] || "")}</span></span></label>`).join("");
+  $("toolSet").value = "shell + files + code"; applyToolSet();
+  const cats = {...presets.examples};
+  for (const [k, v] of Object.entries(presets.data_examples || {})) cats["From the data: " + k] = v;
+  presets.allExamples = cats;
+  $("exCat").innerHTML = Object.keys(cats).map(k => `<option>${esc(k)}</option>`).join("");
+  showExamples(); newChat(); insDocs = {}; if (!$("inspectView").hidden) loadDocList();
+  // completion runs (pretraining text): no chat; Inspect for min-gru and gated-deltanet runs
+  const completion = r.mode === "completion";
+  $("tabChat").hidden = completion; $("tabInspect").hidden = !r.inspect;
+  cBase = cGen = ""; renderC(false); loadStarters();
+  if (completion && !$("chatView").hidden || !r.inspect && !$("inspectView").hidden) { setTab("complete"); forcedComplete = true; }
+  else if (!completion && forcedComplete && !$("completeView").hidden) setTab("chat");
+  if (!completion) forcedComplete = false;
+}
+$("ckpt").onchange = () => { if (current) localStorage.setItem("ckpt:" + current.run, $("ckpt").value); newChat(); };
+
+function applyToolSet() {
+  const want = new Set(presets.tool_sets[$("toolSet").value] || []);
+  document.querySelectorAll("#tools input, #atumTools input").forEach(cb => cb.checked = want.has(cb.dataset.name));
+  if ([...want].some(n => n.startsWith("atum:"))) $("atumTools").closest("details").open = true;
+}
+function showExamples() {
+  const list = presets.allExamples[$("exCat").value] || [];
+  $("examples").innerHTML = list.map(t => `<button class="ex">${esc(t)}</button>`).join("");
+  $("examples").querySelectorAll("button").forEach((b, i) => b.onclick = () => useExample(list[i]));
+}
+function useExample(t) { $("input").value = t; grow(); $("input").focus(); }
+
+async function refreshWorkspace() {
+  const w = await api("/api/workspace");
+  $("files").innerHTML = Object.keys(w.files).map(p => `<div data-p="${esc(p)}">~/${esc(p)}</div>`).join("") || '<p class="note">No files.</p>';
+  $("files").querySelectorAll("div[data-p]").forEach(d => d.onclick = () => {
+    $("fileView").hidden = false; $("fileView").textContent = `~/${d.dataset.p}\n\n` + w.files[d.dataset.p]; });
+  $("memory").textContent = Object.keys(w.memory).length ? Object.entries(w.memory).map(([k, v]) => `${k}: ${v}`).join("\n") : "Nothing saved.";
+}
+
+// ---------- the conversation ----------
+function buildHeader() {
+  const sys = $("sys").value.trim();
+  const lines = [...document.querySelectorAll("#tools input:checked, #atumTools input:checked, #decoys input:checked")].map(cb => cb.dataset.line);
+  let h = "<bos>";
+  if (sys) h += `<system>${sys}</system>`;
+  if (lines.length) h += "<tools>\n" + lines.join("\n") + "\n</tools>";
+  return h;
+}
+
+function render(streaming) {
+  const box = $("msgs");
+  if (rawMode) { box.innerHTML = `<div class="raw">${esc(doc || buildHeader())}</div>`; return; }
+  const h = header || buildHeader();
+  const sys = (h.match(/<system>([\s\S]*?)<\/system>/) || [])[1];
+  const tools = (h.match(/<tools>\n([\s\S]*?)<\/tools>/) || [])[1];
+  const names = tools ? tools.trim().split("\n").map(l => l.split("(")[0]) : [];
+  const context = `<div class="context">${sys ? `<details><summary>System prompt</summary><pre>${esc(sys)}</pre></details>` : "No system prompt"}
+    ${names.length ? `<details><summary>${names.length} tool${names.length > 1 ? "s" : ""}: ${esc(names.join(", "))}</summary><pre>${esc(tools.trim())}</pre></details>` : "<span>No tools</span>"}</div>`;
+  if (!header) {
+    const ex = presets ? Object.values(presets.allExamples)[0] || [] : [];
+    box.innerHTML = `<div class="empty"><h1>${current ? esc(current.run) : "No model"}</h1>
+      <p>${current ? `${esc(current.arch)} trained on ${esc(current.dataset)}. The system prompt and tools from Setup are fixed when you send the first message.` : ""}</p>
+      ${context}<div class="chips">${ex.slice(0, 4).map((t, i) => `<button class="chip" data-i="${i}">${esc(t)}</button>`).join("")}</div></div>`;
+    box.querySelectorAll(".chip").forEach(b => b.onclick = () => useExample(ex[+b.dataset.i]));
+    return;
+  }
+  let html = context;
+  const parts = doc.slice(header.length).split(/(<\/?(?:user|assistant|think|call|result)>|<eos>)/);
+  let where = null, buf = "", inner = "", nUser = 0;
+  const text = () => { if (buf.trim()) inner += `<div>${esc(buf.replace(/^\n+/, ""))}</div>`; buf = ""; };
+  for (const p of parts) {
+    if (!p) continue;
+    if (p === "<user>") { where = "user"; buf = ""; }
+    else if (p === "</user>") {
+      const n = nUser++;
+      if (editing === n) html += `<div class="msg user"><div class="edit-box"><textarea id="editText" rows="3" aria-label="Edit message">${esc(editDraft)}</textarea>
+        <div class="edit-actions"><button id="editCancel" class="stop">Cancel</button><button id="editSave" class="send">Send</button></div></div></div>`;
+      else html += `<div class="msg user">${streaming || busy ? "" : `<button class="edit ghost" data-u="${n}" title="Edit this message and answer it again (the conversation after it is dropped)">Edit</button>`}<div class="bubble">${esc(buf)}</div></div>`;
+      buf = ""; where = null;
+    }
+    else if (p === "<assistant>") { where = "assistant"; inner = ""; buf = ""; }
+    else if (p === "</assistant>") { text(); if (inner) html += `<div class="msg">${inner}</div>`; inner = ""; where = null; }
+    else if (p === "<think>") { text(); where = "think"; }
+    else if (p === "</think>") { inner += `<details class="think"><summary>Thought</summary><div>${esc(buf)}</div></details>`; buf = ""; where = "assistant"; }
+    else if (p === "<call>") { text(); where = "call"; }
+    else if (p === "</call>") { inner += `<div class="call"><i>Tool call</i>${esc(buf)}</div>`; buf = ""; where = "assistant"; }
+    else if (p === "<result>") { if (inner) { html += `<div class="msg">${inner}</div>`; inner = ""; } where = "result"; buf = ""; }
+    else if (p === "</result>") { html += `<div class="msg"><div class="result"><i>Result</i>${esc(buf)}</div></div>`; buf = ""; where = null; }
+    else if (p === "<eos>") { html += `<p class="note">End of conversation.</p>`; }
+    else buf += p;
+  }
+  if (where) {  // the turn being written
+    if (where === "think") inner += `<details class="think" open><summary>Thinking</summary><div class="cursor">${esc(buf)}</div></details>`;
+    else if (where === "call") inner += `<div class="call cursor"><i>Tool call</i>${esc(buf)}</div>`;
+    else if (where === "assistant") { inner += `<div class="${streaming ? "cursor" : ""}">${esc(buf.replace(/^\n+/, ""))}</div>`; buf = ""; }
+    if (where !== "user" && where !== "result") html += `<div class="msg">${inner}</div>`;
+  }
+  // after the last reply: answer the last message again (sampled at the temperature; at 0 it is greedy: the same reply)
+  const canRegen = !streaming && !busy && editing === null && doc.lastIndexOf("</user>") > doc.lastIndexOf("<user>") && doc.lastIndexOf("</user>") >= 0;
+  if (canRegen) html += `<div class="turn-actions"><button id="regen" class="ghost" title="Discard the reply after your last message and sample a new one">Regenerate</button>
+    <label>Temperature <input id="regenTemp" type="number" step="0.1" min="0" value="${esc($("temp").value)}"></label>
+    ${+$("temp").value > 0 ? "" : "<span>greedy: the same reply; raise it to sample</span>"}</div>`;
+  box.innerHTML = html;
+  box.querySelectorAll(".edit").forEach(b => b.onclick = () => startEdit(+b.dataset.u));
+  if (editing !== null && $("editText")) {
+    const t = $("editText");
+    t.oninput = () => { editDraft = t.value; };
+    t.onkeydown = e => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(); }
+      if (e.key === "Escape") { editing = null; render(false); }
+    };
+    $("editSave").onclick = saveEdit;
+    $("editCancel").onclick = () => { editing = null; render(false); };
+  }
+  if (canRegen) {
+    $("regen").onclick = regenerate;
+    $("regenTemp").onchange = () => { $("temp").value = $("regenTemp").value; render(false); };
+  }
+  const sc = $("chatScroll"); sc.scrollTop = sc.scrollHeight;
+}
+
+async function stream(onText) {
+  abort = new AbortController();
+  const res = await fetch("/api/generate", {method:"POST", signal:abort.signal, headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({run:current.run, checkpoint:$("ckpt").value, document:doc, temperature:+$("temp").value,
+                          top_k:+$("topk").value || null, max_new_tokens:+$("maxtok").value,
+                          repetition_penalty:+$("rep").value || 1})});
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let pending = "", info = null;
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    pending += dec.decode(value, {stream:true});
+    let i;
+    while ((i = pending.indexOf("\n\n")) >= 0) {
+      const line = pending.slice(0, i); pending = pending.slice(i + 2);
+      if (!line.startsWith("data: ")) continue;
+      const ev = JSON.parse(line.slice(6));
+      if (ev.error) throw new Error(ev.error);
+      if (ev.text) onText(ev.text);
+      if (ev.done) info = ev;
+    }
+  }
+  return info;
+}
+
+async function assistantTurns() {
+  const rounds = Math.max(0, +$("rounds").value);
+  let thinkOnly = 0;  // the training data puts thinking in its own turn: <assistant><think>..</think></assistant><assistant>answer
+  for (let round = 0; round <= rounds; round++) {
+    doc += "<assistant>";
+    let turn = "";
+    setStatus("Generating");
+    const info = await stream(t => { turn += t; doc += t; render(true); });
+    if (!(turn.endsWith("</assistant>") || turn.endsWith("<eos>"))) doc += "</assistant>";
+    setStatus(info ? `${info.tokens} tokens at ${info.tps} tokens/s` : "");
+    if (turn.endsWith("<eos>")) break;
+    const calls = [...turn.matchAll(/<call>([\s\S]*?)<\/call>/g)].map(m => m[1]);
+    const visible = turn.replace(/<think>[\s\S]*?<\/think>/g, "").replace("</assistant>", "").trim();
+    if (!calls.length && !visible && turn.includes("</think>") && thinkOnly < 2) { thinkOnly++; round--; continue; }
+    if (!calls.length || round === rounds) break;
+    for (const c of calls) {
+      setStatus("Running " + c.split("(")[0]);
+      const {result} = await api("/api/tool", {call:c});
+      doc += `<result>${result}</result>`;
+      render(false);
+    }
+    refreshWorkspace();
+  }
+}
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || busy || !current) return;
+  if (header === null) { header = buildHeader(); doc = header; }
+  doc += `<user>${text}</user>`;
+  $("input").value = ""; grow();
+  await reply();
+}
+async function reply() {
+  busy = true; $("send").hidden = true; $("stop").hidden = false;
+  render(true);
+  try { await assistantTurns(); }
+  catch (e) { if (e.name !== "AbortError") setStatus("Generation failed: " + e.message); else { doc += "</assistant>"; setStatus("Stopped"); } }
+  busy = false; $("send").hidden = false; $("stop").hidden = true;
+  render(false); refreshWorkspace();
+}
+function userOffset(n) {  // where the n-th user message starts in doc
+  let i = header.length - 1;
+  for (let k = 0; k <= n; k++) { i = doc.indexOf("<user>", i + 1); if (i < 0) return -1; }
+  return i;
+}
+function startEdit(n) {
+  if (busy) return;
+  const at = userOffset(n);
+  if (at < 0) return;
+  editing = n; editDraft = doc.slice(at + "<user>".length, doc.indexOf("</user>", at));
+  render(false);
+  const t = $("editText"); t.focus(); t.setSelectionRange(t.value.length, t.value.length);
+  t.scrollIntoView({block: "nearest"});
+}
+async function saveEdit() {
+  const text = editDraft.trim(), at = userOffset(editing);
+  if (!text || busy || at < 0) return;
+  editing = null;
+  doc = doc.slice(0, at) + `<user>${text}</user>`;  // the conversation after this message goes (tool side effects stay)
+  await reply();
+}
+async function regenerate() {
+  if (busy || !current) return;
+  const end = doc.lastIndexOf("</user>");
+  if (end < 0) return;
+  doc = doc.slice(0, end + "</user>".length);  // everything the model wrote after it goes (tool side effects stay)
+  await reply();
+}
+function setStatus(s) { $("status").textContent = s; }
+function newChat() { if (busy) return; editing = null; header = null; doc = ""; setStatus(""); render(false); }
+function grow() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(220, t.scrollHeight) + "px"; }
+
+$("send").onclick = send;
+$("stop").onclick = () => abort && abort.abort();
+$("newChat").onclick = () => { newChat(); setTab("chat"); };
+$("input").addEventListener("input", grow);
+$("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("sysPreset").onchange = () => { $("sys").value = $("sysPreset").value; if (!header) render(false); };
+$("toolSet").onchange = () => { applyToolSet(); if (!header) render(false); };
+$("sys").oninput = () => { if (!header) render(false); };
+$("temp").oninput = () => { if (header && !busy) render(false); };
+$("exCat").onchange = showExamples;
+$("rawBtn").onclick = () => { rawMode = !rawMode; $("rawBtn").textContent = rawMode ? "Show conversation" : "Show raw document"; setTab("chat"); render(false); };
+$("resetFs").onclick = async () => { await api("/api/workspace/reset", {}); refreshWorkspace(); };
+$("clearMem").onclick = async () => { await api("/api/memory/clear", {}); refreshWorkspace(); };
+$("setupBtn").onclick = () => { setupOpen = $("setup").hidden; $("setup").hidden = !setupOpen;
+  $("setupBtn").classList.toggle("on", setupOpen); $("setupBtn").setAttribute("aria-pressed", String(setupOpen)); };
+document.addEventListener("change", e => { if (!header && e.target.closest("#tools, #atumTools, #decoys")) render(false); });
+if (window.innerWidth < 900) { setupOpen = false; $("setup").hidden = true; $("setupBtn").classList.remove("on"); }
+
+let setupOpen = true;  // the Setup drawer belongs to the chat: Inspect gets the whole width
+function setTab(which) {
+  const insp = which === "inspect", chat = which === "chat", comp = which === "complete";
+  $("tabChat").classList.toggle("on", chat); $("tabInspect").classList.toggle("on", insp); $("tabComplete").classList.toggle("on", comp);
+  $("chatView").hidden = !chat; $("inspectView").hidden = !insp; $("completeView").hidden = !comp;
+  $("setupBtn").hidden = $("newChat").hidden = !chat; $("setup").hidden = !chat || !setupOpen;
+  if (insp && !Object.keys(insDocs).length) loadDocList();
+  if (comp) $("cPrompt").focus();
+}
+$("tabChat").onclick = () => setTab("chat");
+$("tabInspect").onclick = () => setTab("inspect");
+$("tabComplete").onclick = () => { setTab("complete"); forcedComplete = false; };
+
+// ================= Completion (plain text: the model continues it; pretraining runs) =================
+let cBase = "", cGen = "", cAbort = null, cBusy = false;
+let forcedComplete = false;  // a completion run opened the tab: a chat run returns to Chat
+function renderC(streaming) {
+  const ended = cGen.endsWith("<eos>");
+  $("cOut").innerHTML = (cBase || cGen) ? `<span class="p">${esc(cBase)}</span><span class="${streaming ? "cursor" : ""}">${esc(cGen.replace(/<eos>$/, ""))}</span>`
+    + (ended ? `<p class="note">End of the text.</p>` : "") : "";
+  $("cCont").disabled = $("cRegen").disabled = $("cUse").disabled = streaming || !cBase;
+  $("cStartWrap").hidden = !!(cBase || cGen);
+}
+async function complete(prompt) {
+  if (cBusy || !current || !prompt.trim()) return;
+  cBase = prompt; cGen = ""; cBusy = true;
+  $("cGen").hidden = true; $("cStop").hidden = false; $("cStatus").textContent = "Generating";
+  renderC(true);
+  cAbort = new AbortController();
+  try {
+    const res = await fetch("/api/generate", {method:"POST", signal:cAbort.signal, headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({run:current.run, checkpoint:$("ckpt").value, document:"<bos>" + prompt, mode:"completion",
+                            temperature:+$("cTemp").value, top_k:+$("cTopk").value || null, max_new_tokens:+$("cMax").value,
+                            repetition_penalty:+$("cRep").value || 1})});
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let pending = "", info = null;
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      pending += dec.decode(value, {stream:true});
+      let i;
+      while ((i = pending.indexOf("\n\n")) >= 0) {
+        const line = pending.slice(0, i); pending = pending.slice(i + 2);
+        if (!line.startsWith("data: ")) continue;
+        const ev = JSON.parse(line.slice(6));
+        if (ev.error) throw new Error(ev.error);
+        if (ev.text) { cGen += ev.text; renderC(true); }
+        if (ev.done) info = ev;
+      }
+    }
+    $("cStatus").textContent = info ? `${info.tokens} tokens at ${info.tps} tokens/s` : "";
+  } catch (e) { $("cStatus").textContent = e.name === "AbortError" ? "Stopped" : "Generation failed: " + e.message; }
+  cBusy = false; $("cGen").hidden = false; $("cStop").hidden = true; renderC(false);
+}
+$("cGen").onclick = () => complete($("cPrompt").value);
+$("cStop").onclick = () => cAbort && cAbort.abort();
+$("cCont").onclick = () => complete(cBase + cGen.replace(/<eos>$/, ""));
+$("cRegen").onclick = () => complete(cBase);
+$("cUse").onclick = () => { $("cPrompt").value = cBase + cGen.replace(/<eos>$/, ""); $("cPrompt").focus(); };
+$("cPrompt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); complete($("cPrompt").value); } });
+async function loadStarters() {
+  $("cStarters").innerHTML = "";
+  if (!current) return;
+  const st = await api("/api/starters?dataset=" + encodeURIComponent(current.dataset));
+  if (st.error) return;
+  $("cStarters").innerHTML = Object.entries(st).map(([cat, list]) => `<h4>${esc(cat)}</h4><div class="chips">`
+    + list.map(t => `<button class="chip" data-t="${esc(t)}">${esc(t)}</button>`).join("") + "</div>").join("");
+  $("cStarters").querySelectorAll(".chip").forEach(b => b.onclick = () => { $("cPrompt").value = b.dataset.t; complete(b.dataset.t); });
+}
+
+// ================= Inspect =================
+// The layers see `kept` positions of the text; with a static memory the system / tool contents are only in the
+// memories (shown dimmed in place). Views: Loss (how well each assistant token was predicted), Stored (what the
+// states hold at the selected token), Recall (what the selected token reads from the memories). The side panel:
+// the selected token's probability and the next-token prediction layer by layer.
+let ins = null, insT = 0, insMode = "loss", insDocs = {};
+const f32 = b64 => { const bin = atob(b64), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new Float32Array(u.buffer); };
+const LOSS_CAP = 5;  // nats: the colour saturates here
+const colour = {
+  // Loss view: green where the token was the model's top-1 choice (stronger the more confident), red where it was not
+  // (stronger the higher the loss): the reds are where the model gets it wrong
+  right: p => `rgba(30, 150, 80, ${(0.10 + 0.30 * p).toFixed(3)})`,
+  wrong: a => `rgba(214, 48, 49, ${(0.22 + 0.58 * a).toFixed(3)})`,
+  stored: a => `rgba(14, 112, 104, ${0.07 + 0.5 * a})`,
+  recall: a => `rgba(109, 62, 214, ${0.05 + 0.4 * a})`,
+  // Attention (gated-deltanet): positive weights teal, negative (a later write took more than this token wrote) orange
+  attnPos: a => `rgba(14, 112, 104, ${(0.06 + 0.55 * a).toFixed(3)})`,
+  attnNeg: a => `rgba(214, 110, 20, ${(0.06 + 0.55 * a).toFixed(3)})`,
+};
+
+async function loadDocList() {
+  if (!current) return;
+  $("insDoc").innerHTML = '<option value="">Loading documents</option>';
+  insDocs = await api(`/api/documents?dataset=${encodeURIComponent(current.dataset)}&split=validation`);
+  if (insDocs.error) { $("insDoc").innerHTML = `<option value="">${esc(insDocs.error)}</option>`; insDocs = {}; return; }
+  const label = d => { const m = d.match(/<user>([\s\S]*?)<\/user>/); return (m ? m[1] : d.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").slice(0, 80); };
+  $("insDoc").innerHTML = '<option value="">Load a validation document</option>' + Object.entries(insDocs).map(([cat, docs]) =>
+    `<optgroup label="${esc(cat)}">` + docs.map((d, i) => `<option value="${esc(cat)}|${i}">${esc(label(d))}</option>`).join("") + "</optgroup>").join("");
+}
+$("insDoc").onchange = () => {
+  const v = $("insDoc").value; if (!v) return;
+  const k = v.lastIndexOf("|"); $("insText").value = insDocs[v.slice(0, k)][+v.slice(k + 1)]; runInspect();
+};
+$("insFromChat").onclick = () => { $("insText").value = doc || buildHeader(); };
+
+async function runInspect() {
+  if (!current) return;
+  const text = $("insText").value.trim() || doc || buildHeader();
+  $("insSummary").textContent = "Inspecting";
+  const out = await api("/api/inspect", {run:current.run, checkpoint:$("ckpt").value, text});
+  if (out.error) { $("insSummary").textContent = "Inspection failed: " + out.error; return; }
+  out.layers.forEach(L => { L.z = f32(L.update_gate); L.c = f32(L.candidate); if (L.mem_w) { L.mw = f32(L.mem_w); L.mg = f32(L.mem_gate); } });
+  const gdn = out.kind === "gdn"; out.att = {};
+  out.rawToKept = new Int32Array(out.raw.length).fill(-1); out.kept.forEach((r, k) => out.rawToKept[r] = k);
+  out.rawToEntry = new Int32Array(out.raw.length).fill(-1);
+  if (out.memory) { out.memory.entry_pos.forEach((r, j) => out.rawToEntry[r] = j); out.readRow = {};
+    out.memory.read_pos.forEach((t, r) => out.readRow[t] = r); }
+  ins = out;
+  $("insLayer").innerHTML = gdn ? out.heads.map((_, i) => `<option value="${i}">${i + 1}</option>`).join("")
+    : '<option value="all">All</option>' + out.layers.map((_, i) => `<option value="${i}">${i + 1}</option>`).join("");
+  if (gdn) $("insHead").innerHTML = '<option value="all">All</option>' + out.heads[0].half_life.map((_, h) => `<option value="${h}">${h + 1}</option>`).join("");
+  ["stored", "recall"].forEach(m => $("insMode").querySelector(`[data-mode="${m}"]`).hidden = gdn);
+  $("insMode").querySelector('[data-mode="attention"]').hidden = !gdn;
+  if (gdn ? ["stored", "recall"].includes(insMode) : insMode === "attention") insMode = "loss";
+  const box = $("insTokens");
+  box.innerHTML = out.raw.map((t, r) => {
+    const k = out.rawToKept[r], tag = /^<\/?[a-z]+>$/.test(t) ? " tag" : "";
+    return k >= 0 ? `<span class="tk${tag}" data-k="${k}">${esc(showTok(t))}</span>`
+                  : `<span class="tk mem" data-e="${out.rawToEntry[r]}">${esc(showTok(t))}</span>`;
+  }).join("");
+  ins.elK = []; ins.elE = [];
+  box.querySelectorAll(".tk").forEach(el => {
+    if (el.dataset.k !== undefined) { ins.elK[+el.dataset.k] = el; el.onclick = () => insSelect(+el.dataset.k); }
+    else if (+el.dataset.e >= 0) ins.elE[+el.dataset.e] = el;
+  });
+  $("insMode").querySelector('[data-mode="recall"]').disabled = !out.memory;
+  if (!out.memory && insMode === "recall") insMode = "loss";
+  setMode(insMode);
+  insSelect(firstScored());
+}
+const firstScored = () => { const t = ins.scored.indexOf(1); return t >= 0 ? t : ins.T - 1; };
+
+function setMode(m) {
+  insMode = m;
+  $("insMode").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.mode === m));
+  $("hideWrap").hidden = m !== "stored";
+  $("insLayer").parentElement.hidden = m === "loss";  // the loss is the final prediction's
+  $("headWrap").hidden = $("measureWrap").hidden = m !== "attention";
+  if (ins) insSelect(insT);
+}
+$("insMode").querySelectorAll("button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+
+const layersShown = () => $("insLayer").value === "all" ? ins.layers.map((_, i) => i) : [+$("insLayer").value];
+
+// exact weight of every past token j in each channel at position t: w[j][c] = gate[j][c] * prod_{s>j} keep[s][c]
+function weights(L, t) {
+  const H = ins.H, w = new Float32Array((t + 1) * H), P = new Float32Array(H).fill(1);
+  for (let j = t; j >= 0; j--) {
+    const keepOn = ins.reset[j] ? 0 : 1;
+    for (let c = 0; c < H; c++) { const z = L.z[j * H + c]; w[j * H + c] = z * P[c]; P[c] *= (1 - z) * keepOn; }
+  }
+  return w;
+}
+// each past token's share of the state at t: per channel its part of the channel's content (weight x |candidate|),
+// then the mean over the channels
+function storedShares(L, t) {
+  const H = ins.H, w = weights(L, t), share = new Float32Array(t + 1);
+  let n = 0;
+  for (let c = 0; c < H; c++) {
+    let tot = 0; for (let j = 0; j <= t; j++) tot += w[j * H + c] * Math.abs(L.c[j * H + c]);
+    if (tot <= 1e-12) continue;
+    n++; for (let j = 0; j <= t; j++) share[j] += w[j * H + c] * Math.abs(L.c[j * H + c]) / tot;
+  }
+  if (n) for (let j = 0; j <= t; j++) share[j] /= n;
+  return share;
+}
+// the selected position's read weights over the memory entries (mean over the shown layers), and the gates
+function readsAt(t) {
+  const M = ins.memory, r = ins.readRow ? ins.readRow[t] : undefined;
+  if (!M || r === undefined) return null;
+  const E = M.entries.length, nm = M.names.length, ls = layersShown(), w = new Float32Array(E), g = new Float32Array(nm);
+  for (const li of ls) { const L = ins.layers[li];
+    for (let j = 0; j < E; j++) w[j] += L.mw[r * E + j] / ls.length;
+    for (let i = 0; i < nm; i++) g[i] += L.mg[r * nm + i] / ls.length; }
+  return {w, g, doc:M.read_doc[r]};
+}
+
+// Attention (gated-deltanet): position t's read in each layer and head, unrolled into exact weights over the past
+// tokens' values (o_t = sum_i c_i v_i, server: delta_rule_read_weights), fetched per position. "share": c_i (v_i . o_t)
+// / |o_t|^2, each token's part of the read (sums to 1 over the document so far); "weight": c_i itself.
+const nHeads = () => ins.heads[0].half_life.length;
+function attVals(A, l, hsel, meas) {
+  const arr = meas === "c" ? A.c : A.share, H = nHeads(), n = A.n, out = new Float32Array(n);
+  const hs = hsel === "all" ? [...Array(H).keys()] : [+hsel];
+  for (const h of hs) for (let i = 0; i < n; i++) out[i] += arr[(l * H + h) * n + i] / hs.length;
+  return out;
+}
+function attSplit(A, l, h) {  // |share| of this token / the conv's window before it / older
+  const H = nHeads(), n = A.n, base = (l * H + h) * n, w = ins.conv_size - 1, sp = [0, 0, 0];
+  for (let i = 0; i < n; i++) { const d = n - 1 - i; sp[d === 0 ? 0 : d <= w ? 1 : 2] += Math.abs(A.share[base + i]); }
+  const tot = sp[0] + sp[1] + sp[2] || 1; return sp.map(x => x / tot);
+}
+function fetchAttend(t) {
+  if (ins.attPending === t) return;
+  ins.attPending = t; const asked = ins;
+  api("/api/attend", {attn_id: ins.attn_id, t}).then(r => {
+    if (asked !== ins) return;
+    ins.attPending = null;
+    if (r.error) { $("insSummary").textContent = "Unrolling failed: " + r.error; return; }
+    ins.att[t] = {start: r.start, n: r.n, c: f32(r.c), share: f32(r.share), err: r.err};
+    if (insT === t && insMode === "attention") insSelect(t);
+  });
+}
+
+function insSelect(t) {
+  if (!ins) return;
+  insT = Math.max(0, Math.min(ins.T - 1, t));
+  const T = ins.T, el = ins.elK;
+  el.forEach(e => { e.style.background = ""; e.classList.remove("after", "sel", "off"); e.title = ""; });
+  ins.elE.forEach(e => { if (e) { e.style.background = ""; e.title = ""; } });
+  let summary = "", legend = "";
+  if (insMode === "loss") {
+    let n = 0, sum = 0, sumH = 0, top1 = 0;
+    for (let j = 1; j < T; j++) {
+      if (!ins.scored[j - 1]) { el[j].classList.add("off"); continue; }
+      const loss = ins.loss[j - 1], rank = ins.rank[j - 1], p = Math.exp(-loss);
+      n++; sum += loss; sumH += ins.entropy[j - 1]; top1 += rank === 0;
+      el[j].style.background = rank === 0 ? colour.right(p) : colour.wrong(Math.min(1, loss / LOSS_CAP));
+      el[j].title = `${rank === 0 ? "top-1" : "rank " + (rank + 1)}, p = ${p.toFixed(3)}, loss ${loss.toFixed(3)} nats`;
+    }
+    el[0].classList.add("off");
+    summary = n ? `<b>${n}</b> ${n === T - 1 ? "tokens" : "assistant tokens"} scored: <b>${(100 * top1 / n).toFixed(1)}%</b> top-1 (green), ${n - top1} not (red). Mean loss <b>${(sum / n).toFixed(3)}</b> nats (${(sum / n / Math.LN2).toFixed(3)} bits per token), mean entropy <b>${(sumH / n / Math.LN2).toFixed(2)}</b> bits.`
+                : "This text has no assistant tokens: the training scores only what the assistant writes.";
+    legend = `top-1 <i style="width:44px; background:linear-gradient(90deg, ${colour.right(0)}, ${colour.right(1)})"></i>
+      &nbsp; missed, loss 0 <i style="background:linear-gradient(90deg, ${colour.wrong(0)}, ${colour.wrong(1)})"></i> ${LOSS_CAP}+ nats`;
+  } else if (insMode === "stored") {
+    const hide = Math.max(0, +$("insHide").value || 0), oldest = insT - hide, ls = layersShown();
+    const vals = new Float32Array(insT + 1), per = [];
+    for (const li of ls) { const s = storedShares(ins.layers[li], insT); let old = 0;
+      for (let j = 0; j <= insT; j++) { vals[j] += s[j] / ls.length; if (j <= oldest) old += s[j]; } per.push([li, old]); }
+    let mx = 1e-12; for (let j = 0; j <= oldest; j++) mx = Math.max(mx, vals[j]);
+    for (let j = 0; j < T; j++) {
+      if (j > insT) { el[j].classList.add("after"); continue; }
+      if (j > oldest) { el[j].classList.add("off"); continue; }
+      el[j].style.background = colour.stored(Math.sqrt(vals[j] / mx));
+      el[j].title = `${(100 * vals[j]).toFixed(2)}% of the state`;
+    }
+    ins.storedVals = vals; ins.storedOldest = oldest;
+    const olds = per.map(x => 100 * x[1]), mean = olds.reduce((a, b) => a + b, 0) / olds.length;
+    summary = oldest < 0 ? `Nothing older than the last ${hide} tokens yet.` : per.length === 1
+      ? `Tokens older than the last ${hide} hold <b>${olds[0].toFixed(1)}%</b> of layer ${per[0][0] + 1}'s state at the selected token.`
+      : `Tokens older than the last ${hide} hold <b>${mean.toFixed(1)}%</b> of the state at the selected token, from ${Math.min(...olds).toFixed(1)}% to ${Math.max(...olds).toFixed(1)}% across the layers.`;
+    legend = `less <i style="background:linear-gradient(90deg, ${colour.stored(0)}, ${colour.stored(1)})"></i> more`;
+  } else if (insMode === "attention") {
+    const A = ins.att[insT];
+    for (let j = insT + 1; j < T; j++) el[j].classList.add("after");
+    if (!A) { fetchAttend(insT); summary = "Unrolling the read at this token"; }
+    else {
+      const l = +$("insLayer").value, hs = $("insHead").value, meas = $("insMeasure").value, v = attVals(A, l, hs, meas);
+      let mx = 1e-12; for (let i = 0; i < A.n; i++) mx = Math.max(mx, Math.abs(v[i]));
+      for (let j = 0; j < A.start; j++) el[j].classList.add("off");
+      for (let i = 0; i < A.n; i++) { const j = A.start + i, a = Math.sqrt(Math.abs(v[i]) / mx);
+        el[j].style.background = v[i] >= 0 ? colour.attnPos(a) : colour.attnNeg(a);
+        el[j].title = meas === "c" ? `weight ${v[i].toFixed(4)} on this token's value` : `${(100 * v[i]).toFixed(1)}% of the read`; }
+      const sh = attVals(A, l, hs, "share"), w = ins.conv_size - 1; let self = 0, near = 0, far = 0;
+      for (let i = 0; i < A.n; i++) { const d = A.n - 1 - i; if (d === 0) self += sh[i]; else if (d <= w) near += sh[i]; else far += sh[i]; }
+      const who = hs === "all" ? `layer ${l + 1}, mean of the heads` : `layer ${l + 1}, head ${+hs + 1} (half-life ${ins.heads[l].half_life[hs]} tokens, write strength ${ins.heads[l].beta[hs].toFixed(2)})`;
+      summary = `<b>${who}</b>: the read at the selected token is <b>${(100 * self).toFixed(0)}%</b> its own value,
+        <b>${(100 * near).toFixed(0)}%</b> the ${w} tokens before, <b>${(100 * far).toFixed(0)}%</b> older ones.
+        Exact unroll of the memory (rebuilds the read to ${A.err.toExponential(1)}); each value already mixes its token with the ${w} before it (the short conv).`;
+      legend = `negative <i style="width:60px; background:linear-gradient(90deg, ${colour.attnNeg(1)}, ${colour.attnNeg(0)})"></i>
+        <i style="width:60px; background:linear-gradient(90deg, ${colour.attnPos(0)}, ${colour.attnPos(1)})"></i> positive`;
+    }
+  } else {
+    const M = ins.memory, ls = layersShown();
+    let mx = 1e-12; const add = new Float32Array(T);
+    for (const li of ls) { const a = ins.layers[li].mem_add; for (let j = 0; j < T; j++) add[j] += a[j] / ls.length; }
+    for (let j = 0; j < T; j++) mx = Math.max(mx, add[j]);
+    for (let j = 0; j < T; j++) if (add[j] > 0) { el[j].style.background = colour.recall(add[j] / mx);
+      el[j].title = `the memories add ${add[j].toFixed(3)} to the stream here`; } else el[j].classList.add("off");
+    const rd = readsAt(insT);
+    if (rd) { let wm = 1e-12; M.entries.forEach((_, j) => { if (M.entry_doc[j] === rd.doc) wm = Math.max(wm, rd.w[j]); });
+      M.entries.forEach((_, j) => { const e = ins.elE[j]; if (!e || M.entry_doc[j] !== rd.doc) return;
+        e.style.background = colour.recall(rd.w[j] / wm); e.title = `${(100 * rd.w[j]).toFixed(2)}% of the ${M.names[M.entry_kind[j]]} read`; }); }
+    const counts = M.names.map((_, i) => M.entry_kind.filter(k => k === i).length);
+    summary = `${M.names.map((n, i) => `${n} <b>${counts[i]}</b>`).join(", ")} tokens in the memories, read by <b>${M.read_pos.length}</b> positions.
+      Assistant tokens are coloured by how much the memories add there; the dimmed system and tool tokens by how much the selected token reads them.`;
+    legend = `less <i style="background:linear-gradient(90deg, ${colour.recall(0)}, ${colour.recall(1)})"></i> more`;
+  }
+  el[insT].classList.add("sel");
+  el[insT].scrollIntoView({block:"nearest"});
+  $("insSummary").innerHTML = summary;
+  $("legend").innerHTML = legend;
+  renderSide();
+}
+
+function cands(rows, actual) {
+  const mx = rows.length ? rows[0][1] : 1;
+  return rows.map(([i, p]) => `<div class="cand"><span class="pill${i === actual ? " hit" : ""}">${esc(showTok(ins.vocab[i]))}</span>
+    <span class="bar"><i style="width:${(100 * p / Math.max(mx, 1e-9)).toFixed(0)}%"></i></span><span class="p">${(100 * p).toFixed(0)}%</span></div>`).join("");
+}
+
+function renderSide() {
+  const t = insT, tok = ins.tokens[t], next = t + 1 < ins.T ? ins.ids[t + 1] : null, L = ins.lens.length - 1;
+  let h = `<h3>Selected token</h3><span class="big-tok">${esc(showTok(tok))}</span><span class="note" style="margin-left:8px">position ${t}</span>`;
+  const scored = t > 0 && ins.scored[t - 1];
+  if (scored) {
+    const loss = ins.loss[t - 1];
+    const rank = ins.rank[t - 1];
+    h += `<div class="facts">${rank === 0 ? `<b style="color:#1E9650">Top-1</b>` : `<b style="color:#D63031">Rank ${rank + 1}</b>`}: predicted with <b>${(100 * Math.exp(-loss)).toFixed(1)}%</b>, loss <b>${loss.toFixed(3)}</b> nats, entropy ${(ins.entropy[t - 1] / Math.LN2).toFixed(2)} bits</div>`;
+  } else if (t > 0) h += `<div class="facts">Not scored: the training only scores the assistant's tokens.</div>`;
+  if (insMode === "stored" && ins.storedVals) {
+    const top = []; for (let j = 0; j <= ins.storedOldest; j++) top.push([ins.storedVals[j], j]);
+    top.sort((a, b) => b[0] - a[0]);
+    h += `<h3>Most stored</h3>` + (top.length ? top.slice(0, 14).filter(x => x[0] > 0).map(([v, j]) =>
+      `<button class="pill" data-j="${j}" title="position ${j}">${esc(showTok(ins.tokens[j]))} ${(100 * v).toFixed(1)}%</button>`).join("") : `<p class="note">Nothing old enough yet.</p>`);
+  }
+  if (insMode === "recall" && ins.memory) {
+    const M = ins.memory, rd = readsAt(t);
+    if (!rd) h += `<h3>Memory read</h3><p class="note">This token does not read the memories. Only the assistant's turns read them: <code>&lt;assistant&gt;</code> and what follows.</p>`;
+    else M.names.forEach((name, i) => {
+      const js = M.entries.map((_, j) => j).filter(j => M.entry_doc[j] === rd.doc && M.entry_kind[j] === i);
+      h += `<h3>Reads from the ${name}</h3>`;
+      if (!js.length) { h += `<p class="note">Empty in this document.</p>`; return; }
+      js.sort((a, b) => rd.w[b] - rd.w[a]);
+      h += `<div class="facts" style="margin:-4px 0 6px">Gate ${rd.g[i].toFixed(3)}: how much of this read reaches the stream</div>`
+        + js.slice(0, 6).map(j => `<div class="cand"><span class="pill${next !== null && M.entries[j] === ins.vocab[next] ? " hit" : ""}">${esc(showTok(M.entries[j]))}</span>
+          <span class="bar"><i style="width:${(100 * rd.w[j] / rd.w[js[0]]).toFixed(0)}%"></i></span><span class="p">${(100 * rd.w[j]).toFixed(0)}%</span></div>`).join("");
+    });
+  }
+  if (insMode === "attention" && ins.att && ins.att[t]) {
+    const A = ins.att[t], H = nHeads(), l = +$("insLayer").value, hs = $("insHead").value, meas = $("insMeasure").value;
+    h += `<h3>Every head at this token</h3><p class="note" style="margin:-4px 0 8px">The past token each head reads most, its share of the read, and the split: this token / the ${ins.conv_size - 1} before / older.</p>`
+      + `<div class="agrid" style="grid-template-columns:28px repeat(${H}, minmax(0, 1fr))"><span></span>`
+      + [...Array(H).keys()].map(k => `<span class="hd">head ${k + 1}</span>`).join("")
+      + ins.heads.map((hd, li) => `<span class="ln">L${li + 1}</span>` + [...Array(H).keys()].map(k => {
+          const base = (li * H + k) * A.n; let j = 0;
+          for (let i = 1; i < A.n; i++) if (Math.abs(A.share[base + i]) > Math.abs(A.share[base + j])) j = i;
+          const sp = attSplit(A, li, k), on = li === l && (hs === "all" || +hs === k);
+          return `<button class="acell${on ? " on" : ""}" data-l="${li}" data-h="${k}" title="half-life ${hd.half_life[k]} tokens, write strength ${hd.beta[k].toFixed(2)}">
+            <span class="tt">${esc(showTok(ins.tokens[A.start + j]))}</span><span class="pc">${(100 * A.share[base + j]).toFixed(0)}%</span>
+            <span class="asplit">${sp.map(x => `<i style="width:${(100 * x).toFixed(0)}%"></i>`).join("")}</span></button>`; }).join("")).join("")
+      + `</div>`;
+    const v = attVals(A, l, hs, meas), top = [...v.keys()].sort((a, b) => Math.abs(v[b]) - Math.abs(v[a])).slice(0, 12);
+    h += `<h3>Most read: layer ${l + 1}${hs === "all" ? ", all heads" : ", head " + (+hs + 1)}</h3>`
+      + top.map(i => `<button class="pill" data-j="${A.start + i}" title="position ${A.start + i}" style="background:${v[i] >= 0 ? colour.attnPos(0.5) : colour.attnNeg(0.5)}">${esc(showTok(ins.tokens[A.start + i]))} ${meas === "c" ? v[i].toFixed(3) : (100 * v[i]).toFixed(1) + "%"}</button>`).join("");
+  }
+  if (scored) h += `<h3>What the model expected here</h3>${cands(ins.lens[L][t - 1], ins.ids[t])}`;
+  h += `<h3>Next token, layer by layer</h3>`
+    + (next !== null ? `<div class="facts" style="margin:-4px 0 6px">Actual next: <span class="pill hit">${esc(showTok(ins.vocab[next]))}</span></div>` : "")
+    + `<table class="lens">` + ins.lens.map((rows, n) => `<tr class="${n === L ? "final" : ""}"><td>${n === 0 ? "Embedding" : "Layer " + n}</td>
+       <td>${cands(rows[t].slice(0, n === L ? 5 : 3), next)}</td></tr>`).join("") + `</table>`;
+  $("insSide").innerHTML = h;
+  $("insSide").querySelectorAll("[data-j]").forEach(b => b.onclick = () => ins.elK[+b.dataset.j].scrollIntoView({block:"center"}));
+  $("insSide").querySelectorAll(".acell").forEach(b => b.onclick = () => {
+    $("insLayer").value = b.dataset.l; $("insHead").value = b.dataset.h; insSelect(insT); });
+}
+
+$("insRun").onclick = runInspect;
+$("insLayer").onchange = () => insSelect(insT);
+$("insHead").onchange = () => insSelect(insT);
+$("insMeasure").onchange = () => insSelect(insT);
+$("insHide").oninput = () => insSelect(insT);
+document.addEventListener("keydown", e => {
+  if ($("inspectView").hidden || !ins || ["TEXTAREA", "INPUT", "SELECT"].includes(e.target.tagName)) return;
+  if (e.key === "ArrowLeft") { e.preventDefault(); insSelect(insT - 1); }
+  if (e.key === "ArrowRight") { e.preventDefault(); insSelect(insT + 1); }
+});
+
+init();
+</script>
+</body>
+</html>

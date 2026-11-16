@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en" class="bg-slate-50">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token bank clusters - __TITLE__</title>
+<style>/*__CSS__*/</style>
+<script>/*__PLOTLY__*/</script>
+</head>
+<body class="text-slate-800 text-sm antialiased">
+
+<header class="sticky top-0 z-20 bg-white border-b border-slate-200">
+  <div class="max-w-[1600px] mx-auto px-5 py-3 flex flex-wrap items-center gap-x-6 gap-y-2">
+    <div class="mr-auto">
+      <h1 class="text-base font-semibold text-slate-900">Token bank clusters</h1>
+      <p class="text-xs text-slate-500" id="subtitle"></p>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-xs uppercase tracking-wide text-slate-500">k</span>
+      <div id="kbtns" class="flex border border-slate-300 rounded-md overflow-hidden"></div>
+    </div>
+    <label class="flex items-center gap-2"><span class="text-xs uppercase tracking-wide text-slate-500">x</span>
+      <select id="xsel" class="border border-slate-300 rounded-md px-2 py-1 bg-white"></select></label>
+    <label class="flex items-center gap-2"><span class="text-xs uppercase tracking-wide text-slate-500">y</span>
+      <select id="ysel" class="border border-slate-300 rounded-md px-2 py-1 bg-white"></select></label>
+    <label class="flex items-center gap-2"><span class="text-xs uppercase tracking-wide text-slate-500">color</span>
+      <select id="csel" class="border border-slate-300 rounded-md px-2 py-1 bg-white"></select></label>
+    <div class="relative">
+      <input id="search" list="toklist" placeholder="find a token..." autocomplete="off"
+             class="border border-slate-300 rounded-md px-3 py-1 w-56 focus:outline-none focus:border-slate-500">
+      <datalist id="toklist"></datalist>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-[1600px] mx-auto px-5 py-4 grid grid-cols-[19rem_1fr] gap-4">
+  <aside class="space-y-4">
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-center justify-between">
+        <h2 class="font-semibold text-slate-900">Clusters</h2>
+        <button id="showall" class="text-xs text-slate-500 hover:text-slate-900">show all</button>
+      </div>
+      <ul id="clist" class="divide-y divide-slate-100"></ul>
+      <p class="px-4 py-2 text-xs text-slate-500 border-t border-slate-200">Click to inspect and focus. The eye hides a cluster in the scatter. Ordered by share of training text.</p>
+    </section>
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200"><h2 class="font-semibold text-slate-900">Silhouette by k</h2></div>
+      <div id="silplot" class="h-40"></div>
+      <p class="px-4 pb-3 text-xs text-slate-500">Low for every k: the (&lambda;, prior) values form a continuum. Read clusters as regions of it.</p>
+    </section>
+  </aside>
+
+  <div class="space-y-4 min-w-0">
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-center justify-between">
+        <h2 class="font-semibold text-slate-900" id="scattertitle">Tokens</h2>
+        <span class="text-xs text-slate-500">click a point for its details; box / lasso (toolbar) to select a group</span>
+      </div>
+      <div id="scatter" class="h-[560px]"></div>
+    </section>
+
+    <section class="bg-white border border-slate-200 rounded-md">
+      <nav id="tabs" class="flex border-b border-slate-200 px-2"></nav>
+      <div class="p-4">
+        <div data-tab="overview">
+          <p class="text-xs text-slate-500 mb-2">Cluster centroids in standardized units (z-scores of each feature over all clustered tokens). Hover for the raw means.</p>
+          <div id="heat" class="h-80"></div>
+          <div class="overflow-x-auto mt-4"><table id="overtable" class="w-full text-left"></table></div>
+        </div>
+        <div data-tab="cluster" class="hidden"><div id="cdetail"></div></div>
+        <div data-tab="token" class="hidden"><div id="tdetail"><p class="text-slate-500">Click a point, a chip or a story word, or search for a token.</p></div></div>
+        <div data-tab="selection" class="hidden"><div id="sdetail"><p class="text-slate-500">Use the box or lasso tool in the scatter toolbar to select tokens.</p></div></div>
+        <div data-tab="stories" class="hidden">
+          <div class="flex items-center gap-2 mb-3"><span class="text-xs uppercase tracking-wide text-slate-500">story</span><div id="storybtns" class="flex gap-1"></div>
+            <label class="ml-4 flex items-center gap-2 text-xs text-slate-600"><input type="checkbox" id="storyfocus" class="accent-slate-700"> dim tokens outside the focused cluster</label></div>
+          <div id="story" class="leading-8 text-[15px]"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const D = /*__DATA__*/null;
+const T = D.tokens, N = T.t.length, NB = D.nb;
+const PAL = ["#4e79a7", "#e15759", "#59a14f", "#f28e2b", "#b07aa1", "#9c755f", "#76b7b2", "#d4a72c", "#ff9da7", "#7f7f7f", "#2f6f8f", "#a0522d", "#6a8f2f", "#8f2f6a", "#3b3b8f", "#2f8f6a"];
+const GPAL = ["#4e79a7", "#9c9c9c", "#e15759", "#59a14f", "#d4a72c", "#cccccc"];
+const BANKC = ["#e15759", "#f28e2b", "#4e79a7", "#59a14f"];
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const vis = s => s.replace(/^ /, "·");  // show a leading space as a middle dot
+const fmtPct = v => (v * 100).toFixed(v < 0.01 ? 2 : 1) + "%";
+const PLOT_CFG = { displaylogo: false, responsive: true, modeBarButtonsToRemove: ["toImage"] };
+const FONT = { family: "ui-sans-serif, system-ui, sans-serif", size: 11, color: "#334155" };
+const totalClustered = T.n.reduce((a, b) => a + b, 0);
+// WebGL markers when available (fast), SVG otherwise or with ?svg in the URL (headless browsers, some remote desktops)
+const GL = !/[?&]svg/.test(location.search) && (() => { try { const c = document.createElement("canvas"); return !!(c.getContext("webgl") || c.getContext("experimental-webgl")); } catch (e) { return false; } })();
+const SCATTER = GL ? "scattergl" : "scatter";
+
+let k = D.k0, lab = D.labels[k], hidden = new Set(), focus = null, selToken = null, selection = [], colorBy = "cluster", tab = "overview", story = 0;
+const xKey = { v: "pc1" }, yKey = { v: "pc2" };
+
+// ---- features ----
+const FEATS = [{ id: "pc1", name: `PC1 (${(D.pcvar[0] * 100).toFixed(0)}% var)`, f: i => T.pc[i][0] },
+               { id: "pc2", name: `PC2 (${(D.pcvar[1] * 100).toFixed(0)}% var)`, f: i => T.pc[i][1] }];
+for (let b = 0; b < NB; b++) {
+  FEATS.push({ id: `lam${b}`, name: `bank ${b + 1} lambda`, f: i => T.lam[i][b], bank: b });
+  FEATS.push({ id: `pr${b}`, name: `bank ${b + 1} log prior`, f: i => Math.log(T.pr[i][b]), bank: b });
+  FEATS.push({ id: `ret${b}`, name: `bank ${b + 1} retention @64`, f: i => T.ret[i][b], bank: b });
+}
+FEATS.push({ id: "logn", name: "log10 count", f: i => Math.log10(T.n[i]) });
+const feat = id => FEATS.find(f => f.id === id);
+const ZNAMES = [...Array.from({ length: NB }, (_, b) => `b${b + 1} lambda`), ...Array.from({ length: NB }, (_, b) => `b${b + 1} log prior`)];
+
+// ---- per-k cluster summaries (cached) ----
+const cache = {};
+function summary(kk) {
+  if (cache[kk]) return cache[kk];
+  const L = D.labels[kk], cl = Array.from({ length: kk }, (_, c) => ({ c, idx: [] }));
+  L.forEach((c, i) => cl[c].idx.push(i));
+  for (const o of cl) {
+    const m = o.idx.length, mean = f => o.idx.reduce((a, i) => a + f(i), 0) / Math.max(m, 1);
+    o.size = m;
+    o.share = o.idx.reduce((a, i) => a + T.n[i], 0) / totalClustered;
+    o.lam = Array.from({ length: NB }, (_, b) => mean(i => T.lam[i][b]));
+    o.pr = Array.from({ length: NB }, (_, b) => mean(i => T.pr[i][b]));
+    o.ret = Array.from({ length: NB }, (_, b) => { const v = o.idx.map(i => T.ret[i][b]).sort((a, c) => a - c); return v[Math.floor(v.length / 2)] || 0; });
+    o.z = Array.from({ length: 2 * NB }, (_, j) => mean(i => T.z[i][j]));
+    o.groups = D.groups.map((_, g) => o.idx.filter(i => T.g[i] === g).length);
+    o.byFreq = [...o.idx].sort((a, c) => T.n[c] - T.n[a]);
+    const d2 = i => T.z[i].reduce((a, v, j) => a + (v - o.z[j]) ** 2, 0);
+    o.dist = new Map(o.idx.map(i => [i, Math.sqrt(d2(i))]));
+    o.typical = [...o.idx].sort((a, c) => o.dist.get(a) - o.dist.get(c));
+  }
+  return (cache[kk] = cl);
+}
+const ccol = c => PAL[c % PAL.length];
+const chip = (i, extra = "") => `<button onclick="selectToken(${i})" title="${esc(T.t[i])}: ${T.n[i].toLocaleString()} occurrences, cluster ${lab[i] + 1}"
+  class="inline-flex items-center gap-1 border border-slate-200 rounded px-1.5 py-0.5 m-0.5 font-mono text-xs hover:border-slate-500 bg-white">
+  <span class="w-2 h-2 rounded-sm" style="background:${ccol(lab[i])}"></span>${esc(vis(T.t[i]))}${extra}</button>`;
+
+// ---- header controls ----
+document.getElementById("subtitle").textContent = `${D.run} / ${D.ckpt}  -  ${N.toLocaleString()} tokens seen at least ${D.min_count} times, ` +
+  `features: lambda and log prior in each of ${NB} banks (standardized), k-means++`;
+for (const [id, keyObj] of [["xsel", xKey], ["ysel", yKey]]) {
+  const s = document.getElementById(id);
+  s.innerHTML = FEATS.map(f => `<option value="${f.id}">${f.name}</option>`).join("");
+  s.value = keyObj.v; s.onchange = () => { keyObj.v = s.value; drawScatter(); };
+}
+const csel = document.getElementById("csel");
+csel.innerHTML = `<option value="cluster">cluster</option><option value="group">word group</option>` + FEATS.map(f => `<option value="${f.id}">${f.name}</option>`).join("");
+csel.onchange = () => { colorBy = csel.value; drawScatter(); };
+document.getElementById("toklist").innerHTML = [...Array(N).keys()].sort((a, c) => T.n[c] - T.n[a]).map(i => `<option value="${esc(T.t[i].trim() || T.t[i])}">`).join("");
+document.getElementById("search").addEventListener("change", e => {
+  const q = e.target.value; if (!q) return;
+  let i = T.t.findIndex(t => t === q || t.trim() === q);
+  if (i < 0) i = T.t.findIndex(t => t.trim().toLowerCase().startsWith(q.toLowerCase()));
+  if (i >= 0) selectToken(i);
+});
+function drawKButtons() {
+  document.getElementById("kbtns").innerHTML = Object.keys(D.labels).map(Number).map(kk =>
+    `<button onclick="setK(${kk})" title="silhouette ${D.sil[kk]}" class="px-2.5 py-1 border-r border-slate-300 last:border-r-0 ${kk === k ? "bg-slate-800 text-white" : "bg-white hover:bg-slate-100"}">${kk}</button>`).join("");
+}
+function setK(kk) { k = kk; lab = D.labels[k]; hidden.clear(); focus = null; drawAll(); }
+document.getElementById("showall").onclick = () => { hidden.clear(); focus = null; drawAll(); };
+
+// ---- tabs ----
+const TABS = [["overview", "Overview"], ["cluster", "Cluster"], ["token", "Token"], ["selection", "Selection"], ["stories", "Stories"]];
+function setTab(t) {
+  tab = t;
+  document.getElementById("tabs").innerHTML = TABS.map(([id, name]) =>
+    `<button onclick="setTab('${id}')" class="px-3 py-2 -mb-px border-b-2 ${id === t ? "border-slate-800 text-slate-900 font-medium" : "border-transparent text-slate-500 hover:text-slate-800"}">${name}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(el => el.classList.toggle("hidden", el.dataset.tab !== t));
+  if (t === "overview") drawOverview();
+  if (t === "cluster") drawCluster();
+  if (t === "stories") drawStory();
+  window.dispatchEvent(new Event("resize"));
+}
+
+// ---- sidebar ----
+function drawList() {
+  const cl = summary(k);
+  document.getElementById("clist").innerHTML = cl.map(o => {
+    const on = !hidden.has(o.c), act = focus === o.c;
+    return `<li class="flex items-stretch ${act ? "bg-slate-100" : "hover:bg-slate-50"}">
+      <button onclick="focusCluster(${o.c})" class="flex-1 text-left px-4 py-2 min-w-0 ${on ? "" : "opacity-40"}">
+        <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-sm shrink-0" style="background:${ccol(o.c)}"></span>
+          <span class="font-medium text-slate-900">Cluster ${o.c + 1}</span>
+          <span class="ml-auto text-xs text-slate-500 tabular-nums">${o.size} tok, ${fmtPct(o.share)}</span></div>
+        <div class="mt-0.5 text-xs text-slate-500 font-mono truncate">${o.byFreq.slice(0, 7).map(i => esc(vis(T.t[i]))).join("  ")}</div>
+      </button>
+      <button onclick="toggleHide(${o.c})" title="${on ? "hide" : "show"} in the scatter" class="px-3 text-slate-400 hover:text-slate-800">${on ? "&#9673;" : "&#9675;"}</button></li>`;
+  }).join("");
+}
+function toggleHide(c) { hidden.has(c) ? hidden.delete(c) : hidden.add(c); drawList(); drawScatter(); }
+function focusCluster(c) { focus = focus === c ? null : c; drawList(); drawScatter(); if (focus !== null) setTab("cluster"); else drawCluster(); if (tab === "stories") drawStory(); }
+
+// ---- scatter ----
+const scatterDiv = document.getElementById("scatter");
+let scatterReady = false;
+function drawScatter() {
+  const fx = feat(xKey.v), fy = feat(yKey.v), cl = summary(k);
+  const visible = [...Array(N).keys()].filter(i => !hidden.has(lab[i]));
+  const size = i => 3 + 1.3 * Math.log10(T.n[i]);
+  const hover = i => `<b>${esc(vis(T.t[i]))}</b>  (${T.n[i].toLocaleString()})<br>cluster ${lab[i] + 1}, ${D.groups[T.g[i]]}<br>` +
+    Array.from({ length: NB }, (_, b) => `b${b + 1}: lambda ${T.lam[i][b].toFixed(2)}  prior ${T.pr[i][b].toFixed(2)}`).join("<br>");
+  const op = c => (focus === null ? 0.65 : c === focus ? 0.9 : 0.08);
+  let traces;
+  if (colorBy === "cluster") {
+    traces = cl.filter(o => !hidden.has(o.c)).map(o => ({
+      type: SCATTER, mode: "markers", name: `cluster ${o.c + 1}`, x: o.idx.map(fx.f), y: o.idx.map(fy.f), customdata: o.idx,
+      text: o.idx.map(hover), hovertemplate: "%{text}<extra></extra>",
+      marker: { size: o.idx.map(size), color: ccol(o.c), opacity: op(o.c), line: { width: 0 } } }));
+  } else if (colorBy === "group") {
+    traces = D.groups.map((g, gi) => { const idx = visible.filter(i => T.g[i] === gi);
+      return { type: SCATTER, mode: "markers", name: g, x: idx.map(fx.f), y: idx.map(fy.f), customdata: idx, text: idx.map(hover),
+        hovertemplate: "%{text}<extra></extra>", marker: { size: idx.map(size), color: GPAL[gi], opacity: 0.65 } }; }).filter(t => t.x.length);
+  } else {
+    const fc = feat(colorBy);
+    traces = [{ type: SCATTER, mode: "markers", name: fc.name, x: visible.map(fx.f), y: visible.map(fy.f), customdata: visible, text: visible.map(hover),
+      hovertemplate: "%{text}<extra></extra>", showlegend: false,
+      marker: { size: visible.map(size), color: visible.map(fc.f), colorscale: "Viridis", opacity: 0.7, colorbar: { title: { text: fc.name, side: "right" }, thickness: 10 } } }];
+  }
+  if (selToken !== null && !hidden.has(lab[selToken])) traces.push({ type: SCATTER, mode: "markers+text", name: "selected", showlegend: false,
+    x: [fx.f(selToken)], y: [fy.f(selToken)], text: [vis(T.t[selToken])], textposition: "top center", textfont: { size: 13, color: "#0f172a" },
+    customdata: [selToken], hoverinfo: "skip", marker: { size: 16, color: "rgba(0,0,0,0)", line: { width: 2, color: "#0f172a" } } });
+  const layout = { margin: { t: 10, r: 10, b: 44, l: 54 }, font: FONT, paper_bgcolor: "#fff", plot_bgcolor: "#fff", dragmode: "pan",
+    xaxis: { title: { text: fx.name }, gridcolor: "#eef2f6", zerolinecolor: "#cbd5e1" }, yaxis: { title: { text: fy.name }, gridcolor: "#eef2f6", zerolinecolor: "#cbd5e1" },
+    legend: { orientation: "h", y: 1.06, font: { size: 11 } }, hoverlabel: { bgcolor: "#fff", bordercolor: "#cbd5e1", font: FONT }, uirevision: `${xKey.v}|${yKey.v}` };
+  document.getElementById("scattertitle").textContent = `Tokens: ${fy.name} vs ${fx.name}` + (focus !== null ? ` (cluster ${focus + 1} focused)` : "");
+  Plotly.react(scatterDiv, traces, layout, PLOT_CFG);
+  if (!scatterReady) {
+    scatterDiv.on("plotly_click", e => { const p = e.points[0]; if (p && p.customdata !== undefined) selectToken(p.customdata); });
+    scatterDiv.on("plotly_selected", e => { if (!e) return; selection = [...new Set(e.points.map(p => p.customdata))]; drawSelection(); setTab("selection"); });
+    scatterReady = true;
+  }
+}
+
+// ---- silhouette ----
+function drawSil() {
+  const ks = Object.keys(D.sil).map(Number);
+  Plotly.react("silplot", [{ type: "bar", x: ks, y: ks.map(kk => D.sil[kk]), marker: { color: ks.map(kk => (kk === k ? "#1e293b" : "#cbd5e1")) },
+    hovertemplate: "k=%{x}: %{y:.3f}<extra></extra>" }],
+    { margin: { t: 8, r: 8, b: 28, l: 40 }, font: FONT, xaxis: { dtick: 1 }, yaxis: { gridcolor: "#eef2f6" }, paper_bgcolor: "#fff", plot_bgcolor: "#fff" },
+    { displayModeBar: false, responsive: true });
+}
+
+// ---- overview ----
+const bankCells = (o, b) => `<td class="px-2 py-1.5 tabular-nums whitespace-nowrap">
+  <div class="flex items-center gap-1.5"><div class="w-16 h-1.5 bg-slate-100 rounded-sm"><div class="h-1.5 rounded-sm bg-emerald-600" style="width:${(1 - o.lam[b]) * 100}%"></div></div>${o.lam[b].toFixed(2)}</div>
+  <div class="flex items-center gap-1.5"><div class="w-16 h-1.5 bg-slate-100 rounded-sm"><div class="h-1.5 rounded-sm bg-sky-700" style="width:${Math.min(o.pr[b] / 3, 1) * 100}%"></div></div>${o.pr[b].toFixed(2)}</div>
+  <div class="text-xs text-slate-500">ret ${o.ret[b].toFixed(2)}</div></td>`;
+function drawOverview() {
+  const cl = summary(k);
+  Plotly.react("heat", [{ type: "heatmap", z: cl.map(o => o.z), x: ZNAMES, y: cl.map(o => `cluster ${o.c + 1}`), colorscale: "RdBu", reversescale: true, zmid: 0,
+    customdata: cl.map(o => [...o.lam, ...o.pr]), hovertemplate: "%{y}, %{x}<br>z = %{z:.2f}<br>raw mean %{customdata:.3f}<extra></extra>",
+    colorbar: { thickness: 10, title: { text: "z" } } }],
+    { margin: { t: 8, r: 8, b: 70, l: 80 }, font: FONT, yaxis: { autorange: "reversed" }, paper_bgcolor: "#fff" }, { displayModeBar: false, responsive: true });
+  document.getElementById("overtable").innerHTML = `<thead class="text-xs uppercase tracking-wide text-slate-500 border-b border-slate-200"><tr>
+    <th class="px-2 py-1.5">cluster</th><th class="px-2 py-1.5">tokens</th><th class="px-2 py-1.5">text</th>` +
+    Array.from({ length: NB }, (_, b) => `<th class="px-2 py-1.5"><span style="color:${BANKC[b]}">bank ${b + 1}</span><div class="normal-case font-normal">1-&lambda; (green), prior (blue)</div></th>`).join("") +
+    `<th class="px-2 py-1.5">most frequent</th></tr></thead><tbody class="divide-y divide-slate-100">` +
+    cl.map(o => `<tr class="align-top hover:bg-slate-50 cursor-pointer" onclick="focusCluster(${o.c})">
+      <td class="px-2 py-1.5"><span class="inline-block w-3 h-3 rounded-sm align-middle mr-1.5" style="background:${ccol(o.c)}"></span>${o.c + 1}</td>
+      <td class="px-2 py-1.5 tabular-nums">${o.size}</td><td class="px-2 py-1.5 tabular-nums">${fmtPct(o.share)}</td>` +
+      Array.from({ length: NB }, (_, b) => bankCells(o, b)).join("") +
+      `<td class="px-2 py-1.5 font-mono text-xs text-slate-600">${o.byFreq.slice(0, 12).map(i => esc(vis(T.t[i]))).join("  ")}</td></tr>`).join("") + "</tbody>";
+}
+
+// ---- cluster tab ----
+let tsort = "count", tfilter = "";
+function drawCluster() {
+  const el = document.getElementById("cdetail");
+  if (focus === null) { el.innerHTML = `<p class="text-slate-500">Pick a cluster in the list (or a row in the overview table).</p>`; return; }
+  const o = summary(k)[focus];
+  const gmax = Math.max(...o.groups);
+  const sorters = { count: (a, c) => T.n[c] - T.n[a], typical: (a, c) => o.dist.get(a) - o.dist.get(c), alpha: (a, c) => T.t[a].trim().localeCompare(T.t[c].trim()) };
+  for (let b = 0; b < NB; b++) { sorters[`lam${b}`] = (a, c) => T.lam[a][b] - T.lam[c][b]; sorters[`pr${b}`] = (a, c) => T.pr[c][b] - T.pr[a][b]; }
+  const rows = o.idx.filter(i => !tfilter || T.t[i].toLowerCase().includes(tfilter)).sort(sorters[tsort]).slice(0, 400);
+  el.innerHTML = `
+  <div class="flex items-baseline gap-3 mb-3"><span class="w-3 h-3 rounded-sm" style="background:${ccol(o.c)}"></span>
+    <h3 class="text-base font-semibold text-slate-900">Cluster ${o.c + 1}</h3>
+    <span class="text-slate-500">${o.size} tokens, ${fmtPct(o.share)} of the clustered training text</span></div>
+  <div class="grid gap-3 mb-4" style="grid-template-columns:repeat(${NB},minmax(0,1fr))">${Array.from({ length: NB }, (_, b) => `
+    <div class="border border-slate-200 rounded-md p-3">
+      <div class="text-xs uppercase tracking-wide mb-1" style="color:${BANKC[b]}">bank ${b + 1} <span class="text-slate-400 normal-case">(lambda init ${D.bank_lambdas[b]})</span></div>
+      <div class="grid grid-cols-3 gap-1 tabular-nums"><div><div class="text-xs text-slate-500">lambda</div><div class="text-lg">${o.lam[b].toFixed(2)}</div></div>
+        <div><div class="text-xs text-slate-500">prior</div><div class="text-lg">${o.pr[b].toFixed(2)}</div></div>
+        <div><div class="text-xs text-slate-500">retention</div><div class="text-lg">${o.ret[b].toFixed(2)}</div></div></div></div>`).join("")}</div>
+  <div class="grid grid-cols-[16rem_1fr] gap-6">
+    <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">word groups</div>
+      ${D.groups.map((g, gi) => o.groups[gi] ? `<div class="flex items-center gap-2 py-0.5"><div class="w-36 truncate text-xs">${g}</div>
+        <div class="flex-1 h-2 bg-slate-100 rounded-sm"><div class="h-2 rounded-sm" style="width:${(o.groups[gi] / gmax) * 100}%;background:${GPAL[gi]}"></div></div>
+        <div class="w-10 text-right text-xs tabular-nums">${o.groups[gi]}</div></div>` : "").join("")}
+      <div class="text-xs uppercase tracking-wide text-slate-500 mt-4 mb-1">most typical (closest to centroid)</div><div>${o.typical.slice(0, 30).map(i => chip(i)).join("")}</div>
+    </div>
+    <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">most frequent</div><div>${o.byFreq.slice(0, 60).map(i => chip(i)).join("")}</div></div>
+  </div>
+  <div class="mt-5 flex items-center gap-3"><div class="text-xs uppercase tracking-wide text-slate-500">all tokens</div>
+    <input id="tfilter" value="${esc(tfilter)}" placeholder="filter..." class="border border-slate-300 rounded-md px-2 py-0.5 w-40">
+    <select id="tsort" class="border border-slate-300 rounded-md px-2 py-0.5 bg-white">
+      <option value="count">by count</option><option value="typical">by typicality</option><option value="alpha">alphabetical</option>
+      ${Array.from({ length: NB }, (_, b) => `<option value="lam${b}">bank ${b + 1} lambda (low first)</option><option value="pr${b}">bank ${b + 1} prior (high first)</option>`).join("")}
+    </select><span class="text-xs text-slate-500">${rows.length < o.idx.length ? `showing ${rows.length} of ${o.idx.length}` : ""}</span></div>
+  <div class="mt-2 max-h-96 overflow-y-auto border border-slate-200 rounded-md"><table class="w-full text-left">
+    <thead class="sticky top-0 bg-slate-50 text-xs uppercase tracking-wide text-slate-500"><tr><th class="px-2 py-1">token</th><th class="px-2 py-1">count</th><th class="px-2 py-1">group</th>
+      ${Array.from({ length: NB }, (_, b) => `<th class="px-2 py-1" style="color:${BANKC[b]}">b${b + 1} &lambda; / prior</th>`).join("")}</tr></thead>
+    <tbody class="divide-y divide-slate-100">${rows.map(i => `<tr class="hover:bg-slate-50 cursor-pointer" onclick="selectToken(${i})">
+      <td class="px-2 py-0.5 font-mono">${esc(vis(T.t[i]))}</td><td class="px-2 py-0.5 tabular-nums">${T.n[i].toLocaleString()}</td><td class="px-2 py-0.5 text-xs text-slate-500">${D.groups[T.g[i]]}</td>
+      ${Array.from({ length: NB }, (_, b) => `<td class="px-2 py-0.5 tabular-nums">${T.lam[i][b].toFixed(2)} / ${T.pr[i][b].toFixed(2)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  document.getElementById("tsort").value = tsort;
+  document.getElementById("tsort").onchange = e => { tsort = e.target.value; drawCluster(); };
+  const tf = document.getElementById("tfilter");
+  tf.oninput = e => { tfilter = e.target.value.toLowerCase(); clearTimeout(tf._t); tf._t = setTimeout(() => { drawCluster(); const n = document.getElementById("tfilter"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 200); };
+}
+
+// ---- token tab ----
+function kernel(b, x) { const o = D.osc; let s = 0; for (let m = 0; m < o.amp[b].length; m++) s += o.amp[b][m] * Math.exp(-o.rate[b][m] * x) * Math.cos(o.freq[b][m] * x + o.phase[b][m]); return s; }
+function selectToken(i) {
+  selToken = i; drawScatter(); setTab("token");
+  const ks = Array.from({ length: D.window }, (_, j) => j + 1);
+  const nn = [...Array(N).keys()].filter(j => j !== i).map(j => [j, T.z[j].reduce((a, v, q) => a + (v - T.z[i][q]) ** 2, 0)]).sort((a, c) => a[1] - c[1]).slice(0, 30);
+  document.getElementById("tdetail").innerHTML = `
+  <div class="flex items-baseline gap-3 mb-3"><h3 class="text-xl font-semibold font-mono text-slate-900">${esc(vis(T.t[i]))}</h3>
+    <span class="text-slate-500">id ${T.id[i]}, ${T.n[i].toLocaleString()} occurrences, ${D.groups[T.g[i]]}</span>
+    <button onclick="focusCluster(${lab[i]})" class="ml-2 inline-flex items-center gap-1.5 border border-slate-300 rounded-md px-2 py-0.5 hover:bg-slate-100">
+      <span class="w-2.5 h-2.5 rounded-sm" style="background:${ccol(lab[i])}"></span>cluster ${lab[i] + 1}</button></div>
+  <div class="grid grid-cols-[20rem_1fr] gap-6">
+    <div><table class="w-full text-left tabular-nums"><thead class="text-xs uppercase tracking-wide text-slate-500 border-b border-slate-200"><tr>
+      <th class="py-1">bank</th><th class="py-1">lambda</th><th class="py-1">prior</th><th class="py-1">retention</th></tr></thead><tbody class="divide-y divide-slate-100">
+      ${Array.from({ length: NB }, (_, b) => `<tr><td class="py-1" style="color:${BANKC[b]}">bank ${b + 1}</td><td class="py-1">${T.lam[i][b].toFixed(3)}</td><td class="py-1">${T.pr[i][b].toFixed(3)}</td><td class="py-1">${T.ret[i][b].toFixed(3)}</td></tr>`).join("")}
+      </tbody></table>
+      <p class="text-xs text-slate-500 mt-2">lambda 0 = flat weight over distance (never forgotten), 1 = the bank's own decay. Retention = |w(64<sup>lambda</sup>)| / |w(1)|.</p>
+      <div class="text-xs uppercase tracking-wide text-slate-500 mt-4 mb-1">nearest tokens in (lambda, prior) space</div><div>${nn.map(([j]) => chip(j)).join("")}</div></div>
+    <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">weight of this token at each distance, per bank: prior x w<sub>b</sub>(k<sup>lambda</sup>) (before normalization)</div>
+      <div id="tcurve" class="h-72"></div></div>
+  </div>`;
+  Plotly.react("tcurve", Array.from({ length: NB }, (_, b) => ({ type: "scatter", mode: "lines", name: `bank ${b + 1}`, x: ks,
+    y: ks.map(kk => T.pr[i][b] * kernel(b, Math.pow(kk, T.lam[i][b]))), line: { color: BANKC[b], width: 2 } })),
+    { margin: { t: 8, r: 8, b: 40, l: 50 }, font: FONT, xaxis: { title: { text: "distance k (tokens back)" }, gridcolor: "#eef2f6" }, yaxis: { gridcolor: "#eef2f6", zerolinecolor: "#cbd5e1" },
+      legend: { orientation: "h", y: 1.1 }, paper_bgcolor: "#fff", plot_bgcolor: "#fff" }, { displayModeBar: false, responsive: true });
+}
+
+// ---- selection tab ----
+function drawSelection() {
+  const el = document.getElementById("sdetail");
+  if (!selection.length) { el.innerHTML = `<p class="text-slate-500">Nothing selected.</p>`; return; }
+  const byC = {}; selection.forEach(i => (byC[lab[i]] = (byC[lab[i]] || 0) + 1));
+  const rows = [...selection].sort((a, c) => T.n[c] - T.n[a]);
+  const mean = f => selection.reduce((a, i) => a + f(i), 0) / selection.length;
+  el.innerHTML = `<div class="flex items-baseline gap-3 mb-3"><h3 class="text-base font-semibold text-slate-900">${selection.length} tokens selected</h3>
+    <span class="text-slate-500">${Object.entries(byC).sort((a, c) => c[1] - a[1]).map(([c, n]) => `<span class="inline-flex items-center gap-1 mr-2"><span class="w-2.5 h-2.5 rounded-sm" style="background:${ccol(+c)}"></span>cluster ${+c + 1}: ${n}</span>`).join("")}</span></div>
+    <div class="text-xs text-slate-500 mb-2">mean lambda / prior: ${Array.from({ length: NB }, (_, b) => `<span style="color:${BANKC[b]}">bank ${b + 1}</span> ${mean(i => T.lam[i][b]).toFixed(2)} / ${mean(i => T.pr[i][b]).toFixed(2)}`).join(", ")}</div>
+    <div>${rows.slice(0, 300).map(i => chip(i)).join("")}${rows.length > 300 ? `<span class="text-xs text-slate-500"> ... ${rows.length - 300} more</span>` : ""}</div>`;
+}
+
+// ---- stories tab ----
+function drawStory() {
+  document.getElementById("storybtns").innerHTML = D.stories.map((_, s) =>
+    `<button onclick="story=${s};drawStory()" class="px-2.5 py-0.5 border border-slate-300 rounded-md ${s === story ? "bg-slate-800 text-white" : "bg-white hover:bg-slate-100"}">${s + 1}</button>`).join("");
+  const dim = document.getElementById("storyfocus").checked && focus !== null;
+  document.getElementById("story").innerHTML = D.stories[story].map(([t, i]) => {
+    if (t === "\\n") return "<br>";
+    if (i < 0) return `<span class="text-slate-400" title="not clustered (rare)">${esc(t)}</span>`;
+    const c = lab[i], faded = dim && c !== focus;
+    return `<span onclick="selectToken(${i})" title="${esc(T.t[i])}: cluster ${c + 1}" class="cursor-pointer rounded-sm px-px"
+      style="background:${faded ? "transparent" : ccol(c) + "26"};border-bottom:2px solid ${faded ? "#e2e8f0" : ccol(c)};${faded ? "color:#94a3b8" : ""}">${esc(t)}</span>`;
+  }).join("");
+}
+document.getElementById("storyfocus").onchange = drawStory;
+
+function drawAll() { drawKButtons(); drawList(); drawSil(); drawScatter(); setTab(tab); }
+// Deep links: #k=8&cluster=4&token=hill&tab=stories
+const H = Object.fromEntries(location.hash.slice(1).split("&").filter(Boolean).map(kv => kv.split("=").map(decodeURIComponent)));
+if (H.k && D.labels[H.k]) { k = +H.k; lab = D.labels[k]; }
+drawAll();
+if (H.cluster) focusCluster(+H.cluster - 1);
+if (H.token) { const i = T.t.findIndex(t => t.trim() === H.token); if (i >= 0) selectToken(i); }
+if (H.tab) setTab(H.tab);
+</script>
+</body>
+</html>

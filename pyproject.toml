@@ -1,0 +1,49 @@
+[project]
+name = "rnn-research"
+version = "0.2.0"
+description = "Spherical language models on Intel XPU"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+
+# One backend, one environment. The XPU torch wheel bundles its own Intel
+# runtime, so nothing has to be exported (no LD_LIBRARY_PATH, no PYTHONPATH,
+# no KERAS_BACKEND) -- `uv run model train` uses the GPU directly.
+dependencies = [
+    "keras>=3.15",
+    "keras-hub>=0.19",
+    "numpy>=1.26",
+    "plotly>=6.0",
+    "tokenizers>=0.20.0",
+    "torch==2.12.1+xpu",
+    # torch+xpu's own dependency; listed directly so the source below can pin
+    # it to the XPU index (uv sources only apply to direct dependencies).
+    "triton-xpu==3.7.1",
+    "tqdm>=4.66.0",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+model = "model.cli:main"
+
+[tool.uv]
+# The XPU wheels (and their `triton-xpu` dependency) are Linux-only, so
+# resolution is restricted to Linux. Without this, uv also tries to solve for
+# win32 and fails on the missing `triton-xpu`.
+environments = ["sys_platform == 'linux'"]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-xpu" }
+triton-xpu = { index = "pytorch-xpu" }
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model*"]

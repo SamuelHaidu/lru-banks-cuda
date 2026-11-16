@@ -1,0 +1,53 @@
+# Environment & Secrets
+.env
+.env.*
+
+# Python & Caches
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+build/
+dist/
+*.egg-info/
+.python-version
+
+# Intel Level-Zero kernel cache (never delete -- a cold cache costs a full
+# SPIR-V recompile on the next training start; just don't version it)
+.sycl_cache/
+
+# Custom SYCL extensions (model/kernels/*.sycl), built by torch on first use
+.kernel_build/
+
+# Artifacts & Data
+runs/
+datasets/
+tokenizers/
+*.keras
+*.npy
+*.npz
+*.bin
+*.parquet
+uv.lock
+
+# Pre-refactor codebase, kept on disk for reference only
+archive/
+
+# Separate scratch subproject, not part of this repo's history
+tinygrad-fused-kernel/
+
+# webchat state (persistent memory of the chat page)
+.webchat/
+.pod
+
+# Secrets (RunPod / S3 keys)
+credentials.txt
+
+# Local logs (cron pulls, experiment output)
+logs/
+
+# Node dependencies of the report CSS tool
+node_modules/
+
+# Third-party papers kept for reference
+studies/*.pdf

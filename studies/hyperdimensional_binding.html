@@ -1,0 +1,251 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Binding and unbinding in high-dimensional vectors (HDC / VSA): interactive demo</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; max-width: 1200px; color: #222; line-height: 1.45; }
+  h1 { font-size: 23px; margin-bottom: 2px; } h2 { font-size: 18px; margin: 4px 0 6px; }
+  .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+  .formula { font-family: monospace; background: #f4f4f6; padding: 8px 12px; border-radius: 6px; margin: 8px 0; }
+  .note { font-size: 13px; color: #555; }
+  label { font-size: 13px; color: #444; margin-right: 12px; }
+  input[type=text] { font-size: 14px; padding: 3px 6px; }
+  button { font-size: 13px; padding: 4px 10px; margin-right: 6px; }
+  .row { display: flex; gap: 18px; flex-wrap: wrap; } .row > div { flex: 1; min-width: 340px; }
+  table { border-collapse: collapse; font-size: 13px; } td, th { padding: 3px 8px; border-bottom: 1px solid #eee; text-align: left; }
+  .ok { color: #1a9850; font-weight: 600; } .bad { color: #d73027; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Binding and unbinding data in a single vector</h1>
+<div class="note">Hyperdimensional computing (vector symbolic architectures) stores structured data (pairs, records,
+sequences) in one fixed-size vector using three operations. Everything below runs live in your browser with random vectors.</div>
+<div class="formula">
+  <b>bundle</b> (superpose a set): &nbsp; s = a + b + c &nbsp;&nbsp;&nbsp; s stays similar to each member<br>
+  <b>bind</b> (pair a role with a filler): &nbsp; r &otimes; f &nbsp;&nbsp;&nbsp; dissimilar to both r and f, and invertible<br>
+  <b>unbind</b> (ask "what is bound to r?"): &nbsp; r<sup>-1</sup> &otimes; s &asymp; f + noise &nbsp;&nbsp;&nbsp; then <b>clean up</b>: the nearest known vector is the answer
+</div>
+<div>
+  <label>dimension D <select id="dim" onchange="redrawAll()">
+    <option>32</option><option>64</option><option selected>128</option><option>256</option><option>1024</option><option>4096</option></select></label>
+  <label>binding scheme <select id="scheme" onchange="redrawAll()">
+    <option value="fhrr" selected>FHRR: unit phasors, bind = add phases (multiply complex numbers)</option>
+    <option value="map">MAP: bipolar &plusmn;1, bind = elementwise multiply (self-inverse)</option>
+  </select></label>
+  <label>seed <input type="number" id="seed" value="7" style="width:60px" onchange="redrawAll()"></label>
+</div>
+
+<!-- 1 ------------------------------------------------------------------ -->
+<div class="panel">
+  <h2>1. Random vectors are almost orthogonal</h2>
+  <div class="note">In high dimension, independent random vectors have cosine similarity near 0 (spread about 1/&radic;D).
+  That is what lets thousands of symbols coexist without confusing each other.</div>
+  <div class="row"><div id="orthoHeat" style="height:340px"></div><div id="orthoHist" style="height:340px"></div></div>
+</div>
+
+<!-- 2 ------------------------------------------------------------------ -->
+<div class="panel">
+  <h2>2. A record in one vector: bind roles to fillers, bundle, then ask</h2>
+  <div class="formula">record = name &otimes; Lily &nbsp;+&nbsp; pet &otimes; cat &nbsp;+&nbsp; place &otimes; park &nbsp;+&nbsp; ... &nbsp;&nbsp;&nbsp;&nbsp;
+  query: pet<sup>-1</sup> &otimes; record &rarr; nearest filler</div>
+  <div>
+    <label>record (role=filler, comma separated)</label>
+    <input type="text" id="record" style="width:70%" value="name=Lily, pet=cat, place=park, color=red, food=cake, friend=Tom" oninput="drawRecord()"><br>
+    <label>ask role</label> <span id="roleBtns"></span>
+  </div>
+  <div class="row"><div id="recordBars" style="height:330px"></div><div id="recordInfo" class="note" style="padding-top:20px"></div></div>
+</div>
+
+<!-- 3 ------------------------------------------------------------------ -->
+<div class="panel">
+  <h2>3. Capacity: how many pairs fit before answers turn to noise</h2>
+  <div class="note">Every extra pair adds crosstalk to each unbinding. Accuracy of the clean-up (out of a vocabulary of
+  <span id="vocabN">200</span> fillers) as the record grows, for several dimensions. Roughly, capacity grows linearly with D.</div>
+  <button onclick="drawCapacity()">re-run</button>
+  <div id="capacity" style="height:360px"></div>
+</div>
+
+<!-- 4 ------------------------------------------------------------------ -->
+<div class="panel">
+  <h2>4. The link to our models: RoPE is binding with position</h2>
+  <div class="formula">
+    RoPE rotates each pair of dims of token e by angle k&middot;&theta;<sub>i</sub>: as a complex number, R<sub>k</sub> e = e &middot; exp(i k &theta;<sub>i</sub>)
+    &nbsp;=&nbsp; e &otimes; p<sub>k</sub> &nbsp;&nbsp;(FHRR binding with a position vector p<sub>k</sub>)<br>
+    our context vector &nbsp; h = &Sigma;<sub>k</sub> w(k) R<sub>k</sub> e<sub>t(n-k)</sub> &nbsp; is a <b>bundle of position-bound tokens</b><br>
+    unbinding position k: &nbsp; R<sub>-k</sub> h &asymp; w(k) e<sub>t(n-k)</sub> + crosstalk &nbsp;&rarr;&nbsp; clean up against the vocabulary: "which token was k steps back?"
+  </div>
+  <div>
+    <label>sequence</label>
+    <input type="text" id="seq" style="width:70%" value="Once upon a time there was a little girl named Lily . She had a red ball and a pet cat named Tom" oninput="drawSeq()"><br>
+    <label>position frequencies <select id="freqs" onchange="drawSeq()">
+      <option value="rope" selected>RoPE: &theta;_i = 10000^(-i/(D/2)) (as in our models)</option>
+      <option value="random">random angles (classic FHRR positions)</option></select></label>
+    <label>weights w(k) <select id="wk" onchange="drawSeq()">
+      <option value="flat">flat (all 1)</option><option value="inv" selected>1/k (decay)</option><option value="exp">exp(-k/8)</option></select></label>
+    <label>vocabulary for clean-up: sequence words + <input type="number" id="extraVocab" value="300" style="width:60px" onchange="drawSeq()"> random words</label>
+  </div>
+  <div class="row"><div id="seqAcc" style="height:330px"></div><div id="seqQuery" style="height:330px"></div></div>
+  <div class="note">Left: for every distance k, the similarity of the unbound vector to the right token (green = clean-up picks
+  the right token, red = wrong). Right: click a bar on the left to see the full clean-up ranking for that k.
+  With RoPE frequencies many dims rotate very slowly, so position k and k&plusmn;1 are nearly the same binding: nearby
+  positions blur together (the model "knows roughly where" rather than "exactly where"), while random angles separate
+  every position. Decaying weights make far tokens fade below the crosstalk, which is exactly the recency trade-off our
+  kernels learn.</div>
+</div>
+
+<div class="panel note">
+  <b>Takeaways for the token-kernel models</b><br>
+  - Our banks already <i>bind</i> (RoPE rotation by distance) and <i>bundle</i> (the weighted sum); the readout is a linear
+  clean-up against the vocabulary, which is why a name in the context votes for itself (section 2/4 in miniature).<br>
+  - What they lack is explicit <i>unbinding by a query</i>: asking "what was the verb?" needs a learned role vector and an
+  unbind step before the clean-up (the per-token prior and the router only re-weight the bundle).<br>
+  - Capacity is the real constraint at D = 128: a bundle of ~128 tokens is far past the clean recall range of section 3,
+  so the kernels must focus energy on few tokens (the "selective context" we saw) for anything to stay recoverable.
+</div>
+
+<script>
+// ------------------------------------------------------------------ vector algebra
+function rng(seed) { let s = seed >>> 0; return () => { s = (s + 0x6D2B79F5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const D = () => +document.getElementById("dim").value;
+const SCH = () => document.getElementById("scheme").value;
+// A vector: FHRR -> {re, im} (unit phasors), MAP -> {re} bipolar.
+function randVec(r, d = D(), sch = SCH()) {
+  if (sch === "map") return { re: Float64Array.from({ length: d }, () => (r() < 0.5 ? -1 : 1)) };
+  const re = new Float64Array(d), im = new Float64Array(d);
+  for (let i = 0; i < d; i++) { const a = 2 * Math.PI * r(); re[i] = Math.cos(a); im[i] = Math.sin(a); }
+  return { re, im };
+}
+function bind(a, b) {
+  if (!a.im) return { re: a.re.map((v, i) => v * b.re[i]) };
+  const re = new Float64Array(a.re.length), im = new Float64Array(a.re.length);
+  for (let i = 0; i < re.length; i++) { re[i] = a.re[i] * b.re[i] - a.im[i] * b.im[i]; im[i] = a.re[i] * b.im[i] + a.im[i] * b.re[i]; }
+  return { re, im };
+}
+function inv(a) { return a.im ? { re: a.re.slice(), im: a.im.map(v => -v) } : a; }  // conjugate / self-inverse
+function add(a, b, w = 1) { const o = { re: a.re.map((v, i) => v + w * b.re[i]) }; if (a.im) o.im = a.im.map((v, i) => v + w * b.im[i]); return o; }
+function zero(d = D(), sch = SCH()) { const o = { re: new Float64Array(d) }; if (sch !== "map") o.im = new Float64Array(d); return o; }
+function cos(a, b) {  // real cosine similarity (complex vectors as 2D-real)
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.re.length; i++) { dot += a.re[i] * b.re[i]; na += a.re[i] ** 2; nb += b.re[i] ** 2;
+    if (a.im) { dot += a.im[i] * b.im[i]; na += a.im[i] ** 2; nb += b.im[i] ** 2; } }
+  return dot / (Math.sqrt(na * nb) || 1);
+}
+const seed = () => +document.getElementById("seed").value;
+// item memory: a stable random vector per symbol name
+function memory(r) { const m = {}; return name => (m[name] ||= randVec(r)); }
+
+// ------------------------------------------------------------------ 1. orthogonality
+function drawOrtho() {
+  const r = rng(seed()), n = 12, vs = Array.from({ length: n }, () => randVec(r));
+  const z = vs.map(a => vs.map(b => cos(a, b)));
+  Plotly.react("orthoHeat", [{ type: "heatmap", z, zmin: -1, zmax: 1, colorscale: "RdBu", reversescale: true, x: vs.map((_, i) => "v" + i), y: vs.map((_, i) => "v" + i) }],
+    { title: `cosine between 12 random vectors, D = ${D()}`, margin: { t: 40, l: 40 } }, { displayModeBar: false });
+  const r2 = rng(seed() + 1), sims = [];
+  for (let t = 0; t < 600; t++) sims.push(cos(randVec(r2), randVec(r2)));
+  Plotly.react("orthoHist", [{ type: "histogram", x: sims, nbinsx: 40, marker: { color: "#4393c3" } }],
+    { title: `cosine of 600 random pairs (std ${Math.sqrt(sims.reduce((a, b) => a + b * b, 0) / sims.length).toFixed(3)}, 1/sqrt(D) = ${(1 / Math.sqrt(D())).toFixed(3)})`,
+      xaxis: { range: [-1, 1], title: "cosine" }, margin: { t: 40 } }, { displayModeBar: false });
+}
+
+// ------------------------------------------------------------------ 2. record
+let askRole = null;
+function parseRecord() {
+  return document.getElementById("record").value.split(",").map(x => x.split("=").map(s => s.trim())).filter(p => p.length === 2 && p[0] && p[1]);
+}
+function drawRecord() {
+  const pairs = parseRecord(); if (!pairs.length) return;
+  const r = rng(seed() + 2), mem = memory(r);
+  const roles = pairs.map(p => p[0]); if (!roles.includes(askRole)) askRole = roles[Math.min(1, roles.length - 1)];
+  document.getElementById("roleBtns").innerHTML = roles.map(ro => `<button style="${ro === askRole ? "background:#333;color:#fff" : ""}" onclick="askRole='${ro}';drawRecord()">${ro}</button>`).join("");
+  let rec = zero();
+  for (const [ro, fi] of pairs) rec = add(rec, bind(mem("role:" + ro), mem("item:" + fi)));
+  const probe = bind(inv(mem("role:" + askRole)), rec);
+  const fillers = [...new Set(pairs.map(p => p[1]).concat(["dog", "Ben", "school", "blue", "apple", "Mia", "tree", "ball", "Sue", "house"]))];
+  const sims = fillers.map(f => cos(probe, mem("item:" + f))), order = sims.map((_, i) => i).sort((a, b) => sims[b] - sims[a]);
+  const truth = pairs.find(p => p[0] === askRole)[1];
+  Plotly.react("recordBars", [{ type: "bar", x: order.map(i => fillers[i]), y: order.map(i => sims[i]),
+    marker: { color: order.map(i => (fillers[i] === truth ? "#1a9850" : "#bbb")) } }],
+    { title: `unbind "${askRole}" from the record, then compare with every known filler`, yaxis: { title: "cosine", range: [-0.3, 1] }, margin: { t: 40 } }, { displayModeBar: false });
+  const best = fillers[order[0]];
+  const bindSim = cos(bind(mem("role:" + askRole), mem("item:" + truth)), mem("item:" + truth));
+  document.getElementById("recordInfo").innerHTML =
+    `answer: <b class="${best === truth ? "ok" : "bad"}">${best}</b> (true: ${truth})<br><br>` +
+    `similarity of the answer: ${sims[order[0]].toFixed(3)}; runner-up ${fillers[order[1]]}: ${sims[order[1]].toFixed(3)}<br>` +
+    `record holds ${pairs.length} pairs in one vector of D = ${D()} ${SCH() === "fhrr" ? "complex" : "&plusmn;1"} numbers<br><br>` +
+    `bound pair vs its own filler: cosine ${bindSim.toFixed(3)} (binding hides the filler until you unbind)<br>` +
+    `record vs "${truth}" directly (no unbind): ${cos(rec, mem("item:" + truth)).toFixed(3)}`;
+}
+
+// ------------------------------------------------------------------ 3. capacity
+function drawCapacity() {
+  const vocabN = 200; document.getElementById("vocabN").textContent = vocabN;
+  const dims = [64, 128, 256, 1024], ns = [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96], trials = 3, traces = [];
+  for (const d of dims) {
+    const acc = [];
+    for (const n of ns) {
+      let ok = 0, tot = 0;
+      for (let t = 0; t < trials; t++) {
+        const r = rng(seed() * 1000 + d * 7 + n * 13 + t);
+        const items = Array.from({ length: vocabN }, () => randVec(r, d)), roles = Array.from({ length: n }, () => randVec(r, d));
+        const fill = roles.map(() => Math.floor(r() * vocabN));
+        let rec = zero(d); roles.forEach((ro, i) => { rec = add(rec, bind(ro, items[fill[i]])); });
+        roles.forEach((ro, i) => {
+          const probe = bind(inv(ro), rec); let best = -1, bs = -2;
+          items.forEach((it, j) => { const c = cos(probe, it); if (c > bs) { bs = c; best = j; } });
+          ok += best === fill[i]; tot++;
+        });
+      }
+      acc.push(ok / tot);
+    }
+    traces.push({ x: ns, y: acc, mode: "lines+markers", name: `D = ${d}` });
+  }
+  Plotly.react("capacity", traces, { title: `clean-up accuracy vs pairs bundled (${SCH().toUpperCase()}, vocabulary ${vocabN})`,
+    xaxis: { title: "pairs in the record", type: "log" }, yaxis: { title: "accuracy", range: [0, 1.05] }, margin: { t: 40 } }, { displayModeBar: false });
+}
+
+// ------------------------------------------------------------------ 4. RoPE sequence
+let seqK = 1;
+function drawSeq() {
+  const toks = document.getElementById("seq").value.split(/\s+/).filter(Boolean);
+  const n = toks.length, d = D(), half = Math.floor(d / 2);
+  const r = rng(seed() + 3);
+  // complex token vectors in half dims (as RoPE pairs dims i and i + d/2 into one complex number)
+  const vocab = [...new Set(toks)], extra = +document.getElementById("extraVocab").value;
+  for (let i = 0; i < extra; i++) vocab.push("w" + i);
+  const emb = {}; vocab.forEach(w => emb[w] = randVec(r, half, "fhrr"));
+  const freqKind = document.getElementById("freqs").value, wk = document.getElementById("wk").value;
+  const theta = Float64Array.from({ length: half }, (_, i) => (freqKind === "rope" ? Math.pow(10000, -i / half) : 2 * Math.PI * r()));
+  const rot = (v, k) => bind(v, { re: theta.map(t => Math.cos(k * t)), im: theta.map(t => Math.sin(k * t)) });
+  const weight = k => (wk === "flat" ? 1 : wk === "inv" ? 1 / k : Math.exp(-k / 8));
+  let h = zero(half, "fhrr");
+  toks.forEach((t, j) => { const k = n - j; h = add(h, rot(emb[t], k), weight(k)); });  // k = 1 is the last token
+  const ks = Array.from({ length: n }, (_, i) => i + 1), right = [], correct = [], rankings = {};
+  for (const k of ks) {
+    const probe = rot(h, -k), truth = toks[n - k];
+    const sims = vocab.map(w => cos(probe, emb[w])), ord = sims.map((_, i) => i).sort((a, b) => sims[b] - sims[a]);
+    right.push(sims[vocab.indexOf(truth)]); correct.push(vocab[ord[0]] === truth);
+    rankings[k] = { truth, top: ord.slice(0, 12).map(i => [vocab[i], sims[i]]) };
+  }
+  const acc = correct.filter(Boolean).length / n;
+  Plotly.react("seqAcc", [{ type: "bar", x: ks, y: right, marker: { color: correct.map(c => (c ? "#1a9850" : "#d73027")) },
+    text: ks.map(k => toks[n - k]), hovertemplate: "k=%{x}: %{text}<br>cosine %{y:.3f}<extra></extra>" }],
+    { title: `unbind every position from one D=${d} vector: ${(acc * 100).toFixed(0)}% recovered`, xaxis: { title: "distance k (1 = last token)" },
+      yaxis: { title: "cosine to the right token" }, margin: { t: 40 } }, { displayModeBar: false });
+  document.getElementById("seqAcc").on("plotly_click", ev => { seqK = ev.points[0].x; drawQuery(rankings); });
+  if (!rankings[seqK]) seqK = 1;
+  drawQuery(rankings);
+}
+function drawQuery(rankings) {
+  const q = rankings[seqK]; if (!q) return;
+  Plotly.react("seqQuery", [{ type: "bar", x: q.top.map(t => t[0]), y: q.top.map(t => t[1]),
+    marker: { color: q.top.map(t => (t[0] === q.truth ? "#1a9850" : "#bbb")) } }],
+    { title: `k = ${seqK}: what was ${seqK} step(s) back? (true: "${q.truth}")`, yaxis: { title: "cosine" }, margin: { t: 40 } }, { displayModeBar: false });
+}
+
+function redrawAll() { drawOrtho(); drawRecord(); drawCapacity(); drawSeq(); }
+redrawAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selection by resonance: banks tuned like oscillators</title>
+<style>
+  :root { --b: #e2e8f0; --t: #1e293b; --m: #64748b; --bg: #f8fafc; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--t); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  header { background: #fff; border-bottom: 1px solid var(--b); padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--m); font-size: 13px; max-width: 1150px; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--b); border-radius: 6px; min-width: 0; }
+  .card h2 { margin: 0; padding: 9px 14px; border-bottom: 1px solid var(--b); font-size: 14px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .card h2 span { font-weight: 400; color: var(--m); font-size: 12px; }
+  .body { padding: 12px 14px; }
+  .full { grid-column: 1 / -1; }
+  .note { color: var(--m); font-size: 12px; margin: 6px 0 0; }
+  .tok { display: inline-block; margin: 3px 2px; padding: 3px 8px; border: 1px solid var(--b); border-radius: 4px; cursor: pointer; font-family: ui-monospace, monospace; font-size: 14px; user-select: none; background: #fff; color: #94a3b8; }
+  .tok.on { color: var(--t); border-color: #94a3b8; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+  label.k { color: var(--m); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
+  button:hover { background: #f1f5f9; }
+  canvas { width: 100%; display: block; }
+  .banks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .bank { border: 1px solid var(--b); border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+  .bank.sel { outline: 2px solid #1e293b; }
+  .bank h3 { margin: 0 0 4px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .bank h3 i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .sl { display: grid; grid-template-columns: 4.2rem 1fr 2.6rem; align-items: center; gap: 4px; font-size: 12px; color: var(--m); }
+  .sl input { width: 100%; }
+  .sl b { font-weight: 400; color: var(--t); text-align: right; font-variant-numeric: tabular-nums; }
+  .sel-text { line-height: 2; font-family: ui-monospace, monospace; font-size: 13px; }
+  .sel-text span { padding: 1px 3px; border-radius: 3px; }
+  .math { font-family: ui-serif, Georgia, serif; font-size: 15px; background: #f8fafc; border: 1px solid var(--b); border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+  table { border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 2px 6px; text-align: left; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Selection by resonance: banks tuned like oscillators</h1>
+  <p>Every token has a frequency and a phase; every bank has a frequency, a phase and a sharpness (Q). A token's prior in a bank is how strongly it resonates with the bank:
+    tuned tokens get a high weight, detuned ones almost none. So the per-token, per-bank prior table becomes two numbers per token, and tokens with nearby frequencies are selected together:
+    the grouping comes from the spectrum. Retune a bank (or let the context retune it) and it selects a different group. Waves are synthetic: entity, place, action and opening words sit in
+    four frequency bands; function words are scattered.</p>
+</header>
+<main>
+  <section class="card full">
+    <h2>Sentence <span>click words to switch them on/off; the banks select among the words that are on</span></h2>
+    <div class="body">
+      <div id="sent"></div>
+      <div class="row" style="margin-top:8px">
+        <label class="k">presets</label>
+        <button data-p="*">all</button><button data-p="rhinoceros named Roxy icy hill climb">a few content words</button><button data-p="">none</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>Banks <span>click a bank to inspect it; drag its tuning</span></h2>
+    <div class="body">
+      <div class="banks" id="banks"></div>
+      <div class="row" style="margin-top:12px">
+        <label class="k">context</label>
+        <input type="range" id="ctx" min="0" max="1" step="0.01" value="0" style="width:260px">
+        <span id="ctxv" style="font-size:13px"></span>
+      </div>
+      <p class="note">The context knob stands for the state of the text (for example the general state): it retunes bank 1 from the entity band toward the place band. The same bank then
+        selects different words, which is context-dependent feature selection with no new parameters per token.</p>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>Spectrum <span>tokens at their frequencies (height = amplitude), banks as resonance curves</span></h2>
+    <div class="body"><canvas id="spec"></canvas>
+      <p class="note">A token's prior in a bank = the bank's curve height at the token's frequency x the phase match. Sharp banks (high Q) select a narrow band; broad banks (low Q) mix neighbouring groups.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Priors from resonance <span>active tokens x banks</span></h2>
+    <div class="body"><canvas id="mat"></canvas>
+      <div class="math">prior<sub>b</sub>(t) = a<sub>t</sub> &middot; 1 / (1 + Q<sub>b</sub><sup>2</sup>(&omega;<sub>t</sub>/&omega;<sub>b</sub> &minus; &omega;<sub>b</sub>/&omega;<sub>t</sub>)<sup>2</sup>) &middot; (1 + cos(&phi;<sub>t</sub> &minus; &phi;<sub>b</sub>)) / 2</div>
+      <p class="note">The first factor is the classic resonance (Lorentzian) curve of a driven oscillator; the second rewards being in phase with the bank.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>What each bank selected <span>share of the bank's weight (normalized like the real banks)</span></h2>
+    <div class="body" id="selected"></div>
+  </section>
+
+  <section class="card">
+    <h2>Resonance in time <span id="wavet"></span></h2>
+    <div class="body"><canvas id="waves"></canvas>
+      <p class="note">Black: the bank's wave. Thin: the active tokens' waves. A tuned token stays in step with the bank, so their product stays positive and its running average (right panel) settles high;
+        a detuned token drifts in and out of step (beats) and its average falls toward 0. The prior is this overlap, in closed form.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Overlap over a window <span>running mean of token x bank, per token</span></h2>
+    <div class="body"><canvas id="overlap"></canvas>
+      <p class="note">Each line is one active token's overlap with the selected bank as the window grows. Tuned tokens converge to a high value; detuned ones oscillate around 0: the longer the window, the sharper the selection.</p></div>
+  </section>
+
+  <section class="card full">
+    <h2>How this maps to the model</h2>
+    <div class="body" style="font-size:13px">
+      <p style="margin-top:0"><b>Today:</b> each bank has its own prior per token (64 banks x 10k tokens = 640k free numbers), learned independently. Nothing ties "hill" in bank 4 to "hill" in bank 7, or "hill" to "mountain".</p>
+      <p><b>With resonance:</b> each token has a frequency and a phase (or a few of each), each bank a frequency, phase and Q. Priors become prior<sub>b</sub>(t) = resonance(token, bank): 2-3 numbers per token
+        instead of one per bank, and words with similar roles end up in the same band, so they are selected together by every bank tuned there. Adding banks is cheap (3 numbers each).</p>
+      <p><b>Context feature selection:</b> let the bank's frequency depend on the context, &omega;<sub>b</sub> = f<sub>b</sub>(general state). The same bank then pulls places in one passage and characters in another.
+        It stays exactly parallel: the weight of token s for query q is a scalar function of (token s, context at q), so the banded weighted sum works as now; only the weight table is per query
+        instead of per token (cost like the bank sums, far below attention).</p>
+      <p style="margin-bottom:0"><b>Together with the clock:</b> the resonance prior can also drive the bank's clock (time advances by the prior), so the tokens a bank resonates with form its compact sequence.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+const WORDS = ["Once", "upon", "a", "time", ",", "there", "lived", "a", "rhinoceros", "named", "Roxy", ".", "Roxy", "loved", "to", "climb", "the", "icy", "hill", ".", "The", "hill", "was", "cold", "and", "slippery", "."];
+const GROUP = { Once: "opening", upon: "opening", time: "opening", rhinoceros: "entity", named: "entity", Roxy: "entity", icy: "place", hill: "place", cold: "place", slippery: "place",
+                lived: "action", loved: "action", climb: "action" };
+const BAND = { entity: 1.0, place: 1.8, action: 2.7, opening: 3.7 };
+const GPH = { entity: 0.6, place: 2.2, action: 3.9, opening: 5.3 };
+const GCOL = { entity: "#e15759", place: "#59a14f", action: "#4e79a7", opening: "#d4a72c", function: "#94a3b8" };
+let seed = 11; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const TOK = WORDS.map((w, j) => {
+  const g = GROUP[w] || "function";
+  return g === "function"
+    ? { w, g, f: 0.6 + 3.8 * rnd(), ph: rnd() * 2 * Math.PI, a: 0.55 }
+    : { w, g, f: BAND[g] * (1 + (rnd() - 0.5) * 0.08), ph: GPH[g] + (rnd() - 0.5) * 0.6, a: 1.0 };
+});
+const BANKS = [
+  { name: "bank 1", col: "#e15759", f: BAND.entity, ph: GPH.entity, q: 6 },
+  { name: "bank 2", col: "#59a14f", f: BAND.place, ph: GPH.place, q: 6 },
+  { name: "bank 3", col: "#4e79a7", f: BAND.action, ph: GPH.action, q: 6 },
+  { name: "bank 4", col: "#d4a72c", f: BAND.opening, ph: GPH.opening, q: 6 },
+];
+let on = new Set(TOK.map((_, j) => j)), selB = 0, ctx = 0;
+const bankF = b => (b === 0 ? BANKS[0].f + ctx * (BAND.place - BANKS[0].f) : BANKS[b].f);  // context retunes bank 1
+const bankPh = b => (b === 0 ? BANKS[0].ph + ctx * (GPH.place - BANKS[0].ph) : BANKS[b].ph);
+const lor = (f, b) => { const r = f / bankF(b) - bankF(b) / f; return 1 / (1 + BANKS[b].q ** 2 * r * r); };
+const prior = (j, b) => TOK[j].a * lor(TOK[j].f, b) * (1 + Math.cos(TOK[j].ph - bankPh(b))) / 2;
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+function canvas(id, h) {
+  const cv = document.getElementById(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600;
+  cv.style.height = h + "px"; cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h); g.font = "11px ui-sans-serif, system-ui"; return { g, w, h };
+}
+function rgba(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${Math.max(0, Math.min(1, a)).toFixed(3)})`; }
+
+// ---- UI ----
+const sent = document.getElementById("sent");
+sent.innerHTML = TOK.map((t, j) => `<span class="tok" data-j="${j}">${esc(t.w)}</span>`).join(" ");
+sent.querySelectorAll(".tok").forEach(el => el.onclick = () => { const j = +el.dataset.j; on.has(j) ? on.delete(j) : on.add(j); draw(); });
+document.querySelectorAll("[data-p]").forEach(b => b.onclick = () => {
+  const p = b.dataset.p; on = new Set(p === "*" ? TOK.map((_, j) => j) : TOK.map((t, j) => (p.split(" ").includes(t.w) ? j : -1)).filter(j => j >= 0)); draw();
+});
+const banksDiv = document.getElementById("banks");
+banksDiv.innerHTML = BANKS.map((B, b) => `<div class="bank" data-b="${b}">
+  <h3><i style="background:${B.col}"></i>${B.name}</h3>
+  <div class="sl">frequency<input type="range" min="0.5" max="4.5" step="0.01" value="${B.f}" data-k="f" data-b="${b}"><b id="vf${b}"></b></div>
+  <div class="sl">phase<input type="range" min="0" max="6.28" step="0.01" value="${B.ph}" data-k="ph" data-b="${b}"><b id="vph${b}"></b></div>
+  <div class="sl">sharpness Q<input type="range" min="1" max="20" step="0.5" value="${B.q}" data-k="q" data-b="${b}"><b id="vq${b}"></b></div></div>`).join("");
+banksDiv.querySelectorAll(".bank").forEach(el => el.addEventListener("click", e => { if (e.target.tagName !== "INPUT") { selB = +el.dataset.b; draw(); } }));
+banksDiv.querySelectorAll("input").forEach(el => el.oninput = () => { BANKS[+el.dataset.b][el.dataset.k] = +el.value; selB = +el.dataset.b; draw(); });
+document.getElementById("ctx").oninput = e => { ctx = +e.target.value; draw(); };
+
+function draw() {
+  sent.querySelectorAll(".tok").forEach(el => { const j = +el.dataset.j, isOn = on.has(j); el.classList.toggle("on", isOn); el.style.color = isOn ? GCOL[TOK[j].g] : ""; });
+  banksDiv.querySelectorAll(".bank").forEach(el => el.classList.toggle("sel", +el.dataset.b === selB));
+  BANKS.forEach((B, b) => { document.getElementById(`vf${b}`).textContent = bankF(b).toFixed(2); document.getElementById(`vph${b}`).textContent = bankPh(b).toFixed(2); document.getElementById(`vq${b}`).textContent = B.q; });
+  document.getElementById("ctxv").textContent = ctx < 0.05 ? "bank 1 tuned to characters" : ctx > 0.95 ? "bank 1 retuned to places" : `bank 1 between characters and places (${ctx.toFixed(2)})`;
+  drawSpectrum(); drawMatrix(); drawSelected(); drawWaves(); drawOverlap();
+}
+
+function drawSpectrum() {
+  const { g, w, h } = canvas("spec", 260), pL = 34, pR = 10, pT = 10, pB = 60, fx = f => pL + (f - 0.4) / 4.2 * (w - pL - pR), ph = h - pT - pB, y = v => pT + (1 - v) * ph;
+  g.strokeStyle = "#e2e8f0"; for (const v of [0, 0.5, 1]) { g.beginPath(); g.moveTo(pL, y(v)); g.lineTo(w - pR, y(v)); g.stroke(); g.fillStyle = "#64748b"; g.textAlign = "right"; g.fillText(v.toFixed(1), pL - 4, y(v) + 4); }
+  BANKS.forEach((B, b) => {
+    g.strokeStyle = B.col; g.lineWidth = b === selB ? 2.5 : 1.3; g.globalAlpha = b === selB ? 1 : 0.6; g.beginPath();
+    for (let s = 0; s <= 400; s++) { const f = 0.4 + 4.2 * s / 400, v = lor(f, b); s ? g.lineTo(fx(f), y(v)) : g.moveTo(fx(f), y(v)); } g.stroke(); g.globalAlpha = 1;
+  });
+  const placed = [];
+  TOK.forEach((t, j) => {
+    if (!on.has(j)) return;
+    const x = fx(t.f); g.strokeStyle = GCOL[t.g]; g.lineWidth = 2; g.beginPath(); g.moveTo(x, y(0)); g.lineTo(x, y(0) - t.a * 18); g.stroke();
+    let row = 0; while (placed.some(p => p.row === row && Math.abs(p.x - x) < 46)) row++; placed.push({ x, row });
+    g.save(); g.translate(x, y(0) + 12 + row * 12); g.fillStyle = GCOL[t.g]; g.textAlign = "center"; g.fillText(t.w, 0, 0); g.restore();
+  });
+  g.fillStyle = "#64748b"; g.textAlign = "center"; g.fillText("frequency →", (w + pL) / 2, h - 4);
+}
+
+function drawMatrix() {
+  const act = [...on], n = act.length, { g, w, h } = canvas("mat", Math.max(80, 26 + n * 15));
+  if (!n) return;
+  const pL = 92, pT = 18, cw = (w - pL - 8) / BANKS.length, ch = (h - pT - 4) / n;
+  BANKS.forEach((B, b) => { g.fillStyle = B.col; g.textAlign = "center"; g.fillText(B.name, pL + (b + 0.5) * cw, 12); });
+  act.forEach((j, r) => {
+    g.fillStyle = GCOL[TOK[j].g]; g.textAlign = "right"; g.fillText(TOK[j].w, pL - 6, pT + r * ch + ch / 2 + 4);
+    BANKS.forEach((B, b) => { const v = prior(j, b); g.fillStyle = rgba(B.col, v); g.fillRect(pL + b * cw + 1, pT + r * ch + 1, cw - 2, ch - 2);
+      if (ch > 11) { g.fillStyle = v > 0.55 ? "#fff" : "#475569"; g.textAlign = "center"; g.fillText(v.toFixed(2), pL + (b + 0.5) * cw, pT + r * ch + ch / 2 + 4); } });
+  });
+}
+
+function drawSelected() {
+  const act = [...on].sort((a, b) => a - b);
+  document.getElementById("selected").innerHTML = BANKS.map((B, b) => {
+    const p = act.map(j => prior(j, b)), tot = p.reduce((s, v) => s + v, 0) || 1, pmax = Math.max(...p, 1e-9);
+    const top = act.map((j, i) => [j, p[i] / tot]).sort((a, c) => c[1] - a[1]).slice(0, 4).filter(x => x[1] > 0.02);
+    return `<div style="margin-bottom:10px"><div style="font-size:12px;color:${B.col};font-weight:600">${B.name} <span style="color:#64748b;font-weight:400">top: ${top.map(([j, s]) => `${esc(TOK[j].w)} ${(s * 100).toFixed(0)}%`).join(", ") || "-"}</span></div>
+      <div class="sel-text">${act.map((j, i) => `<span style="background:${rgba(B.col, 0.85 * p[i] / pmax)};color:${p[i] / pmax > 0.6 ? "#fff" : "#1e293b"}">${esc(TOK[j].w)}</span>`).join(" ")}</div></div>`;
+  }).join("");
+}
+
+function drawWaves() {
+  const { g, w, h } = canvas("waves", 220), b = selB, act = [...on], span = 18, y0 = h / 2, amp = h / 2 - 14, X = s => 6 + s / span * (w - 12);
+  document.getElementById("wavet").textContent = `${BANKS[b].name} (frequency ${bankF(b).toFixed(2)})`;
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(0, y0); g.lineTo(w, y0); g.stroke();
+  act.forEach(j => {
+    const t = TOK[j], pr = prior(j, b); g.strokeStyle = GCOL[t.g]; g.globalAlpha = 0.25 + 0.75 * Math.min(1, pr * 1.5); g.lineWidth = 1; g.beginPath();
+    for (let s = 0; s <= 400; s++) { const x = s / 400 * span, v = 0.6 * t.a * Math.cos(t.f * x + t.ph); s ? g.lineTo(X(x), y0 - v * amp) : g.moveTo(X(x), y0 - v * amp); } g.stroke();
+  });
+  g.globalAlpha = 1; g.strokeStyle = "#0f172a"; g.lineWidth = 2.5; g.beginPath();
+  for (let s = 0; s <= 400; s++) { const x = s / 400 * span, v = Math.cos(bankF(b) * x + bankPh(b)); s ? g.lineTo(X(x), y0 - v * amp) : g.moveTo(X(x), y0 - v * amp); } g.stroke();
+}
+
+function drawOverlap() {
+  const { g, w, h } = canvas("overlap", 220), b = selB, act = [...on], span = 40, pL = 34, y = v => 10 + (1 - (v + 0.5) / 1.5) * (h - 30), X = s => pL + s / span * (w - pL - 8);
+  g.strokeStyle = "#e2e8f0"; g.fillStyle = "#64748b"; g.textAlign = "right";
+  for (const v of [-0.5, 0, 0.5, 1]) { g.beginPath(); g.moveTo(pL, y(v)); g.lineTo(w, y(v)); g.stroke(); g.fillText(v.toFixed(1), pL - 4, y(v) + 4); }
+  g.textAlign = "center"; g.fillText("window length →", (w + pL) / 2, h - 4);
+  act.forEach(j => {
+    const t = TOK[j]; let acc = 0; const n = 400; g.strokeStyle = GCOL[t.g]; g.lineWidth = 1.3; g.beginPath();
+    for (let s = 1; s <= n; s++) { const x = s / n * span; acc += 2 * t.a * Math.cos(t.f * x + t.ph) * Math.cos(bankF(b) * x + bankPh(b)); const v = acc / s; s > 1 ? g.lineTo(X(x), y(v)) : g.moveTo(X(x), y(v)); }
+    g.stroke();
+  });
+}
+
+window.addEventListener("resize", draw);
+draw();
+</script>
+</body>
+</html>

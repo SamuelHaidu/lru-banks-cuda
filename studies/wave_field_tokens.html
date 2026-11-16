@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tokens as radio stations: emit waves, listen with filters</title>
+<style>
+  :root { --b: #e2e8f0; --t: #1e293b; --m: #64748b; --bg: #f8fafc; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--t); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  header { background: #fff; border-bottom: 1px solid var(--b); padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--m); font-size: 13px; max-width: 1150px; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--b); border-radius: 6px; min-width: 0; }
+  .card h2 { margin: 0; padding: 9px 14px; border-bottom: 1px solid var(--b); font-size: 14px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .card h2 span { font-weight: 400; color: var(--m); font-size: 12px; }
+  .body { padding: 12px 14px; }
+  .full { grid-column: 1 / -1; }
+  .note { color: var(--m); font-size: 12px; margin: 6px 0 0; }
+  .tok { display: inline-block; margin: 3px 2px; padding: 4px 10px; border: 1px solid var(--b); border-radius: 4px; cursor: pointer; font-family: ui-monospace, monospace; font-size: 15px; background: #fff; }
+  .tok.sel { outline: 2px solid #1e293b; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+  label.k { color: var(--m); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
+  button:hover { background: #f1f5f9; } button.act { background: #1e293b; color: #fff; border-color: #1e293b; }
+  canvas { width: 100%; display: block; }
+  .math { font-family: ui-serif, Georgia, serif; font-size: 15px; background: #f8fafc; border: 1px solid var(--b); border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+  .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .sub { font-size: 12px; color: var(--m); margin-bottom: 2px; }
+  .big { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tokens as radio stations: emit waves, listen with band-pass filters</h1>
+  <p>Each token broadcasts a mix of damped waves on shared "stations" (frequencies), with its own strength, phase and propagation length: its embedding <i>is</i> that signal.
+    The field at a position is everything broadcast before it. Each token also has a receiver, a band-pass filter per station; what it picks up from the field is its contextualized feature.
+    "time" after "Once upon" hears the opening stations; after "took some" it hears others, so it becomes a different vector. Distance lives in the wave phases (no RoPE), and the field
+    is a running sum, so inference keeps a constant-size state. Signals are synthetic, designed to show the mechanism.</p>
+</header>
+<main>
+  <section class="card full">
+    <h2>Sentence <span>click a word to see what it receives</span></h2>
+    <div class="body">
+      <div class="row"><label class="k">sentence</label>
+        <button data-s="0" class="act">Once upon a time there was a cat</button>
+        <button data-s="1">He took some time to think</button>
+        <button data-s="2">Once upon a time he took some time</button></div>
+      <div id="sent" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:8px"><label class="k">station shown in the waveform</label><input type="range" id="kst" min="0" max="15" step="1" value="2" style="width:220px"><span id="kstv"></span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Emitters: what each token broadcasts <span>amplitude per station (color = phase), and how far it carries</span></h2>
+    <div class="body"><canvas id="emit"></canvas>
+      <p class="note">One row per word: bars = amplitude on each of the 16 stations (low frequency left), bar color = phase. The right column is the propagation length (short / medium / long decay class).</p></div>
+  </section>
+
+  <section class="card">
+    <h2>The field <span>|F<sub>k</sub>(i)|: energy on each station at each position</span></h2>
+    <div class="body"><canvas id="field"></canvas>
+      <p class="note">Broadcasts start at their word and fade with distance at their own rate; the field is the superposition. Long-range words (Once, upon) keep their stations lit for the rest of the sentence.</p></div>
+  </section>
+
+  <section class="card full">
+    <h2>Waves on one station <span id="wavet"></span></h2>
+    <div class="body"><canvas id="wave"></canvas>
+      <p class="note">Thin: each word's damped wave on this station, starting at the word. Thick: the field (their sum). Dots: the field sampled at each word, which is what that word's receiver hears on this station.</p></div>
+  </section>
+
+  <section class="card full">
+    <h2>Receiver of the selected word <span id="rect"></span></h2>
+    <div class="body">
+      <div class="three">
+        <div><div class="sub">field it hears |F(i)| per station</div><canvas id="rfield"></canvas></div>
+        <div><div class="sub">its band-pass filter g per station</div><canvas id="rfilt"></canvas></div>
+        <div><div class="sub">its feature = g &middot; |F(i)| (what it picks up)</div><canvas id="rfeat"></canvas></div>
+      </div>
+      <div class="math">F<sub>k</sub>(i) = &Sigma;<sub>j&le;i</sub> c<sub>tok j, k</sub> e<sup>(&minus;&alpha;<sub>tok j</sub> + i&omega;<sub>k</sub>)(i&minus;j)</sup> &nbsp;&nbsp;&nbsp; feature<sub>i,k</sub> = g<sub>tok i, k</sub> &middot; |F<sub>k</sub>(i)| &nbsp;&nbsp;(the complex value can be kept too)</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Same word, different context <span>the feature of "time" in each sentence</span></h2>
+    <div class="body"><canvas id="cmp"></canvas>
+      <div class="row" style="margin-top:6px"><div><div class="sub">cosine between the two "time" features</div><div class="big" id="cos">-</div></div>
+        <p class="note" style="flex:1">Same token, same filter, same emission; the only difference is what was broadcast before it. A plain embedding would give cosine 1.</p></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Constant-size state at inference <span>the field as a running sum</span></h2>
+    <div class="body">
+      <div class="math">F<sub>k,l</sub>(i) = e<sup>&minus;&alpha;<sub>l</sub> + i&omega;<sub>k</sub></sup> &middot; F<sub>k,l</sub>(i&minus;1) + c<sub>tok i, k</sub> &middot; [tok i in class l]</div>
+      <p style="font-size:13px;margin:6px 0">Each step multiplies the stored field by one complex number per (station, decay class) and adds the new word's broadcast. State = stations x decay classes:
+        here <b>16 x 3 = 48</b> complex numbers, whatever the length of the text. The running sum and the explicit sum give the same field: <b id="rec">-</b>.</p>
+      <p class="note">This needs the decay to come from a small set of classes (tokens choose one, or a mix): one accumulator cannot hold signals that fade at arbitrary per-token rates.
+        Training is still parallel: the field for all positions is a causal sum of damped waves (a scan, or our block-banded trick).</p>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>What this replaces</h2>
+    <div class="body" style="font-size:13px">
+      <p style="margin-top:0"><b>Embedding table &rarr; emission table:</b> each token stores its broadcast (complex amplitude per station) and its decay class. <b>RoPE &rarr; the stations:</b> e<sup>i&omega;&Delta;</sup> is the distance code.
+        <b>Banks &rarr; decay classes:</b> how long a word's signal carries is chosen by the word. <b>Router / final state &rarr; receivers at every position:</b> every word gets a contextualized feature, not just the last one.</p>
+      <p><b>Known relatives:</b> complex diagonal state-space models (S4D, LRU) are a field of damped waves with input-independent decay; Mamba makes emission and readout depend on the token.
+        The difference here: the decay belongs to the emitting word (its propagation length), the idea behind the per-token &lambda; of the banks.</p>
+      <p style="margin-bottom:0"><b>Depth:</b> layer-2 words can broadcast from their contextualized features, so later layers listen to compositions ("a character was introduced, then a place"), still parallel and still a constant state per layer.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+const K = 16, OMEGA = Array.from({ length: K }, (_, k) => 0.25 + k * 0.18);
+const DECAY = { short: 0.7, medium: 0.22, long: 0.05 };
+const CLASSES = ["short", "medium", "long"];
+// synthetic emitters: stations (amplitude 1 unless noted), phase, decay class; and receivers (stations listened to)
+const T = (stations, ph, cls, listen = [], amp = 1) => ({ stations, ph, cls, listen, amp });
+const LEX = {
+  Once: T([1, 2, 3], 0.3, "long"), upon: T([2, 3, 4], 0.5, "long"), a: T([5], 1.0, "short", [], 0.35),
+  time: T([6, 7], 2.0, "medium", [1, 2, 3, 4, 10, 11, 12]), there: T([8], 2.5, "short", [], 0.4), was: T([9], 3.0, "short", [6, 7], 0.4),
+  cat: T([13, 14], 4.0, "medium", [1, 2, 3, 6, 7]), He: T([8, 9], 1.5, "medium", []), took: T([10, 11, 12], 2.8, "medium", [8, 9]),
+  some: T([10, 11], 3.1, "medium", [10, 11, 12]), to: T([15], 0.2, "short", [], 0.35), think: T([14, 15], 5.0, "medium", [8, 9, 10, 11]),
+  he: T([8, 9], 1.5, "medium", [1, 2, 3]),
+};
+const SENT = ["Once upon a time there was a cat", "He took some time to think", "Once upon a time he took some time"].map(s => s.split(" "));
+const emission = w => { const L = LEX[w]; return Array.from({ length: K }, (_, k) => L.stations.includes(k) ? { a: L.amp, ph: L.ph + 0.25 * k } : { a: 0, ph: 0 }); };
+const filter = w => Array.from({ length: K }, (_, k) => (LEX[w].listen.includes(k) ? 1 : 0.08));
+let si = 0, sel = 3, kst = 2;
+
+function fieldAt(words, i) {  // explicit sum: F_k(i) = sum_{j<=i} c_jk e^{(-a_j + i w_k)(i-j)}
+  const re = new Array(K).fill(0), im = new Array(K).fill(0);
+  for (let j = 0; j <= i; j++) {
+    const e = emission(words[j]), a = DECAY[LEX[words[j]].cls], d = i - j;
+    for (let k = 0; k < K; k++) if (e[k].a) { const m = e[k].a * Math.exp(-a * d), ang = e[k].ph + OMEGA[k] * d; re[k] += m * Math.cos(ang); im[k] += m * Math.sin(ang); }
+  }
+  return { re, im, mag: re.map((r, k) => Math.hypot(r, im[k])) };
+}
+function fieldRecurrent(words) {  // running sum per (station, class): constant-size state
+  const st = CLASSES.map(() => ({ re: new Array(K).fill(0), im: new Array(K).fill(0) })), out = [];
+  words.forEach(w => {
+    CLASSES.forEach((c, l) => { const a = DECAY[c]; for (let k = 0; k < K; k++) {
+      const m = Math.exp(-a), cs = Math.cos(OMEGA[k]), sn = Math.sin(OMEGA[k]), r = st[l].re[k], i = st[l].im[k];
+      st[l].re[k] = m * (r * cs - i * sn); st[l].im[k] = m * (r * sn + i * cs); } });
+    const e = emission(w), l = CLASSES.indexOf(LEX[w].cls);
+    for (let k = 0; k < K; k++) if (e[k].a) { st[l].re[k] += e[k].a * Math.cos(e[k].ph); st[l].im[k] += e[k].a * Math.sin(e[k].ph); }
+    out.push(Array.from({ length: K }, (_, k) => Math.hypot(st.reduce((s, x) => s + x.re[k], 0), st.reduce((s, x) => s + x.im[k], 0))));
+  });
+  return out;
+}
+const feature = (words, i) => { const F = fieldAt(words, i), g = filter(words[i]); return F.mag.map((m, k) => g[k] * m); };
+
+function canvas(id, h) {
+  const cv = document.getElementById(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600;
+  cv.style.height = h + "px"; cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h); g.font = "11px ui-sans-serif, system-ui"; return { g, w, h };
+}
+const phaseCol = ph => `hsl(${((ph % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) / (2 * Math.PI) * 360}, 55%, 50%)`;
+function barsK(id, vals, col, h = 150, vmax) {
+  const { g, w } = canvas(id, h), m = vmax || Math.max(1e-9, ...vals), pL = 6, bw = (w - pL * 2) / K;
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(pL, h - 16); g.lineTo(w - pL, h - 16); g.stroke();
+  vals.forEach((v, k) => { const bh = (h - 24) * v / m; g.fillStyle = typeof col === "function" ? col(k) : col; g.fillRect(pL + k * bw + 2, h - 16 - bh, bw - 4, bh); });
+  g.fillStyle = "#94a3b8"; g.textAlign = "center"; [0, 5, 10, 15].forEach(k => g.fillText(`${k}`, pL + (k + 0.5) * bw, h - 3));
+}
+
+// ---- UI ----
+const sentDiv = document.getElementById("sent");
+function renderSentence() {
+  const words = SENT[si];
+  sentDiv.innerHTML = words.map((w, i) => `<span class="tok ${i === sel ? "sel" : ""}" data-i="${i}">${w}</span>`).join(" ");
+  sentDiv.querySelectorAll(".tok").forEach(el => el.onclick = () => { sel = +el.dataset.i; draw(); });
+}
+document.querySelectorAll("[data-s]").forEach(b => b.onclick = () => {
+  si = +b.dataset.s; document.querySelectorAll("[data-s]").forEach(x => x.classList.toggle("act", x === b));
+  sel = SENT[si].indexOf("time"); draw();
+});
+document.getElementById("kst").oninput = e => { kst = +e.target.value; draw(); };
+
+function draw() {
+  renderSentence();
+  const words = SENT[si];
+  document.getElementById("kstv").textContent = `station ${kst} (frequency ${OMEGA[kst].toFixed(2)})`;
+  drawEmit(words); drawField(words); drawWave(words); drawReceiver(words); drawCompare(); drawRecurrence(words);
+}
+
+function drawEmit(words) {
+  const uniq = [...new Set(words)], rowH = 22, { g, w } = canvas("emit", 20 + uniq.length * rowH), pL = 64, pR = 70, cw = (w - pL - pR) / K;
+  uniq.forEach((wd, r) => {
+    const e = emission(wd), y = 10 + r * rowH;
+    g.fillStyle = "#334155"; g.textAlign = "right"; g.fillText(wd, pL - 8, y + 14);
+    e.forEach((c, k) => { if (!c.a) return; g.fillStyle = phaseCol(c.ph); const bh = (rowH - 6) * c.a; g.fillRect(pL + k * cw + 1, y + rowH - 3 - bh, cw - 2, bh); });
+    const cls = LEX[wd].cls; g.fillStyle = "#64748b"; g.textAlign = "left";
+    g.fillText(cls, w - pR + 8, y + 14);
+    g.fillStyle = "#cbd5e1"; g.fillRect(w - pR + 46, y + 9, 20, 4); g.fillStyle = "#475569"; g.fillRect(w - pR + 46, y + 9, 20 * { short: 0.2, medium: 0.55, long: 1 }[cls], 4);
+  });
+}
+
+function drawField(words) {
+  const n = words.length, { g, w, h } = canvas("field", 260), pL = 30, pB = 34, cw = (w - pL - 6) / n, ch = (h - pB - 6) / K;
+  const all = words.map((_, i) => fieldAt(words, i).mag), m = Math.max(1e-9, ...all.flat());
+  all.forEach((col, i) => col.forEach((v, k) => { g.fillStyle = `rgba(30,41,59,${(v / m).toFixed(3)})`; g.fillRect(pL + i * cw + 1, 6 + (K - 1 - k) * ch, cw - 2, ch - 1); }));
+  g.fillStyle = "#64748b"; g.textAlign = "right"; [0, 5, 10, 15].forEach(k => g.fillText(`${k}`, pL - 6, 6 + (K - 1 - k) * ch + ch / 2 + 4));
+  g.textAlign = "center"; words.forEach((wd, i) => { g.fillStyle = i === sel ? "#0f172a" : "#64748b"; g.fillText(wd, pL + (i + 0.5) * cw, h - pB + 14); });
+  g.strokeStyle = "#e15759"; g.lineWidth = 2; g.strokeRect(pL + sel * cw + 0.5, 5, cw - 1, K * ch);
+  g.fillStyle = "#94a3b8"; g.save(); g.translate(10, (h - pB) / 2); g.rotate(-Math.PI / 2); g.fillText("station", 0, 0); g.restore();
+}
+
+function drawWave(words) {
+  const n = words.length, { g, w, h } = canvas("wave", 230), pL = 10, X = t => pL + t / (n - 0.5) * (w - 2 * pL), y0 = h / 2 - 8;
+  document.getElementById("wavet").textContent = `station ${kst}, frequency ${OMEGA[kst].toFixed(2)}`;
+  const steps = 700, total = new Array(steps + 1).fill(0);
+  const amp = (h / 2 - 22) / Math.max(1, ...words.map((_, i) => fieldAt(words, i).mag[kst]), 1);
+  words.forEach((wd, j) => {
+    const c = emission(wd)[kst]; if (!c.a) return; const a = DECAY[LEX[wd].cls];
+    g.strokeStyle = phaseCol(c.ph); g.globalAlpha = 0.55; g.lineWidth = 1; g.beginPath(); let started = false;
+    for (let s = 0; s <= steps; s++) { const t = s / steps * (n - 0.5); if (t < j) continue; const d = t - j, v = c.a * Math.exp(-a * d) * Math.cos(c.ph + OMEGA[kst] * d);
+      total[s] += v; started ? g.lineTo(X(t), y0 - v * amp) : (g.moveTo(X(t), y0 - v * amp), started = true); }
+    g.stroke(); g.globalAlpha = 1;
+  });
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(0, y0); g.lineTo(w, y0); g.stroke();
+  g.strokeStyle = "#0f172a"; g.lineWidth = 2.2; g.beginPath(); total.forEach((v, s) => { const t = s / steps * (n - 0.5); s ? g.lineTo(X(t), y0 - v * amp) : g.moveTo(X(t), y0 - v * amp); }); g.stroke();
+  g.textAlign = "center"; words.forEach((wd, i) => { g.fillStyle = i === sel ? "#0f172a" : "#64748b"; g.fillText(wd, X(i), h - 6);
+    const F = fieldAt(words, i); g.fillStyle = "#e15759"; g.beginPath(); g.arc(X(i), y0 - F.re[kst] * amp, 3.5, 0, 2 * Math.PI); g.fill(); });
+}
+
+function drawReceiver(words) {
+  const F = fieldAt(words, sel), gk = filter(words[sel]), f = F.mag.map((m, k) => gk[k] * m);
+  document.getElementById("rect").textContent = `"${words[sel]}" at position ${sel + 1}`;
+  const m = Math.max(1e-9, ...F.mag);
+  barsK("rfield", F.mag, "#475569", 150, m); barsK("rfilt", gk, k => (gk[k] > 0.5 ? "#4e79a7" : "#cbd5e1"), 150, 1); barsK("rfeat", f, "#e15759", 150, m);
+}
+
+function drawCompare() {
+  const a = SENT[0], b = SENT[1], fa = feature(a, a.indexOf("time")), fb = feature(b, b.indexOf("time"));
+  const { g, w, h } = canvas("cmp", 170), pL = 6, bw = (w - 2 * pL) / K, m = Math.max(1e-9, ...fa, ...fb);
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(pL, h - 16); g.lineTo(w - pL, h - 16); g.stroke();
+  for (let k = 0; k < K; k++) {
+    g.fillStyle = "#d4a72c"; g.fillRect(pL + k * bw + 2, h - 16 - (h - 34) * fa[k] / m, bw / 2 - 3, (h - 34) * fa[k] / m);
+    g.fillStyle = "#4e79a7"; g.fillRect(pL + k * bw + bw / 2, h - 16 - (h - 34) * fb[k] / m, bw / 2 - 3, (h - 34) * fb[k] / m);
+  }
+  g.fillStyle = "#94a3b8"; g.textAlign = "center"; [0, 5, 10, 15].forEach(k => g.fillText(`${k}`, pL + (k + 0.5) * bw, h - 3));
+  g.textAlign = "left"; g.fillStyle = "#d4a72c"; g.fillText("■ time in \"Once upon a time ...\"", 8, 12); g.fillStyle = "#4e79a7"; g.fillText("■ time in \"He took some time ...\"", 8, 26);
+  const dot = fa.reduce((s, v, k) => s + v * fb[k], 0), na = Math.hypot(...fa), nb = Math.hypot(...fb);
+  document.getElementById("cos").textContent = (dot / (na * nb + 1e-12)).toFixed(2);
+}
+
+function drawRecurrence(words) {
+  const rec = fieldRecurrent(words), err = Math.max(...words.map((_, i) => Math.max(...fieldAt(words, i).mag.map((v, k) => Math.abs(v - rec[i][k])))));
+  document.getElementById("rec").textContent = `max difference ${err.toExponential(1)}`;
+}
+
+window.addEventListener("resize", draw);
+draw();
+</script>
+</body>
+</html>

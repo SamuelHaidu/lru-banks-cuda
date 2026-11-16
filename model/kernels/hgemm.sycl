@@ -1,0 +1,202 @@
+// fp16 matmul for the XPU: the assembly kernel hgemm_f16 (model/kernels/hgemm/gen_hgemm.py) loaded through Level
+// Zero into torch's SYCL queue, and the passes that feed it.
+//
+//   load_module(zebin)   the patched zebin (the OpenCL stub's metadata + the assembly) -> one sycl::kernel
+//   pack(src, dst, ...)  f32 strided 2D view -> fp16 panels dst[P][Kp][G] (G = 16: A rows, 32: B columns), each value
+//                        times scal[slot]; rows / k past the view are zeros
+//   amax_scale(src, ...) scal[slot] = the power of two that brings max |src| to `target` (on the device: no sync)
+//   gemm(a, b, c, scal, m, n, kp, alpha)   c (m, n) f32 = alpha / (scal[0] scal[1]) a b
+//
+// Every launch goes to torch's current XPU stream, so it is ordered with the surrounding torch ops.
+
+#include <c10/xpu/XPUStream.h>
+#include <level_zero/ze_api.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <torch/extension.h>
+
+#include <memory>
+#include <string>
+
+class HPack;
+class HAmaxZero;
+class HAmax;
+class HAmaxScale;
+
+namespace {
+
+std::unique_ptr<sycl::kernel> g_kernel;
+
+#define ZE_CHECK(x)                                                                              \
+  do {                                                                                           \
+    ze_result_t r_ = (x);                                                                        \
+    TORCH_CHECK(r_ == ZE_RESULT_SUCCESS, #x " failed: 0x", std::hex, static_cast<unsigned>(r_)); \
+  } while (0)
+
+// Returns the machine code the driver loaded for the kernel, so Python can check it is ours (the zebin also carries
+// SPIR-V the driver could recompile).
+py::bytes load_module(const std::string& zebin, const std::string& name) {
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+  auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+  ze_module_desc_t md{ZE_STRUCTURE_TYPE_MODULE_DESC};
+  md.format = ZE_MODULE_FORMAT_NATIVE;
+  md.inputSize = zebin.size();
+  md.pInputModule = reinterpret_cast<const uint8_t*>(zebin.data());
+  ze_module_handle_t mod;
+  ZE_CHECK(zeModuleCreate(zctx, zdev, &md, &mod, nullptr));
+  ze_kernel_desc_t kd{ZE_STRUCTURE_TYPE_KERNEL_DESC};
+  kd.pKernelName = name.c_str();
+  ze_kernel_handle_t zk;
+  ZE_CHECK(zeKernelCreate(mod, &kd, &zk));
+  size_t size = 0;
+  ZE_CHECK(zeKernelGetBinaryExp(zk, &size, nullptr));
+  std::string code(size, '\0');
+  ZE_CHECK(zeKernelGetBinaryExp(zk, &size, reinterpret_cast<uint8_t*>(code.data())));
+  namespace lz = sycl::ext::oneapi::level_zero;
+  auto bundle = sycl::make_kernel_bundle<sycl::backend::ext_oneapi_level_zero, sycl::bundle_state::executable>(
+      {mod, lz::ownership::transfer}, q.get_context());
+  g_kernel = std::make_unique<sycl::kernel>(sycl::make_kernel<sycl::backend::ext_oneapi_level_zero>(
+      {bundle, zk, lz::ownership::transfer}, q.get_context()));
+  return py::bytes(code);
+}
+
+void gemm(const torch::Tensor& a, const torch::Tensor& b, torch::Tensor& c, const torch::Tensor& scal, int64_t m,
+          int64_t n, int64_t kp, double alpha) {
+  TORCH_CHECK(g_kernel, "hgemm: load_module first");
+  TORCH_CHECK(a.scalar_type() == at::kHalf && b.scalar_type() == at::kHalf && c.scalar_type() == at::kFloat);
+  TORCH_CHECK(c.is_contiguous() && c.size(0) == m && c.size(1) == n && n % 32 == 0);
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(c.data_ptr()) % 64 == 0, "hgemm: c must be 64-byte aligned");
+  TORCH_CHECK(kp % 16 == 0 && kp < 65536 && n < 65536, "hgemm: k padded to 16, k and n below 65536");
+  TORCH_CHECK(a.numel() >= (m + 15) / 16 * 16 * kp && b.numel() >= n * kp && scal.numel() >= 16);
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  const size_t groups = static_cast<size_t>((m + 15) / 16) * (n / 32);
+  if (!groups) return;
+  const void* pa = a.data_ptr();
+  const void* pb = b.data_ptr();
+  void* pc = c.data_ptr();
+  const void* ps = scal.data_ptr();
+  const unsigned um = m, un = n, uk = kp;
+  const float al = alpha;
+  q.submit([&](sycl::handler& h) {
+    h.set_args(pa, pb, pc, ps, um, un, uk, al);
+    h.parallel_for(sycl::nd_range<1>(groups * 16, 16), *g_kernel);
+  });
+}
+
+// dst[p][k][r] = half(src[(p G + r) s_r + k s_k] * scal[slot]), 0 past rows / cols. Two values per work-item.
+void pack(const torch::Tensor& src, torch::Tensor& dst, int64_t rows, int64_t cols, int64_t s_r, int64_t s_k,
+          int64_t group, int64_t kp, const torch::Tensor& scal, int64_t slot) {
+  TORCH_CHECK(src.scalar_type() == at::kFloat && dst.scalar_type() == at::kHalf && dst.is_contiguous());
+  TORCH_CHECK(group == 16 || group == 32);
+  const int64_t panels = (rows + group - 1) / group;
+  TORCH_CHECK(dst.numel() >= panels * kp * group);
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  const float* s = src.data_ptr<float>();
+  sycl::half* d = reinterpret_cast<sycl::half*>(dst.data_ptr<at::Half>());
+  const float* sc = scal.data_ptr<float>() + slot;
+  const int64_t total = panels * kp * group / 2;
+  if (!total) return;
+  const int G = group;
+  q.parallel_for<HPack>(sycl::range<1>(total), [=](sycl::id<1> id) {
+    const int64_t i = id[0] * 2;
+    const int64_t r = i % G, k = (i / G) % kp, p = i / (G * kp);
+    const int64_t row = p * G + r;
+    const float f = *sc;
+    float v0 = 0.f, v1 = 0.f;
+    if (k < cols) {
+      if (row < rows) v0 = s[row * s_r + k * s_k] * f;
+      if (row + 1 < rows) v1 = s[(row + 1) * s_r + k * s_k] * f;
+    }
+    d[i] = sycl::half(v0);
+    d[i + 1] = sycl::half(v1);
+  });
+}
+
+// The same panels from a source contiguous along k (s_k = 1: row-major A, or B^T): one 16-lane sub-group per panel
+// and 16 k; for each of the panel's G rows the lanes read 16 consecutive floats (one 64-byte line), then each lane
+// writes its G halves (dst[p][k][0..G-1]) as one contiguous run.
+template <int G>
+struct PackRows {
+  const float* s;
+  sycl::half* d;
+  const float* sc;
+  int64_t rows, cols, s_r, kp;
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
+    const int64_t kblocks = kp / 16, g = it.get_group(0);
+    const int64_t p = g / kblocks, k = (g % kblocks) * 16 + it.get_local_id(0);
+    const float f = *sc;
+    sycl::vec<sycl::half, 16> out[G / 16];  // sycl::vec stops at 16 elements
+#pragma unroll
+    for (int j = 0; j < G; j++) {
+      const int64_t row = p * G + j;
+      out[j / 16][j % 16] = sycl::half((row < rows && k < cols) ? s[row * s_r + k] * f : 0.f);
+    }
+#pragma unroll
+    for (int h = 0; h < G / 16; h++)
+      *reinterpret_cast<sycl::vec<sycl::half, 16>*>(d + (p * kp + k) * G + 16 * h) = out[h];
+  }
+};
+
+void pack_rows(const torch::Tensor& src, torch::Tensor& dst, int64_t rows, int64_t cols, int64_t s_r, int64_t group,
+               int64_t kp, const torch::Tensor& scal, int64_t slot) {
+  TORCH_CHECK(src.scalar_type() == at::kFloat && dst.scalar_type() == at::kHalf && dst.is_contiguous());
+  TORCH_CHECK((group == 16 || group == 32) && kp % 16 == 0);
+  const int64_t panels = (rows + group - 1) / group;
+  TORCH_CHECK(dst.numel() >= panels * kp * group);
+  if (!panels || !kp) return;
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  const float* s = src.data_ptr<float>();
+  sycl::half* d = reinterpret_cast<sycl::half*>(dst.data_ptr<at::Half>());
+  const float* sc = scal.data_ptr<float>() + slot;
+  const sycl::nd_range<1> range(panels * (kp / 16) * 16, 16);
+  if (group == 16)
+    q.parallel_for(range, PackRows<16>{s, d, sc, rows, cols, s_r, kp});
+  else
+    q.parallel_for(range, PackRows<32>{s, d, sc, rows, cols, s_r, kp});
+}
+
+// scal[slot] = 2^floor(log2(target / max |src|)) (1 if src is all zeros); scal[8 + slot] holds the max meanwhile.
+void amax_scale(const torch::Tensor& src, int64_t rows, int64_t cols, int64_t s_r, int64_t s_k,
+                const torch::Tensor& scal, int64_t slot, double target) {
+  TORCH_CHECK(src.scalar_type() == at::kFloat && scal.numel() >= 16);
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  const float* s = src.data_ptr<float>();
+  float* sc = scal.data_ptr<float>();
+  const float tg = target;
+  q.single_task<HAmaxZero>([=] { sc[8 + slot] = 0.f; });
+  const int64_t total = rows * cols;
+  constexpr int WG = 256, PER = 16;
+  const int64_t groups = (total + WG * PER - 1) / (WG * PER);
+  if (groups) {
+    q.parallel_for<HAmax>(sycl::nd_range<1>(groups * WG, WG), [=](sycl::nd_item<1> it) {
+      float mx = 0.f;
+      const int64_t base = it.get_group(0) * (int64_t)WG * PER + it.get_local_id(0);
+      for (int j = 0; j < PER; j++) {
+        const int64_t i = base + (int64_t)j * WG;
+        if (i < total) mx = sycl::fmax(mx, sycl::fabs(s[(i / cols) * s_r + (i % cols) * s_k]));
+      }
+      mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+      if (it.get_local_id(0) == 0) {
+        // non-negative floats order like their bits
+        sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device> m(
+            *reinterpret_cast<unsigned*>(sc + 8 + slot));
+        m.fetch_max(sycl::bit_cast<unsigned>(mx));
+      }
+    });
+  }
+  q.single_task<HAmaxScale>([=] {
+    const float mx = sc[8 + slot];
+    sc[slot] = (mx > 0.f && sycl::isfinite(mx)) ? sycl::exp2(sycl::floor(sycl::log2(tg / mx))) : 1.f;
+  });
+}
+
+}  // namespace
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("load_module", &load_module);
+  m.def("gemm", &gemm);
+  m.def("pack", &pack);
+  m.def("pack_rows", &pack_rows);
+  m.def("amax_scale", &amax_scale);
+}
