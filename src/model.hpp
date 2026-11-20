@@ -100,6 +100,7 @@ class Model {
         bf16 *xh1, *PV, *sb, *k, *q, *o1, *xh2, *Z, *U, *xh3, *q2, *o2;
         float *rstd1, *s, *kn, *qn, *rp1, *aw, *ar, *rstd2, *rstd3, *q2n, *ar2;
         uint8_t *ridx, *gw, *gr, *gr2;
+        uint2* info;
     };
 
     int add(const std::string& name, int rows, int cols, bool decay);
@@ -135,7 +136,7 @@ class Model {
     float *rstdF_, *Gt_, *G2t_, *logits_;
     bf16* dlog_;
     // backward buffers
-    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dk_, *dq1_, *dq2_, *dp1_, *dgw_, *dgr1_, *dgr2_, *coef1_,
+    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dk2_, *dv2_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *coef1_,
         *coef2_, *dx0_, *dWp_;
     bf16 *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
     float *loss_, *stats_, *gsq_;

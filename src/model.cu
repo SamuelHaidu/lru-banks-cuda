@@ -106,6 +106,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         a.ar2 = alloc<float>(size_t(M) * H);
         a.gr2 = alloc<uint8_t>(size_t(M) * H);
         a.o2 = alloc<bf16>(size_t(M) * HD);
+        a.info = alloc<uint2>(size_t(M) * H);
         la_.push_back(a);
     }
     const int Mc = std::min(c.ce_chunk, M);
@@ -131,11 +132,11 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     dG2_ = alloc<bf16>(size_t(M) * c.ldG2());
     dS_ = alloc<float>(size_t(M) * S2);
     dPV_ = alloc<bf16>(size_t(M) * c.ldPV());
-    dk_ = alloc<float>(size_t(M) * HD);
+    dk2_ = alloc<float>(size_t(M) * HD * 2);
+    dv2_ = alloc<float>(size_t(M) * HD * 2);
+    dr2_ = alloc<float>(size_t(M) * H * 2);
     dq1_ = alloc<float>(size_t(M) * HD);
     dq2_ = alloc<float>(size_t(M) * HD);
-    dp1_ = alloc<float>(size_t(M) * H);
-    dgw_ = alloc<float>(size_t(M) * H);
     dgr1_ = alloc<float>(size_t(M) * H);
     dgr2_ = alloc<float>(size_t(M) * H);
     coef1_ = alloc<float>(3 * size_t(M) * H * SLOTS);
@@ -280,7 +281,8 @@ void Model::mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16
 
 BankWrites Model::writes(int n, const Batch& b) {
     const LayerA& a = la_[n];
-    return BankWrites{a.k, a.PV + c_.S2(), c_.ldPV(), a.ridx, a.gw, b.reset, a.rp1, loga_, c_.B, c_.T, c_.H};
+    (void)b;
+    return BankWrites{a.k, a.PV + c_.S2(), c_.ldPV(), a.info, loga_, c_.B, c_.T, c_.H};
 }
 
 void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
@@ -300,12 +302,12 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::F32);
     tic(s, "addr");
     addr_fwd(AddrFwd{Gt_, c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q, a.kn, a.qn, a.ridx, a.rp1,
-                     a.gw, a.gr, a.aw, a.ar, st, M, c_.T, H},
+                     a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H},
              s);
     toc(s);
     const BankWrites bw = writes(n, b);
     tic(s, "bank_fwd");
-    bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), a.o1, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
+    bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
     toc(s);
     mm(s, false, false, M, D, HD, a.o1, HD, w.Wo, D, h_, D, Out::F32, 1.f);
     tic(s, "norm+elementwise");
@@ -322,10 +324,10 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     mm(s, false, false, M, c_.ldG2(), D, a.xh3, D, w.Wq2, c_.ldG2(), G2t_, c_.ldG2(), Out::F32);
     tic(s, "addr");
-    q2_fwd(Q2Fwd{G2t_, c_.ldG2(), p(x.brg2), a.q2, a.q2n, a.ar2, a.gr2, st + 4, M, H}, s);
+    q2_fwd(Q2Fwd{G2t_, c_.ldG2(), p(x.brg2), a.q2, a.q2n, a.ar2, a.gr2, st + 4, a.info, M, H}, s);
     toc(s);
     tic(s, "bank_fwd");
-    bank_fwd(bw, BankRead{a.q2, a.gr2, p(x.ltau2), a.o2, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
+    bank_fwd(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, a.o2, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
     toc(s);
     mm(s, false, false, M, D, HD, a.o2, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
 }
@@ -346,7 +348,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
     mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32);
     tic(s, "bank_rewalk");
-    bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
+    bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
     toc(s);
     tic(s, "addr");
     q2_bwd(Q2Bwd{dq2_, dgr2_, a.q2, a.q2n, a.ar2, g(x.brg2), st + 4, c_.budget, c_.budget_target, count, dG2_,
@@ -379,18 +381,16 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo, D, dO1_, HD, Out::F32);
     mm(s, true, false, HD, D, M, a.o1, HD, dhb_, D, g(x.Wo), D, Out::F32);
     tic(s, "bank_rewalk");
-    bank_rewalk(bw, BankRead{a.q, a.gr, p(x.ltau), nullptr, dO1_, dq1_, dgr1_, coef1_, g(x.ltau)}, s);
+    bank_rewalk(bw, BankRead{a.q, a.gr, p(x.ltau), 2, nullptr, dO1_, dq1_, dgr1_, coef1_, g(x.ltau)}, s);
     toc(s);
     // the writes, for both reads
     tic(s, "bank_adjoint");
-    bank_adjoint(bw,
-                 BankAdjoint{{a.q, a.q2}, {a.gr, a.gr2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk_, dPV_ + S2,
-                             c_.ldPV(), dp1_, dgw_},
-                 s);
+    bank_adjoint(bw, BankAdjoint{{a.q, a.q2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk2_, dv2_, dr2_}, s);
     toc(s);
     tic(s, "addr");
     LBC_CUDA(cudaMemsetAsync(dG_, 0, size_t(M) * c_.ldG() * sizeof(bf16), s));
-    addr_bwd(AddrBwd{dk_, dq1_, dp1_, dgw_, dgr1_, a.k, a.q, a.kn, a.qn, a.rp1, a.aw, a.ar, a.ridx, b.reset, p(x.R),
+    addr_bwd(AddrBwd{dk2_, dv2_, dr2_, dq1_, dgr1_, a.gw, dPV_ + S2, c_.ldPV(), a.k, a.q, a.kn, a.qn, a.rp1, a.aw,
+                     a.ar, a.ridx, b.reset, p(x.R),
                      g(x.R), g(x.bk), g(x.brg), g(x.bwg), st, c_.budget, c_.budget_target, count, dG_, c_.ldG(), M,
                      c_.T, H},
              s);

@@ -73,13 +73,21 @@ struct AddrFwd {
                                   // at a reset or a row's first token the key would be normalize(b_k) alone)
     float *aw, *ar;               // [M][H] gate logits
     float* stats;                 // [4]: sum sigmoid(aw), open writes, sum sigmoid(ar), open reads
+    uint2* info;                  // [M][H] packed for the bank walks: x = m1 | m2 << 8 | flags << 16 (flags: 1 write
+                                  // gate, 2 read gate, 4 reset, 8 hop-2 read gate, set by q2_fwd), y = bits of p1
     int M, T, H;
 };
 void addr_fwd(const AddrFwd& a, cudaStream_t s);
 
 struct AddrBwd {
-    const float *dk, *dq;            // [M][H][DH] gradients of the normalized key / query
-    const float *dp1, *dgw, *dgr;    // [M][H]: routing weight, write gate (straight-through), read gate (dy . o)
+    // from the bank adjoint, per (row, head) and routed slot s = 0, 1: dk2 / dv2 [M][H][2][DH] (written only when
+    // the write gate is open), dr2 [M][H][2] the gradient of the slot's write weight
+    const float *dk2, *dv2, *dr2;
+    const float* dq;                 // [M][H][DH] gradient of the normalized query
+    const float* dgr;                // [M][H] read gate (dy . o)
+    const uint8_t* gw;
+    bf16* dv;                        // the values' gradient, row r head h at dv + r * lddv + h * DH
+    int lddv;
     const bf16 *k, *q;
     const float *kn, *qn, *rp1, *aw, *ar;
     const uint8_t *ridx, *reset;
@@ -103,6 +111,7 @@ struct Q2Fwd {
     float *qn, *ar;
     uint8_t* gr;
     float* stats;  // [2]: sum sigmoid(ar), open reads
+    uint2* info;   // the layer's packed step words: the hop-2 read gate is OR-ed in (flag 8)
     int M, H;
 };
 void q2_fwd(const Q2Fwd& a, cudaStream_t s);
@@ -127,8 +136,8 @@ struct BankWrites {
     const bf16* k;  // [M][H][DH]
     const bf16* v;  // row r, head h at v + r * ldv + h * DH
     int ldv;
-    const uint8_t *ridx, *gw, *reset;
-    const float *rp1, *loga;  // loga [H][SLOTS]: log of each slot's decay per token
+    const uint2* info;   // [M][H] routing, gates, reset, p1 (AddrFwd::info)
+    const float* loga;   // [H][SLOTS]: log of each slot's decay per token
     int B, T, H;
 };
 
@@ -136,6 +145,7 @@ struct BankRead {
     const bf16* q;          // [M][H][DH]
     const uint8_t* gr;      // [M][H]
     const float* log_tau;   // [H]
+    int gate_bit;           // this read's gate in the step word's flags: 2 (hop 1) or 8 (hop 2)
     bf16* o;                // forward: [M][H*DH], g_r * read (closed reads: 0, not computed)
     const float* dy;        // backward: [M][H*DH] gradient of o
     float* dq;              // [M][H][DH]
@@ -148,14 +158,10 @@ void bank_rewalk(const BankWrites& w, const BankRead& r, cudaStream_t s);
 
 struct BankAdjoint {
     const bf16* q[2];
-    const uint8_t* gr[2];
     const float* dy[2];
     const float* coef[2];
-    int hops;
-    float* dk;    // [M][H][DH]
-    bf16* dv;     // row r, head h at dv + r * lddv + h * DH
-    int lddv;
-    float *dp1, *dgw;  // [M][H]
+    int hops;                 // the reads' gates come from the step words (flags 2 and 8)
+    float *dk2, *dv2, *dr2;   // see AddrBwd
 };
 void bank_adjoint(const BankWrites& w, const BankAdjoint& a, cudaStream_t s);
 

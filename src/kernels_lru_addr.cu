@@ -196,6 +196,9 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
             a.rp1[rh] = sigmoid(b1 - b2);
             a.gw[rh] = gw;
             a.gr[rh] = gr;
+            a.info[rh] = make_uint2(unsigned(j1) | unsigned(j2) << 8 |
+                                        unsigned((gw ? 1 : 0) | (gr ? 2 : 0) | (rst ? 4 : 0)) << 16,
+                                    __float_as_uint(sigmoid(b1 - b2)));
             a.aw[rh] = aw;
             a.ar[rh] = ar;
             if (!rst && t > 0) sw += sigmoid(aw);
@@ -232,11 +235,17 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
         const bool rst = a.reset[r];
         const size_t rh = size_t(r) * H + h;
         const float k = __bfloat162float(a.k[rh * DH + lane]);
-        float dk = a.dk[rh * DH + lane];
-        // routing: p1 = sigmoid(l1 - l2), l_m = k . R[:, m]
+        const bool gw = a.gw[rh];
+        // the write's gradients from the two routed slots (bank adjoint): key, value, slot weights
+        float dk = gw ? a.dk2[rh * 2 * DH + lane] + a.dk2[(rh * 2 + 1) * DH + lane] : 0.f;
+        a.dv[size_t(r) * a.lddv + h * DH + lane] =
+            __float2bfloat16(gw ? a.dv2[rh * 2 * DH + lane] + a.dv2[(rh * 2 + 1) * DH + lane] : 0.f);
+        const float dr1 = a.dr2[rh * 2], dr2 = a.dr2[rh * 2 + 1];
+        // routing: weights gw p1, gw (1 - p1) with p1 = sigmoid(l1 - l2), l_m = k . R[:, m]
         const int m1 = a.ridx[rh * 2], m2 = a.ridx[rh * 2 + 1];
         const float p1 = a.rp1[rh];
-        const float dl = a.dp1[rh] * p1 * (1.f - p1);
+        const float dl = (gw ? dr1 - dr2 : 0.f) * p1 * (1.f - p1);
+        const float dgw = p1 * dr1 + (1.f - p1) * dr2;  // straight-through: computed for closed write gates too
         dk += dl * (Rs[lane * RPAD + m1] - Rs[lane * RPAD + m2]);
         atomicAdd(&dRs[lane * RPAD + m1], dl * k);
         atomicAdd(&dRs[lane * RPAD + m2], -dl * k);
@@ -254,7 +263,7 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             const float sr = sigmoid(a.ar[rh]);
             const float dar = (a.dgr[rh] + br) * sr * (1.f - sr);
             const float sw = sigmoid(a.aw[rh]);
-            const float daw = (rst || t == 0) ? 0.f : (a.dgw[rh] + bw) * sw * (1.f - sw);
+            const float daw = (rst || t == 0) ? 0.f : (dgw + bw) * sw * (1.f - sw);
             a.dG[size_t(r) * a.ldG + 2 * HD + h] = __float2bfloat16(dar);
             a.dG[size_t(r) * a.ldG + 2 * HD + H + h] = __float2bfloat16(daw);
             atomicAdd(&dg_s[0], dar);
@@ -284,6 +293,7 @@ __global__ void __launch_bounds__(256) k_q2_fwd(Q2Fwd a) {
         a.qn[w] = qn;
         a.ar[w] = ar;
         a.gr[w] = ar > 0.f;
+        if (ar > 0.f) a.info[w].x |= 8u << 16;
         atomicAdd(a.stats + 0, sigmoid(ar));
         atomicAdd(a.stats + 1, ar > 0.f ? 1.f : 0.f);
     }
