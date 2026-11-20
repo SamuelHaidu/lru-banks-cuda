@@ -27,5 +27,21 @@ target_compile_options(lbc_common INTERFACE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr -Xcompiler=-Wall,-Wextra>)
 
+find_package(Threads REQUIRED)
+
+# The model: kernels, cuBLASLt GEMMs, the data loader.
+add_library(lbc STATIC
+  src/gemm.cpp
+  src/data.cpp
+  src/kernels_basic.cu
+  src/kernels_lru_addr.cu
+  src/kernels_bank.cu
+  src/model.cu)
+target_include_directories(lbc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(lbc PUBLIC lbc_common CUDA::cublasLt Threads::Threads)
+
 add_executable(device_info tools/device_info.cu)
 target_link_libraries(device_info PRIVATE lbc_common)
+
+add_executable(train_bench tools/train_bench.cu)
+target_link_libraries(train_bench PRIVATE lbc)

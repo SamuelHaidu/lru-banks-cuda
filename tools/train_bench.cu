@@ -1,0 +1,239 @@
+// Trains the model on real data and reports the throughput of the whole pipeline: disk reads (memory-mapped token
+// file, a loader thread), host-to-device copies, forward, loss, backward and the optimizer, every step.
+//
+//   train_bench --data /root/data/pretrain-mix-bpe32768/train.npy [--steps 30] [--warmup 5] [--batch 64]
+//               [--seq 512] [--layers 4] [--gate-w 2] [--gate-r 2] [--lr 2e-3] [--budget 0] [--tiny]
+//               [--dump DIR]   (one forward / backward, then parameters, batch, decisions, loss and gradients
+//                               written to DIR for tests/check_grads.py)
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include "../src/data.hpp"
+#include "../src/model.hpp"
+#include "lbc/check.hpp"
+
+using namespace lbc;
+
+namespace {
+
+struct Args {
+    std::string data, dump;
+    int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4;
+    float gate_w = 2.f, gate_r = 2.f, lr = 2e-3f, budget = 0.f;
+    bool tiny = false;
+    uint64_t seed = 1;
+};
+
+Args parse(int argc, char** argv) {
+    Args a;
+    for (int i = 1; i < argc; ++i) {
+        const std::string k = argv[i];
+        auto val = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", k.c_str());
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (k == "--data") a.data = val();
+        else if (k == "--dump") a.dump = val();
+        else if (k == "--steps") a.steps = std::atoi(val());
+        else if (k == "--warmup") a.warmup = std::atoi(val());
+        else if (k == "--batch") a.batch = std::atoi(val());
+        else if (k == "--seq") a.seq = std::atoi(val());
+        else if (k == "--layers") a.layers = std::atoi(val());
+        else if (k == "--gate-w") a.gate_w = std::atof(val());
+        else if (k == "--gate-r") a.gate_r = std::atof(val());
+        else if (k == "--lr") a.lr = std::atof(val());
+        else if (k == "--budget") a.budget = std::atof(val());
+        else if (k == "--seed") a.seed = std::strtoull(val(), nullptr, 10);
+        else if (k == "--tiny") a.tiny = true;
+        else {
+            std::fprintf(stderr, "unknown argument %s\n", k.c_str());
+            std::exit(2);
+        }
+    }
+    if (a.data.empty()) {
+        std::fprintf(stderr, "--data PATH (a uint16 .npy token file) is required\n");
+        std::exit(2);
+    }
+    return a;
+}
+
+template <class T>
+void write_bin(const std::string& path, const T* p, size_t n) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(p), std::streamsize(n * sizeof(T)));
+}
+
+template <class T>
+std::vector<T> download(const T* d, size_t n) {
+    std::vector<T> h(n);
+    LBC_CUDA(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_t s) {
+    const Config& c = model.config();
+    std::filesystem::create_directories(dir);
+    float loss = 0.f;
+    LBC_CUDA(cudaMemcpy(&loss, model.loss_device(), 4, cudaMemcpyDeviceToHost));
+    {
+        std::ofstream f(dir + "/config.txt");
+        f << "V " << c.V << "\nE0 " << c.E0 << "\nD " << c.D << "\nL " << c.L << "\nN " << c.N << "\nH " << c.H
+          << "\nF " << c.F << "\nB " << c.B << "\nT " << c.T << "\nDH " << DH << "\nSLOTS " << SLOTS << "\nldPV "
+          << c.ldPV() << "\nldG " << c.ldG() << "\nldG2 " << c.ldG2() << "\ntau " << c.tau << "\nslot_hl_min "
+          << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max << "\nbudget " << c.budget << "\nbudget_target "
+          << c.budget_target << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\n";
+    }
+    {
+        std::ofstream f(dir + "/manifest.txt");
+        for (const auto& t : model.tensors()) f << t.name << " " << t.off << " " << t.rows << " " << t.cols << "\n";
+    }
+    write_bin(dir + "/params.bin", download(model.params(), model.num_params()).data(), model.num_params());
+    write_bin(dir + "/grads.bin", download(model.grads(), model.num_params()).data(), model.num_params());
+    const size_t n = size_t(c.B) * c.T;
+    write_bin(dir + "/ids.bin", hb.ids, n);
+    write_bin(dir + "/y.bin", hb.y, n);
+    write_bin(dir + "/reset.bin", hb.reset, n);
+    for (int l = 0; l < c.L; ++l) {
+        std::vector<uint8_t> ridx, gw, gr, gr2;
+        model.decisions(l, ridx, gw, gr, gr2, s);
+        const std::string p = dir + "/l" + std::to_string(l) + "_";
+        write_bin(p + "ridx.bin", ridx.data(), ridx.size());
+        write_bin(p + "gw.bin", gw.data(), gw.size());
+        write_bin(p + "gr.bin", gr.data(), gr.size());
+        write_bin(p + "gr2.bin", gr2.data(), gr2.size());
+    }
+    std::printf("dumped to %s (loss %.6f)\n", dir.c_str(), loss);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const Args a = parse(argc, argv);
+    Config c;
+    c.B = a.batch;
+    c.T = a.seq;
+    c.L = a.layers;
+    c.gate_bias_w = a.gate_w;
+    c.gate_bias_r = a.gate_r;
+    c.lr = a.lr;
+    c.budget = a.budget;
+    if (a.tiny) {  // small widths for the gradient check (DH and SLOTS are fixed by the kernels)
+        c.E0 = 32;
+        c.D = 64;
+        c.N = 32;
+        c.H = 2;
+        c.F = 128;
+        c.L = 2;
+        c.B = 2;
+        c.T = 64;
+        c.ce_chunk = 64;
+    }
+
+    TokenFile file(a.data);
+    Loader loader(file, c.B, c.T, a.seed);
+    Model model(c, a.seed);
+    cudaStream_t s;
+    LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    const size_t ntok = size_t(c.B) * c.T;
+    int *d_ids, *d_y;
+    uint8_t* d_reset;
+    LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_reset, ntok));
+
+    size_t free_b = 0, total_b = 0;
+    LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
+    std::printf("model: %zu params, %d layers, D %d, LRU %d complex, %d heads x %d, %d slots, FFN %d, vocab %d x %d\n",
+                model.num_params(), c.L, c.D, c.N, c.H, DH, SLOTS, c.F, c.V, c.E0);
+    std::printf("batch %d x %d = %zu tokens per step; gate biases write %.2f read %.2f; %zu tokens on disk\n", c.B,
+                c.T, ntok, c.gate_bias_w, c.gate_bias_r, file.size());
+    std::printf("GPU memory in use after allocation: %.2f GiB of %.2f\n", (total_b - free_b) / 1073741824.0,
+                total_b / 1073741824.0);
+
+    auto copy_batch = [&](HostBatch* hb) {
+        LBC_CUDA(cudaMemcpyAsync(d_ids, hb->ids, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_y, hb->y, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_reset, hb->reset, ntok, cudaMemcpyHostToDevice, s));
+        const Batch b{d_ids, d_y, d_reset, hb->n_targets};
+        return b;
+    };
+
+    if (!a.dump.empty()) {
+        HostBatch* hb = loader.next();
+        HostBatch keep = *hb;  // the pinned buffers stay valid until the slot is refilled (after this run)
+        const Batch b = copy_batch(hb);
+        model.forward_backward(b, s);
+        LBC_CUDA(cudaStreamSynchronize(s));
+        dump(a.dump, model, keep, s);
+        loader.release(hb, s);
+        return 0;
+    }
+
+    const int total = a.warmup + a.steps;
+    float* d_hist;
+    LBC_CUDA(cudaMalloc(&d_hist, total * sizeof(float)));
+    cudaEvent_t t0, t1;
+    LBC_CUDA(cudaEventCreate(&t0));
+    LBC_CUDA(cudaEventCreate(&t1));
+    double wait_before = 0.0;
+    for (int i = 0; i < total; ++i) {
+        if (i == a.warmup) {
+            LBC_CUDA(cudaEventRecord(t0, s));
+            wait_before = loader.wait_ms();
+        }
+        HostBatch* hb = loader.next();
+        const Batch b = copy_batch(hb);
+        loader.release(hb, s);
+        model.forward_backward(b, s);
+        model.optimizer_step(i + 1, s);
+        LBC_CUDA(cudaMemcpyAsync(d_hist + i, model.loss_device(), sizeof(float), cudaMemcpyDeviceToDevice, s));
+    }
+    LBC_CUDA(cudaEventRecord(t1, s));
+    LBC_CUDA(cudaEventSynchronize(t1));
+    float ms = 0.f;
+    LBC_CUDA(cudaEventElapsedTime(&ms, t0, t1));
+    const double step_ms = ms / a.steps;
+    std::printf("\n%d timed steps (after %d warm-up): %.1f ms per step, %.0f tokens/s, %.2f updates/s\n", a.steps,
+                a.warmup, step_ms, ntok / (step_ms * 1e-3), 1e3 / step_ms);
+    std::printf("loader: waited %.1f ms in total over the timed steps; filling took %.2f ms per batch (thread)\n",
+                loader.wait_ms() - wait_before, loader.fill_ms() / total);
+
+    std::vector<float> hist(total);
+    LBC_CUDA(cudaMemcpy(hist.data(), d_hist, total * sizeof(float), cudaMemcpyDeviceToHost));
+    std::printf("loss by step:");
+    for (int i = 0; i < total; i += std::max(1, total / 12)) std::printf(" [%d] %.3f", i + 1, hist[i]);
+    std::printf(" [%d] %.3f\n", total, hist[total - 1]);
+
+    const std::vector<float> g = model.gate_stats(s);
+    std::printf("open gates (last step), per layer write / read 1 / read 2:");
+    for (int n = 0; n < c.L; ++n) std::printf("  L%d %.2f %.2f %.2f", n, g[3 * n], g[3 * n + 1], g[3 * n + 2]);
+    std::printf("\n");
+
+    // one more step with an event pair around every launch: GPU time per category
+    model.set_profile(true);
+    {
+        HostBatch* hb = loader.next();
+        const Batch b = copy_batch(hb);
+        loader.release(hb, s);
+        model.forward_backward(b, s);
+        model.optimizer_step(total + 1, s);
+    }
+    model.set_profile(false);
+    float sum = 0.f;
+    const auto prof = model.profile_ms();
+    for (const auto& [cat, t] : prof) sum += t;
+    std::printf("GPU time by category (one profiled step, %.1f ms in kernels):\n", sum);
+    for (const auto& [cat, t] : prof) std::printf("  %-18s %8.2f ms  %5.1f%%\n", cat.c_str(), t, 100.f * t / sum);
+    LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
+    std::printf("GPU memory in use: %.2f GiB\n", (total_b - free_b) / 1073741824.0);
+    return 0;
+}
