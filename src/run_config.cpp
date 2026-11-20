@@ -122,8 +122,8 @@ void visit(V& v, RC& c) {
     v("gate_budget", c.arch.gate_budget);
     v("gate_budget_target", c.arch.gate_budget_target);
     v("window_size", c.arch.window_size);
+    v("bank_slots", c.arch.bank_slots);
     v("head_dim", c.arch.head_dim);
-    v("slots", c.arch.slots);
     v("topk", c.arch.topk);
     v.end();
     v.begin("data");
@@ -203,7 +203,10 @@ void RunConfig::validate() const {
     check(a.gate_budget >= 0, "arch_params.gate_budget", "must be >= 0");
     check(a.window_size >= 8 && a.window_size % 8 == 0, "arch_params.window_size", "must be a positive multiple of 8");
     check(a.head_dim == DH, "arch_params.head_dim", "is fixed at " + std::to_string(DH) + " by the kernels");
-    check(a.slots == SLOTS, "arch_params.slots", "is fixed at " + std::to_string(SLOTS) + " by the kernels");
+    check(a.bank_slots.empty() || int(a.bank_slots.size()) == a.num_layers, "arch_params.bank_slots",
+          "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (128 everywhere)");
+    for (int n : a.bank_slots)
+        check(n >= 2 && n <= SLOTS, "arch_params.bank_slots", "entries must be in [2, " + std::to_string(SLOTS) + "]");
     check(a.topk == 2, "arch_params.topk", "is fixed at 2 by the kernels");
     check(data.batch_size >= 1, "data.batch_size", "must be at least 1");
     check(data.epoch_passes > 0, "data.epoch_passes", "must be positive");
@@ -234,6 +237,7 @@ Config RunConfig::model_config() const {
     c.tied = arch.tied_embeddings;
     c.L = arch.num_layers;
     c.hops = arch.hops.empty() ? std::vector<int>(size_t(arch.num_layers), 2) : arch.hops;
+    c.slots = arch.bank_slots;
     c.N = arch.lru_dim;
     c.H = arch.num_heads;
     c.F = ffn_dim();

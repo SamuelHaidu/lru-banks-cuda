@@ -163,6 +163,9 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
 #pragma unroll
             for (int j = 0; j < 4; ++j) l[j] += kd * Rs[d * RPAD + lane + 32 * j];
         }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (lane + 32 * j >= a.slots) l[j] = -INFINITY;  // past the layer's bank size
         float v1 = l[0], v2 = -INFINITY;
         int i1 = lane, i2 = -1;
 #pragma unroll

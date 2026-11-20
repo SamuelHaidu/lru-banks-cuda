@@ -37,7 +37,9 @@ struct ArchCfg {
     double gate_bias_write = 2.0, gate_bias_read = 20.0;
     double gate_budget = 0.0, gate_budget_target = 0.5;  // budget * (mean sigmoid(a) - target)^2 per gate group
     int window_size = 512;
-    int head_dim = DH, slots = SLOTS, topk = 2;          // fixed by the kernels (any other value is rejected)
+    std::vector<int> bank_slots;  // per layer bank size, 2..128 (the kernels' maximum); [] = 128 everywhere. Fewer
+                                  // slots change the model, not the step time (the walks still run 128 threads)
+    int head_dim = DH, topk = 2;  // fixed by the kernels (any other value is rejected)
 };
 
 struct DataCfg {

@@ -37,6 +37,7 @@ struct Config {
     bool factorized = true;  // false: E is V x D (E0 = D), no W_in / W_out
     bool tied = true;        // false: the readout has its own table E_out (V x E0)
     std::vector<int> hops;   // per layer, 1 or 2 (empty: 2 everywhere)
+    std::vector<int> slots;  // per layer bank size, 2..SLOTS (empty: SLOTS everywhere)
     int B = 64, T = 512;
     int bank_chunk = 512;  // tokens per bank-walk block (rows longer than this walk in parallel chunks)
     int ce_chunk = 256;  // loss rows per chunk: 256 x V fp32 logits + bf16 gradients (50 MB) stay in the L2
@@ -49,6 +50,7 @@ struct Config {
 
     int M() const { return B * T; }
     int hops_of(int n) const { return hops.empty() ? 2 : hops[size_t(n)]; }
+    int slots_of(int n) const { return slots.empty() ? SLOTS : slots[size_t(n)]; }
     int HD() const { return H * DH; }
     int S2() const { return 2 * N; }
     int ldPV() const { return 2 * N + H * DH; }

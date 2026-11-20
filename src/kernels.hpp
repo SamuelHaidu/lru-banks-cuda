@@ -100,6 +100,8 @@ struct AddrFwd {
     uint2* info;                  // [M][H] packed for the bank walks: x = m1 | m2 << 8 | flags << 16 (flags: 1 write
                                   // gate, 2 read gate, 4 reset, 8 hop-2 read gate, set by q2_fwd), y = bits of p1
     int M, T, H;
+    int slots = SLOTS;            // the layer's bank size (2..SLOTS): routing picks among slots [0, slots); the
+                                  // others are never written, so the reads never see them
 };
 void addr_fwd(const AddrFwd& a, cudaStream_t s);
 

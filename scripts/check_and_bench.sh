@@ -23,6 +23,7 @@ check default "$@"
 check untied --set arch_params.tied_embeddings=false "$@"
 check unfactorized --set arch_params.factorized=false "$@"
 check hops-2,1 --set 'arch_params.hops=[2,1]' "$@"
+check slots-64,16 --set 'arch_params.bank_slots=[64,16]' "$@"
 check all-options --set arch_params.tied_embeddings=false --set arch_params.factorized=false \
     --set 'arch_params.hops=[1,2]' "$@"
 for mode in "B1 all gates open:--gate-w 20 --gate-r 20" "B2 reads closed:--gate-w 20 --gate-r -20"; do

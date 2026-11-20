@@ -50,7 +50,7 @@ cfg = {}
 for line in (DUMP / "config.txt").read_text().split("\n"):
     if line.strip():
         k, v = line.split()
-        if k == "hops":
+        if k in ("hops", "bank_slots"):
             cfg[k] = [int(x) for x in v.split(",")]
         else:
             cfg[k] = float(v) if "." in v or "e" in v else int(v)
@@ -59,6 +59,7 @@ FACTORIZED, TIED = bool(cfg.get("factorized", 1)), bool(cfg.get("tied", 1))
 HOPS = cfg.get("hops", [2] * L)
 B, T, DH, SLOTS = cfg["B"], cfg["T"], cfg["DH"], cfg["SLOTS"]
 HD = H * DH
+BANK_SLOTS = cfg.get("bank_slots", [SLOTS] * L)
 
 params = read("params.bin", torch.float32).double()
 grads_c = read("grads.bin", torch.float32).double()
@@ -80,8 +81,11 @@ for n in range(L):
     for k in ("gw", "gr", "gr2"):
         dec[n][k] = dec[n][k].reshape(B, T, H)
 
-hl = torch.exp(torch.linspace(math.log(cfg["slot_hl_min"]), math.log(cfg["slot_hl_max"]), SLOTS))
-slot_decay = torch.exp((math.log(0.5) / hl).float().double())  # the C++ keeps log decays in fp32
+def slot_decays(ns):
+    """Half-lives log-spaced over the layer's ns slots; slots past it (never written) keep the slowest one."""
+    hl = torch.exp(torch.linspace(math.log(cfg["slot_hl_min"]), math.log(cfg["slot_hl_max"]), ns))
+    hl = torch.cat([hl, hl[-1:].expand(SLOTS - ns)])
+    return torch.exp((math.log(0.5) / hl).float().double())  # the C++ keeps log decays in fp32
 
 
 def rms(x):
@@ -117,7 +121,7 @@ def lru(Pin, nu, theta):
     return torch.stack(out, 1)
 
 
-def bank_reads(k, v, r1, r2, ridx, queries, gates, taus, closed, p1):
+def bank_reads(k, v, r1, r2, ridx, queries, gates, taus, closed, p1, slot_decay):
     """The banks of one layer (token loop) and its reads: queries / gates / taus, one per hop. A closed write gate's
     gradient is the secant to the open state: its slot weights' gradients scaled by Z / (Z + r), Z the slot's mass just
     before the write and r the weight the write would have had (as the C++ addr_bwd)."""
@@ -188,7 +192,8 @@ def reference():
         v = PV[..., 2 * N:].reshape(B, T, H, DH)  # already bf16 (PV is)
         # hop 1, the FFN, then hop 2 (its query from the stream after the FFN)
         closed = d["gw"] == 0
-        (o1,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q], [gr], [p_("log_tau")[0].exp()], closed, p1)
+        (o1,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q], [gr], [p_("log_tau")[0].exp()], closed, p1,
+                           slot_decays(BANK_SLOTS[n]))
         h = h + bf(o1) @ bf(p_("Wo"))
         z = bf(bf(bf(rms(h)) @ bf(p_("W1") * p_("ffn_norm").T)) + p_("b1")[0])
         h = h + bf(gelu(z)) @ bf(p_("W2")) + p_("b2")[0]
@@ -199,7 +204,7 @@ def reference():
         ar2 = G2[..., HD:HD + H] + p_("brg2")[0]
         gr2 = ste(d["gr2"], ar2, d["gr2"].bool())
         (o2,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q2], [gr2], [p_("log_tau2")[0].exp()], closed,
-                           p1)
+                           p1, slot_decays(BANK_SLOTS[n]))
         h = h + bf(o2) @ bf(p_("Wo2"))
 
     if FACTORIZED:

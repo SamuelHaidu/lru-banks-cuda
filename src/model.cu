@@ -27,6 +27,7 @@ T* Model::alloc(size_t n) {
 Model::Model(const Config& c, uint64_t seed) : c_(c) {
     const int D = c.D, HD = c.HD(), S2 = c.S2(), H = c.H, F = c.F, E0 = c.E0, V = c.V, M = c.M();
     if (int(c.hops.size()) != 0 && int(c.hops.size()) != c.L) fail("Model", "hops needs one entry per layer", __FILE__, __LINE__);
+    if (!c.slots.empty() && int(c.slots.size()) != c.L) fail("Model", "slots needs one entry per layer", __FILE__, __LINE__);
     if (!c.factorized && E0 != D) fail("Model", "an unfactorized embedding is D wide (E0 = D)", __FILE__, __LINE__);
     E_ = add("E", V, E0, true);
     if (!c.tied) E_out_ = add("E_out", V, E0, true);
@@ -76,7 +77,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         Winb_ = alloc<bf16>(size_t(E0) * D);
         Woutb_ = alloc<bf16>(size_t(D) * E0);
     }
-    loga_ = alloc<float>(size_t(H) * SLOTS);
+    loga_ = alloc<float>(size_t(c.L) * H * SLOTS);  // per layer: its bank size sets the half-life spacing
     const int nchunks = (c.T + c.bank_chunk - 1) / c.bank_chunk;
     const size_t ckpt_floats = size_t(c.B) * H * nchunks * CKPT_FIELDS * SLOTS;
     bool any_two = false;
@@ -244,12 +245,17 @@ void Model::init(uint64_t seed) {
         if (t.decay) std::fill(hd.begin() + t.off, hd.begin() + t.off + size_t(t.rows) * t.cols, 1);
     LBC_CUDA(cudaMemcpy(P_, hp.data(), n_ * 4, cudaMemcpyHostToDevice));
     LBC_CUDA(cudaMemcpy(decay_, hd.data(), n_, cudaMemcpyHostToDevice));
-    // slot decays: half-lives log-spaced over [slot_hl_min, slot_hl_max], the same for every head and layer
-    std::vector<float> la(size_t(c_.H) * SLOTS);
-    for (int m = 0; m < SLOTS; ++m) {
-        const double hl = std::exp(std::log(c_.slot_hl_min) +
-                                   (std::log(c_.slot_hl_max) - std::log(c_.slot_hl_min)) * m / (SLOTS - 1));
-        for (int h = 0; h < c_.H; ++h) la[size_t(h) * SLOTS + m] = float(std::log(0.5) / hl);
+    // slot decays: half-lives log-spaced over [slot_hl_min, slot_hl_max] across the layer's bank size (the same for
+    // every head); slots past it are never written (their decay is the slowest one's)
+    std::vector<float> la(size_t(c_.L) * c_.H * SLOTS);
+    for (int n = 0; n < c_.L; ++n) {
+        const int ns = c_.slots_of(n);
+        for (int m = 0; m < SLOTS; ++m) {
+            const int mm = std::min(m, ns - 1);
+            const double hl = std::exp(std::log(c_.slot_hl_min) +
+                                       (std::log(c_.slot_hl_max) - std::log(c_.slot_hl_min)) * mm / (ns - 1));
+            for (int h = 0; h < c_.H; ++h) la[(size_t(n) * c_.H + h) * SLOTS + m] = float(std::log(0.5) / hl);
+        }
     }
     LBC_CUDA(cudaMemcpy(loga_, la.data(), la.size() * 4, cudaMemcpyHostToDevice));
     prepare_weights(nullptr);
@@ -320,7 +326,8 @@ void Model::mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16
 BankWrites Model::writes(int n, const Batch& b) {
     const LayerA& a = la_[n];
     (void)b;
-    return BankWrites{a.k, a.PV + c_.S2(), c_.ldPV(), a.info, loga_, c_.B, c_.T, c_.H, c_.bank_chunk, a.ckpt};
+    return BankWrites{a.k,  a.PV + c_.S2(), c_.ldPV(), a.info, loga_ + size_t(n) * c_.H * SLOTS, c_.B, c_.T, c_.H,
+                      c_.bank_chunk, a.ckpt};
 }
 
 void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
@@ -340,7 +347,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::BF16);
     tic(s, "addr_fwd");
     addr_fwd(AddrFwd{Gt_, c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q, a.kn, a.qn, a.ridx, a.rp1,
-                     a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H},
+                     a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H, c_.slots_of(n)},
              s);
     toc(s);
     const BankWrites bw = writes(n, b);
