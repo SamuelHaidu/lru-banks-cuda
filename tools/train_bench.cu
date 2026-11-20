@@ -3,6 +3,7 @@
 //
 //   train_bench --data /root/data/pretrain-mix-bpe32768/train.npy [--steps 30] [--warmup 5] [--batch 64]
 //               [--seq 512] [--layers 4] [--gate-w 2] [--gate-r 2] [--lr 2e-3] [--budget 0] [--tiny]
+//               [--ce-chunk 256]  (loss rows per chunk: 256 keeps a chunk's logits and gradients in the 4090's L2)
 //               [--dump DIR]   (one forward / backward, then parameters, batch, decisions, loss and gradients
 //                               written to DIR for tests/check_grads.py)
 
@@ -24,7 +25,7 @@ namespace {
 
 struct Args {
     std::string data, dump;
-    int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4;
+    int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4, ce_chunk = 256;
     float gate_w = 2.f, gate_r = 2.f, lr = 2e-3f, budget = 0.f;
     bool tiny = false;
     uint64_t seed = 1;
@@ -53,6 +54,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--lr") a.lr = std::atof(val());
         else if (k == "--budget") a.budget = std::atof(val());
         else if (k == "--seed") a.seed = std::strtoull(val(), nullptr, 10);
+        else if (k == "--ce-chunk") a.ce_chunk = std::atoi(val());
         else if (k == "--tiny") a.tiny = true;
         else {
             std::fprintf(stderr, "unknown argument %s\n", k.c_str());
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
     c.gate_bias_r = a.gate_r;
     c.lr = a.lr;
     c.budget = a.budget;
+    c.ce_chunk = a.ce_chunk;
     if (a.tiny) {  // small widths for the gradient check (DH and SLOTS are fixed by the kernels)
         c.E0 = 32;
         c.D = 64;

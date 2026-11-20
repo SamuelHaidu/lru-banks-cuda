@@ -153,12 +153,20 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
         for (int j = threadIdx.x; j < V; j += blockDim.x) d[j] = __float2bfloat16(0.f);
         return;
     }
-    float m = -INFINITY;
-    for (int j = threadIdx.x; j < V; j += blockDim.x) m = fmaxf(m, l[j]);
-    m = block_max(m, sh);
-    float s = 0.f;
-    for (int j = threadIdx.x; j < V; j += blockDim.x) s += __expf(l[j] - m);
-    s = block_sum(s, sh);
+    // one pass for the max and the sum (online softmax), merged over the block
+    float m = -INFINITY, s = 0.f;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) {
+        const float x = l[j];
+        if (x > m) {
+            s = s * __expf(m - x) + 1.f;
+            m = x;
+        } else {
+            s += __expf(x - m);
+        }
+    }
+    const float mb = block_max(m, sh);
+    s = block_sum(m > -INFINITY ? s * __expf(m - mb) : 0.f, sh);
+    m = mb;
     const float inv = 1.f / s;
     for (int j = threadIdx.x; j < V; j += blockDim.x) {
         float p = __expf(l[j] - m) * inv;
