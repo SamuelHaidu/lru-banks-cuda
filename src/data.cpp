@@ -45,8 +45,12 @@ TokenFile::~TokenFile() {
     if (map_) munmap(map_, map_bytes_);
 }
 
-Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, int slots)
-    : file_(file), B_(B), T_(T), marker_(marker), seed_(seed), slots_(size_t(slots)) {
+Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int slots)
+    : file_(file), B_(B), T_(T), marker_(marker), seed_(seed), next_batch_(start_batch),
+      steps_per_pass_(steps_per_pass(file.size(), B, T)), slots_(size_t(slots)) {
+    if (steps_per_pass_ == 0)
+        throw std::runtime_error("Loader: the token file holds less than one batch of " + std::to_string(B) +
+                                 " x " + std::to_string(T));
     for (auto& s : slots_) {
         const size_t n = size_t(B) * T;
         LBC_CUDA(cudaHostAlloc(&s.hb.ids, n * sizeof(int), cudaHostAllocDefault));
@@ -76,18 +80,19 @@ Loader::~Loader() {
 
 void Loader::fill(HostBatch& hb) {
     const size_t n = file_.size();
-    if (order_.empty() || pos_ + B_ > order_.size()) {  // a new pass: random offset, shuffled windows
-        std::mt19937_64 rng(seed_ * 1000003u + pass_++);
+    const uint64_t g = next_batch_++, pass = g / steps_per_pass_, j = g % steps_per_pass_;
+    if (pass != pass_) {  // a pass: random offset, shuffled windows (a pure function of the seed and the pass)
+        std::mt19937_64 rng(seed_ * 1000003u + pass);
         offset_ = rng() % size_t(T_);
         order_.resize((n - offset_ - 1) / size_t(T_));
         std::iota(order_.begin(), order_.end(), 0u);
         std::shuffle(order_.begin(), order_.end(), rng);
-        pos_ = 0;
+        pass_ = pass;
     }
     const uint16_t* tok = file_.data();
     int targets = 0;
     for (int b = 0; b < B_; ++b) {
-        const size_t start = offset_ + size_t(order_[pos_ + b]) * T_;
+        const size_t start = offset_ + size_t(order_[j * B_ + b]) * T_;
         const size_t o = size_t(b) * T_;
         for (int t = 0; t < T_; ++t) {
             const int x = tok[start + t], y = tok[start + t + 1];
@@ -97,7 +102,6 @@ void Loader::fill(HostBatch& hb) {
             targets += y != marker_;
         }
     }
-    pos_ += B_;
     hb.n_targets = targets;
     *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
 }
@@ -146,6 +150,49 @@ void Loader::release(HostBatch* hb, cudaStream_t stream) {
         ++consume_;
     }
     cv_.notify_all();
+}
+
+ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker) {
+    const size_t n = file.size();
+    const uint16_t* tok = file.data();
+    std::vector<size_t> starts;
+    for (size_t i = 0; i < n; ++i)
+        if (tok[i] == marker) starts.push_back(i);
+    if (starts.empty()) starts.push_back(0);
+    const size_t rows = size_t(B) * T;
+    batches_.resize(size_t(steps));
+    for (int i = 0; i < steps; ++i) {
+        HostBatch& hb = batches_[size_t(i)];
+        LBC_CUDA(cudaHostAlloc(&hb.ids, rows * sizeof(int), cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&hb.y, rows * sizeof(int), cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&hb.reset, rows, cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&hb.inv_n, sizeof(float), cudaHostAllocDefault));
+        std::mt19937_64 rng(seed * 7919u + 104729u * uint64_t(i) + 1);
+        int targets = 0;
+        for (int b = 0; b < B; ++b) {
+            const size_t start = starts[rng() % starts.size()];
+            for (int t = 0; t < T; ++t) {
+                const size_t p = start + size_t(t);
+                const int x = p < n ? tok[p] : marker, y = p + 1 < n ? tok[p + 1] : marker;
+                const size_t o = size_t(b) * T + t;
+                hb.ids[o] = x;
+                hb.y[o] = y == marker ? -1 : y;
+                hb.reset[o] = x == marker;
+                targets += y != marker;
+            }
+        }
+        hb.n_targets = targets;
+        *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
+    }
+}
+
+ValidationSet::~ValidationSet() {
+    for (auto& hb : batches_) {
+        cudaFreeHost(hb.ids);
+        cudaFreeHost(hb.y);
+        cudaFreeHost(hb.reset);
+        cudaFreeHost(hb.inv_n);
+    }
 }
 
 }  // namespace lbc

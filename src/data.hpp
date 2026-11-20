@@ -1,9 +1,10 @@
 #pragma once
 // Training batches from a memory-mapped uint16 .npy token file (`<bos>doc<eos>` documents concatenated), as the
 // Python pipeline's random windows: each pass cuts the stream into windows of T + 1 tokens from a random offset and
-// visits them in a shuffled order. Targets are the next tokens, -1 where the next token is the document marker; the
-// state resets wherever the input token is the marker. A CPU thread fills pinned buffers ahead of the GPU (the disk
-// reads happen there, through the page cache).
+// visits them in a shuffled order. Batch g of the run is batch g % steps_per_pass of pass g / steps_per_pass, so a
+// resumed run continues with exactly the next batch. Targets are the next tokens, -1 where the next token is the
+// document marker; the state resets wherever the input token is the marker. A CPU thread fills pinned buffers ahead
+// of the GPU (the disk reads happen there, through the page cache).
 
 #include <condition_variable>
 #include <cstdint>
@@ -42,7 +43,9 @@ struct HostBatch {
 
 class Loader {
   public:
-    Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, int slots = 3);
+    Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, uint64_t start_batch = 0, int slots = 3);
+    // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
+    static size_t steps_per_pass(size_t tokens, int B, int T) { return tokens > size_t(T) ? (tokens - T) / T / B : 0; }
     ~Loader();
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
@@ -59,8 +62,8 @@ class Loader {
     const TokenFile& file_;
     int B_, T_, marker_;
     uint64_t seed_;
-    uint64_t pass_ = 0;
-    size_t pos_ = 0, offset_ = 0;
+    uint64_t next_batch_, pass_ = ~uint64_t(0), steps_per_pass_;
+    size_t offset_ = 0;
     std::vector<uint32_t> order_;
 
     struct Slot {
@@ -75,6 +78,22 @@ class Loader {
     bool stop_ = false;
     std::thread thread_;
     double wait_ms_ = 0.0, fill_ms_ = 0.0;
+};
+
+// Validation rows, the same every epoch (as the Python pipeline's dense validation, `fixed` rows): `steps` batches of
+// B rows of T tokens, each row from a random document start (seeded per batch); past the end of the file the rows
+// are padded with the marker (no target). Built once into pinned memory.
+class ValidationSet {
+  public:
+    ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker = 0);
+    ~ValidationSet();
+    ValidationSet(const ValidationSet&) = delete;
+    ValidationSet& operator=(const ValidationSet&) = delete;
+    int steps() const { return int(batches_.size()); }
+    const HostBatch& batch(int i) const { return batches_[size_t(i)]; }
+
+  private:
+    std::vector<HostBatch> batches_;
 };
 
 }  // namespace lbc
