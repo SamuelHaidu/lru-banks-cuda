@@ -15,18 +15,12 @@ namespace lbc {
 
 // xh = h / rms(h) (bf16), rstd = 1 / rms(h). The gain is folded into the next GEMM's weight.
 void rmsnorm_fwd(const float* h, bf16* xh, float* rstd, int M, int D, cudaStream_t s);
-// dh (+)= rstd (dxh - xh * mean(dxh * xh))
-void rmsnorm_bwd(const float* dxh, const bf16* xh, const float* rstd, float* dh, int M, int D, bool accumulate,
-                 cudaStream_t s);
+// dh (+)= rstd (dxh - xh * mean(dxh * xh)); also dhb = bf16(dh) (the next GEMMs' operand) and, if colsum is not
+// null, colsum[c] += sum over the rows of the new dh (a bias gradient). D <= 1024.
+void rmsnorm_bwd(const float* dxh, const bf16* xh, const float* rstd, float* dh, bf16* dhb, float* colsum, int M,
+                 int D, bool accumulate, cudaStream_t s);
 void to_bf16(const float* x, bf16* y, size_t n, cudaStream_t s);
-// z <- z + b (the pre-activation, kept for the backward), u = gelu_tanh(z)
-void bias_gelu_fwd(bf16* z, const float* b, bf16* u, int M, int F, cudaStream_t s);
-// dz = du * gelu_tanh'(z)
-void gelu_bwd(const float* du, const bf16* z, bf16* dz, int M, int F, cudaStream_t s);
-void add_bias(float* h, const float* b, int M, int D, cudaStream_t s);
-// out[c] += sum over the M rows of x[r][c] (row stride ld)
-void colsum(const float* x, int M, int N, int ld, float* out, cudaStream_t s);
-void colsum(const bf16* x, int M, int N, int ld, float* out, cudaStream_t s);
+void add_to_f32(const bf16* x, float* y, size_t n, cudaStream_t s);  // y += x
 void embed_gather(const int* ids, const bf16* E, bf16* x, int M, int E0, cudaStream_t s);
 void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cudaStream_t s);
 // Rows of logits [rows][V]: loss_sum += sum (lse - logit[y]) * inv_n; dlogits = (softmax - onehot) * inv_n.

@@ -77,6 +77,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         w.W1 = alloc<bf16>(size_t(D) * F);
         w.W2 = alloc<bf16>(size_t(F) * D);
         w.Wq2 = alloc<bf16>(size_t(D) * c.ldG2());
+        w.b1 = alloc<bf16>(F);
         lw_.push_back(w);
         LayerA a;
         a.xh1 = alloc<bf16>(size_t(M) * D);
@@ -119,14 +120,13 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     G2t_ = alloc<bf16>(size_t(M) * c.ldG2());
     logits_ = alloc<float>(size_t(Mc) * V);
     dlog_ = alloc<bf16>(size_t(Mc) * V);
-    dhr_ = alloc<float>(size_t(M) * E0);
     dhrb_ = alloc<bf16>(size_t(M) * E0);
     dh_ = alloc<float>(size_t(M) * D);
     dhb_ = alloc<bf16>(size_t(M) * D);
     dxh_ = alloc<float>(size_t(M) * D);
     dO1_ = alloc<float>(size_t(M) * HD);
     dO2_ = alloc<float>(size_t(M) * HD);
-    du_ = alloc<float>(size_t(M) * F);
+    db1b_ = alloc<bf16>(F);
     dZ_ = alloc<bf16>(size_t(M) * F);
     dG_ = alloc<bf16>(size_t(M) * c.ldG());
     dG2_ = alloc<bf16>(size_t(M) * c.ldG2());
@@ -239,6 +239,7 @@ void Model::prepare_weights(cudaStream_t s) {
         prep_weight(p(x.W1), p(x.ffn_norm), w.W1, D, F, s);
         prep_weight(p(x.W2), nullptr, w.W2, F, D, s);
         prep_weight(p(x.Wq2), p(x.q2_norm), w.Wq2, D, c_.ldG2(), s);
+        prep_weight(p(x.b1), nullptr, w.b1, 1, F, s);
     }
 }
 
@@ -273,9 +274,9 @@ std::vector<std::pair<std::string, float>> Model::profile_ms() {
 }
 
 void Model::mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16* A, int lda, const bf16* B,
-               int ldb, void* D, int ldd, Out out, float beta) {
+               int ldb, void* D, int ldd, Out out, float beta, const Epilogue& epi) {
     tic(s, "gemm");
-    gemm_.run(s, tA, tB, M, N, K, A, lda, B, ldb, D, ldd, out, beta);
+    gemm_.run(s, tA, tB, M, N, K, A, lda, B, ldb, D, ldd, out, beta, 1.f, epi);
     toc(s);
 }
 
@@ -313,13 +314,11 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "norm+elementwise");
     rmsnorm_fwd(h_, a.xh2, a.rstd2, M, D, s);
     toc(s);
-    mm(s, false, false, M, F, D, a.xh2, D, w.W1, F, a.Z, F, Out::BF16);
+    // U = gelu(xh2 W1' + b1) with the pre-activation Z kept (aux), then h += U W2 + b2: both in GEMM epilogues
+    mm(s, false, false, M, F, D, a.xh2, D, w.W1, F, a.U, F, Out::BF16, 0.f,
+       Epilogue{Epilogue::GeluAuxBias, w.b1, nullptr, a.Z, F});
+    mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2)});
     tic(s, "norm+elementwise");
-    bias_gelu_fwd(a.Z, p(x.b1), a.U, M, F, s);
-    toc(s);
-    mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f);
-    tic(s, "norm+elementwise");
-    add_bias(h_, p(x.b2), M, D, s);
     rmsnorm_fwd(h_, a.xh3, a.rstd3, M, D, s);
     toc(s);
     mm(s, false, false, M, c_.ldG2(), D, a.xh3, D, w.Wq2, c_.ldG2(), G2t_, c_.ldG2(), Out::BF16);
@@ -341,10 +340,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     const float count = float(M) * H;
     const BankWrites bw = writes(n, b);
 
-    // hop 2: h += o2 Wo2
-    tic(s, "norm+elementwise");
-    to_bf16(dh_, dhb_, size_t(M) * D, s);
-    toc(s);
+    // hop 2: h += o2 Wo2 (dhb = bf16(dh), written by the norm backward above)
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
     mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32);
     tic(s, "bank_rewalk");
@@ -359,25 +355,22 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, true, false, D, c_.ldG2(), M, a.xh3, D, dG2_, c_.ldG2(), dWp_, c_.ldG2(), Out::F32);
     tic(s, "norm+elementwise");
     unfold_grad(dWp_, p(x.Wq2), p(x.q2_norm), g(x.Wq2), g(x.q2_norm), D, c_.ldG2(), s);
-    rmsnorm_bwd(dxh_, a.xh3, a.rstd3, dh_, M, D, true, s);
-    // FFN: h += W2 gelu(W1 rms(h) + b1) + b2
-    colsum(dh_, M, D, D, g(x.b2), s);
-    to_bf16(dh_, dhb_, size_t(M) * D, s);
+    rmsnorm_bwd(dxh_, a.xh3, a.rstd3, dh_, dhb_, g(x.b2), M, D, true, s);  // and b2's gradient
     toc(s);
-    mm(s, false, true, M, F, D, dhb_, D, w.W2, D, du_, F, Out::F32);
+    // FFN: h += W2 gelu(W1 rms(h) + b1) + b2; dZ = (dh W2^T) gelu'(Z) and b1's gradient from the GEMM epilogue
+    mm(s, false, true, M, F, D, dhb_, D, w.W2, D, dZ_, F, Out::BF16, 0.f,
+       Epilogue{Epilogue::DGeluBgrad, nullptr, db1b_, a.Z, F});
     mm(s, true, false, F, D, M, a.U, F, dhb_, D, g(x.W2), D, Out::F32);
     tic(s, "norm+elementwise");
-    gelu_bwd(du_, a.Z, dZ_, M, F, s);
-    colsum(dZ_, M, F, F, g(x.b1), s);
+    add_to_f32(db1b_, g(x.b1), F, s);
     toc(s);
     mm(s, false, true, M, D, F, dZ_, F, w.W1, F, dxh_, D, Out::F32);
     mm(s, true, false, D, F, M, a.xh2, D, dZ_, F, dWp_, F, Out::F32);
     tic(s, "norm+elementwise");
     unfold_grad(dWp_, p(x.W1), p(x.ffn_norm), g(x.W1), g(x.ffn_norm), D, F, s);
-    rmsnorm_bwd(dxh_, a.xh2, a.rstd2, dh_, M, D, true, s);
-    // hop 1: h += o1 Wo
-    to_bf16(dh_, dhb_, size_t(M) * D, s);
+    rmsnorm_bwd(dxh_, a.xh2, a.rstd2, dh_, dhb_, nullptr, M, D, true, s);
     toc(s);
+    // hop 1: h += o1 Wo
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo, D, dO1_, HD, Out::F32);
     mm(s, true, false, HD, D, M, a.o1, HD, dhb_, D, g(x.Wo), D, Out::F32);
     tic(s, "bank_rewalk");
@@ -406,7 +399,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, true, false, D, c_.ldPV(), M, a.xh1, D, dPV_, c_.ldPV(), dWp_, c_.ldPV(), Out::F32);
     tic(s, "norm+elementwise");
     unfold_grad(dWp_, p(x.Wa), p(x.norm1), g(x.Wa), g(x.norm1), D, c_.ldPV(), s);
-    rmsnorm_bwd(dxh_, a.xh1, a.rstd1, dh_, M, D, true, s);
+    rmsnorm_bwd(dxh_, a.xh1, a.rstd1, dh_, dhb_, nullptr, M, D, true, s);
     toc(s);
 }
 
@@ -435,24 +428,18 @@ void Model::forward_backward(const Batch& b, cudaStream_t s) {
         tic(s, "ce_softmax");
         ce_rows(logits_, b.y + r0, dlog_, loss_, rows, V, inv_n, s);
         toc(s);
-        mm(s, false, false, rows, E0, V, dlog_, V, Eb_, E0, dhr_ + size_t(r0) * E0, E0, Out::F32);
+        mm(s, false, false, rows, E0, V, dlog_, V, Eb_, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
         mm(s, true, false, V, E0, rows, dlog_, V, hr_ + size_t(r0) * E0, E0, g(E_), E0, Out::F32, 1.f);
     }
 
     // backward
-    tic(s, "norm+elementwise");
-    to_bf16(dhr_, dhrb_, size_t(M) * E0, s);
-    toc(s);
     mm(s, false, true, M, D, E0, dhrb_, E0, Woutb_, E0, dxh_, D, Out::F32);
     mm(s, true, false, D, E0, M, xhF_, D, dhrb_, E0, dWp_, E0, Out::F32);
     tic(s, "norm+elementwise");
     unfold_grad(dWp_, p(W_out_), p(final_norm_), g(W_out_), g(final_norm_), D, E0, s);
-    rmsnorm_bwd(dxh_, xhF_, rstdF_, dh_, M, D, false, s);
+    rmsnorm_bwd(dxh_, xhF_, rstdF_, dh_, dhb_, nullptr, M, D, false, s);
     toc(s);
     for (int n = c_.L - 1; n >= 0; --n) layer_bwd(n, b, s);
-    tic(s, "norm+elementwise");
-    to_bf16(dh_, dhb_, size_t(M) * D, s);
-    toc(s);
     mm(s, false, true, M, E0, D, dhb_, D, Winb_, D, dx0_, E0, Out::F32);
     mm(s, true, false, E0, D, M, x0_, E0, dhb_, D, g(W_in_), D, Out::F32);
     tic(s, "embed");

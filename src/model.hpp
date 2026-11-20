@@ -93,8 +93,8 @@ class Model {
         int norm1, Wa, nu, theta, Ws, bk, brg, bwg, R, ltau, ltau2, Wo, Wo2, ffn_norm, W1, b1, W2, b2, q2_norm, Wq2,
             brg2;
     };
-    struct LayerW {  // bf16 GEMM weights
-        bf16 *Wa, *Ws, *Wo, *Wo2, *W1, *W2, *Wq2;
+    struct LayerW {  // bf16 GEMM weights (and the FFN's first bias: the GELU epilogue takes it in bf16)
+        bf16 *Wa, *Ws, *Wo, *Wo2, *W1, *W2, *Wq2, *b1;
     };
     struct LayerA {  // what the backward needs
         bf16 *xh1, *PV, *sb, *k, *q, *o1, *xh2, *Z, *U, *xh3, *q2, *o2;
@@ -112,7 +112,7 @@ class Model {
     void layer_fwd(int n, const Batch& b, cudaStream_t s);
     void layer_bwd(int n, const Batch& b, cudaStream_t s);
     void mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16* A, int lda, const bf16* B, int ldb,
-            void* D, int ldd, Out out, float beta = 0.f);
+            void* D, int ldd, Out out, float beta = 0.f, const Epilogue& epi = {});
     struct BankWrites writes(int n, const Batch& b);
     void tic(cudaStream_t s, const char* cat);
     void toc(cudaStream_t s);
@@ -138,9 +138,9 @@ class Model {
     bf16* dlog_;
     // backward buffers
     bf16 *dk2_, *dv2_;
-    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
+    float *dh_, *dxh_, *dO1_, *dO2_, *dS_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
         *dWp_;
-    bf16 *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
+    bf16 *db1b_, *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
     float *loss_, *stats_, *gsq_;
 
     std::vector<void*> allocations_;

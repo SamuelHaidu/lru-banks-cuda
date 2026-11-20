@@ -45,3 +45,6 @@ target_link_libraries(device_info PRIVATE lbc_common)
 
 add_executable(train_bench tools/train_bench.cu)
 target_link_libraries(train_bench PRIVATE lbc)
+
+add_executable(check_epilogue tools/check_epilogue.cu)
+target_link_libraries(check_epilogue PRIVATE lbc)

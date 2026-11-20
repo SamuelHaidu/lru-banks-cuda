@@ -22,9 +22,6 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
-__device__ __forceinline__ float to_f(float x) { return x; }
-__device__ __forceinline__ float to_f(bf16 x) { return __bfloat162float(x); }
-
 // block of 256 threads
 __device__ float block_sum(float v, float* sh) {
     v = warp_sum(v);
@@ -52,18 +49,6 @@ __device__ float block_max(float v, float* sh) {
     return sh[0];
 }
 
-__device__ __forceinline__ float gelu_tanh(float z) {
-    const float c = 0.7978845608028654f;
-    return 0.5f * z * (1.f + tanhf(c * (z + 0.044715f * z * z * z)));
-}
-
-__device__ __forceinline__ float gelu_tanh_grad(float z) {
-    const float c = 0.7978845608028654f;
-    const float z2 = z * z;
-    const float t = tanhf(c * (z + 0.044715f * z * z2));
-    return 0.5f * (1.f + t) + 0.5f * z * (1.f - t * t) * c * (1.f + 3.f * 0.044715f * z2);
-}
-
 __global__ void k_rmsnorm_fwd(const float* __restrict__ h, bf16* __restrict__ xh, float* __restrict__ rstd, int M,
                               int D) {
     const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -77,21 +62,52 @@ __global__ void k_rmsnorm_fwd(const float* __restrict__ h, bf16* __restrict__ xh
     if (lane == 0) rstd[row] = r;
 }
 
-__global__ void k_rmsnorm_bwd(const float* __restrict__ dxh, const bf16* __restrict__ xh,
-                              const float* __restrict__ rstd, float* __restrict__ dh, int M, int D, int acc) {
-    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= M) return;
-    const float* g = dxh + size_t(row) * D;
-    const bf16* y = xh + size_t(row) * D;
-    float dot = 0.f;
-    for (int j = lane; j < D; j += 32) dot += g[j] * __bfloat162float(y[j]);
-    dot = warp_sum(dot) / D;
-    const float r = rstd[row];
-    float* out = dh + size_t(row) * D;
-    for (int j = lane; j < D; j += 32) {
-        const float v = r * (g[j] - __bfloat162float(y[j]) * dot);
-        out[j] = acc ? out[j] + v : v;
+// a warp per row, RMS_BWD_ROWS rows per block; the column sums (if any) kept per lane in registers, then summed
+// per block in shared memory: one global atomic per column per block
+constexpr int RMS_BWD_ROWS = 64;
+
+__global__ void __launch_bounds__(256) k_rmsnorm_bwd(const float* __restrict__ dxh, const bf16* __restrict__ xh,
+                                                     const float* __restrict__ rstd, float* __restrict__ dh,
+                                                     bf16* __restrict__ dhb, float* __restrict__ colsum, int M,
+                                                     int D, int acc) {
+    __shared__ float s_col[1024];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5, nd = D / 32;
+    if (colsum)
+        for (int j = threadIdx.x; j < D; j += blockDim.x) s_col[j] = 0.f;
+    float cs[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) cs[i] = 0.f;
+    const int r0 = blockIdx.x * RMS_BWD_ROWS, r1 = min(M, r0 + RMS_BWD_ROWS);
+    for (int row = r0 + warp; row < r1; row += nw) {
+        const float* g = dxh + size_t(row) * D;
+        const bf16* y = xh + size_t(row) * D;
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i)
+            if (i < nd) dot += g[lane + 32 * i] * __bfloat162float(y[lane + 32 * i]);
+        dot = warp_sum(dot) / D;
+        const float r = rstd[row];
+        float* out = dh + size_t(row) * D;
+        bf16* outb = dhb + size_t(row) * D;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < nd) {
+                const int j = lane + 32 * i;
+                float v = r * (g[j] - __bfloat162float(y[j]) * dot);
+                if (acc) v += out[j];
+                out[j] = v;
+                outb[j] = __float2bfloat16(v);
+                cs[i] += v;
+            }
+        }
     }
+    if (!colsum) return;
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+        if (i < nd) atomicAdd(&s_col[lane + 32 * i], cs[i]);
+    __syncthreads();
+    for (int j = threadIdx.x; j < D; j += blockDim.x) atomicAdd(colsum + j, s_col[j]);
 }
 
 __global__ void k_to_bf16(const float* __restrict__ x, bf16* __restrict__ y, size_t n) {
@@ -99,34 +115,9 @@ __global__ void k_to_bf16(const float* __restrict__ x, bf16* __restrict__ y, siz
         y[i] = __float2bfloat16(x[i]);
 }
 
-__global__ void k_bias_gelu(bf16* __restrict__ z, const float* __restrict__ b, bf16* __restrict__ u, size_t n,
-                            int F) {
-    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
-        const float v = __bfloat162float(z[i]) + b[i % F];
-        z[i] = __float2bfloat16(v);
-        u[i] = __float2bfloat16(gelu_tanh(v));
-    }
-}
-
-__global__ void k_gelu_bwd(const float* __restrict__ du, const bf16* __restrict__ z, bf16* __restrict__ dz,
-                           size_t n) {
+__global__ void k_add_to_f32(const bf16* __restrict__ x, float* __restrict__ y, size_t n) {
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
-        dz[i] = __float2bfloat16(du[i] * gelu_tanh_grad(__bfloat162float(z[i])));
-}
-
-__global__ void k_add_bias(float* __restrict__ h, const float* __restrict__ b, size_t n, int D) {
-    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
-        h[i] += b[i % D];
-}
-
-template <class T>
-__global__ void k_colsum(const T* __restrict__ x, int M, int N, int ld, float* __restrict__ out, int rows) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= N) return;
-    const int r0 = blockIdx.y * rows, r1 = min(M, r0 + rows);
-    float s = 0.f;
-    for (int r = r0; r < r1; ++r) s += to_f(x[size_t(r) * ld + col]);
-    atomicAdd(out + col, s);
+        y[i] += __bfloat162float(x[i]);
 }
 
 __global__ void k_embed_gather(const int* __restrict__ ids, const bf16* __restrict__ E, bf16* __restrict__ x,
@@ -239,9 +230,11 @@ void rmsnorm_fwd(const float* h, bf16* xh, float* rstd, int M, int D, cudaStream
     LBC_CUDA(cudaGetLastError());
 }
 
-void rmsnorm_bwd(const float* dxh, const bf16* xh, const float* rstd, float* dh, int M, int D, bool accumulate,
-                 cudaStream_t s) {
-    k_rmsnorm_bwd<<<(M + 7) / 8, 256, 0, s>>>(dxh, xh, rstd, dh, M, D, accumulate ? 1 : 0);
+void rmsnorm_bwd(const float* dxh, const bf16* xh, const float* rstd, float* dh, bf16* dhb, float* colsum, int M,
+                 int D, bool accumulate, cudaStream_t s) {
+    if (D % 32 || D > 1024) fail("rmsnorm_bwd", "D must be a multiple of 32, at most 1024", __FILE__, __LINE__);
+    k_rmsnorm_bwd<<<(M + RMS_BWD_ROWS - 1) / RMS_BWD_ROWS, 256, 0, s>>>(dxh, xh, rstd, dh, dhb, colsum, M, D,
+                                                                      accumulate ? 1 : 0);
     LBC_CUDA(cudaGetLastError());
 }
 
@@ -250,33 +243,8 @@ void to_bf16(const float* x, bf16* y, size_t n, cudaStream_t s) {
     LBC_CUDA(cudaGetLastError());
 }
 
-void bias_gelu_fwd(bf16* z, const float* b, bf16* u, int M, int F, cudaStream_t s) {
-    const size_t n = size_t(M) * F;
-    k_bias_gelu<<<blocks_for(n), 256, 0, s>>>(z, b, u, n, F);
-    LBC_CUDA(cudaGetLastError());
-}
-
-void gelu_bwd(const float* du, const bf16* z, bf16* dz, int M, int F, cudaStream_t s) {
-    const size_t n = size_t(M) * F;
-    k_gelu_bwd<<<blocks_for(n), 256, 0, s>>>(du, z, dz, n);
-    LBC_CUDA(cudaGetLastError());
-}
-
-void add_bias(float* h, const float* b, int M, int D, cudaStream_t s) {
-    const size_t n = size_t(M) * D;
-    k_add_bias<<<blocks_for(n), 256, 0, s>>>(h, b, n, D);
-    LBC_CUDA(cudaGetLastError());
-}
-
-void colsum(const float* x, int M, int N, int ld, float* out, cudaStream_t s) {
-    const int rows = 256;
-    k_colsum<float><<<dim3((N + 255) / 256, (M + rows - 1) / rows), 256, 0, s>>>(x, M, N, ld, out, rows);
-    LBC_CUDA(cudaGetLastError());
-}
-
-void colsum(const bf16* x, int M, int N, int ld, float* out, cudaStream_t s) {
-    const int rows = 256;
-    k_colsum<bf16><<<dim3((N + 255) / 256, (M + rows - 1) / rows), 256, 0, s>>>(x, M, N, ld, out, rows);
+void add_to_f32(const bf16* x, float* y, size_t n, cudaStream_t s) {
+    k_add_to_f32<<<blocks_for(n), 256, 0, s>>>(x, y, n);
     LBC_CUDA(cudaGetLastError());
 }
 
