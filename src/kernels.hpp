@@ -23,17 +23,19 @@ void to_bf16(const float* x, bf16* y, size_t n, cudaStream_t s);
 void add_to_f32(const bf16* x, float* y, size_t n, cudaStream_t s);  // y += x
 void embed_gather(const int* ids, const bf16* E, bf16* x, int M, int E0, cudaStream_t s);
 void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cudaStream_t s);
-// Rows of logits [rows][V]: loss_sum += sum (lse - logit[y]) * inv_n; dlogits = (softmax - onehot) * inv_n.
-// Rows with y < 0 add nothing and get zero gradients.
-void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, float inv_n,
+// Rows of logits [rows][V]: loss_sum += sum (lse - logit[y]) * inv_n; dlogits = (softmax - onehot) * inv_n, with
+// inv_n = 1 / targets read from the device (the step can be a CUDA graph). Rows with y < 0 add nothing.
+void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, const float* inv_n,
              cudaStream_t s);
 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 
 void sumsq(const float* x, size_t n, float* out, cudaStream_t s);
-// AdamW with the update scaled by min(1, clip / ||g||) (||g||^2 read from gsq on the device: no host sync).
+// AdamW with the update scaled by min(1, clip / ||g||) (||g||^2 read from gsq on the device: no host sync); the
+// step count (for the bias corrections) is read from the device as well, so the step can be a CUDA graph.
 void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, float lr, float beta1,
-           float beta2, float eps, float wd, float bc1, float bc2, const float* gsq, float clip, cudaStream_t s);
+           float beta2, float eps, float wd, const int* step, const float* gsq, float clip, cudaStream_t s);
+void increment(int* x, cudaStream_t s);
 // Wb = bf16(diag(gain) W) (gain may be null)
 void prep_weight(const float* W, const float* gain, bf16* Wb, int rows, int cols, cudaStream_t s);
 // From dWp = dL/d(diag(gain) W): dW += diag(gain) dWp, dgain += rowsum(W * dWp) (gain may be null: dW += dWp)

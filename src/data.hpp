@@ -36,6 +36,7 @@ struct HostBatch {
     int* ids = nullptr;        // [B * T]
     int* y = nullptr;          // [B * T]
     uint8_t* reset = nullptr;  // [B * T]
+    float* inv_n = nullptr;    // [1] 1 / targets (pinned, copied with the batch)
     int n_targets = 0;
 };
 

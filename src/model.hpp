@@ -54,12 +54,12 @@ struct Tensor {
     bool decay;
 };
 
-// device pointers; n_targets counted on the host by the loader (no sync)
+// device pointers (fixed across steps, so a step can be a CUDA graph); inv_n = 1 / targets, from the loader
 struct Batch {
     const int* ids;
     const int* y;
     const uint8_t* reset;
-    int n_targets;
+    const float* inv_n;
 };
 
 class Model {
@@ -70,7 +70,7 @@ class Model {
     Model& operator=(const Model&) = delete;
 
     void forward_backward(const Batch& batch, cudaStream_t s);  // loss and every gradient (gradients zeroed first)
-    void optimizer_step(int step, cudaStream_t s);              // step counts from 1
+    void optimizer_step(cudaStream_t s);                        // the step count lives on the device
 
     const float* loss_device() const { return loss_; }
     std::vector<float> gate_stats(cudaStream_t s);  // per layer: open fraction of [write, read 1, read 2]
@@ -144,6 +144,7 @@ class Model {
         *dWp_;
     bf16 *db1b_, *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
     float *loss_, *stats_, *gsq_, *carry_;
+    int* step_;
     int* cflags_;
 
     std::vector<void*> allocations_;

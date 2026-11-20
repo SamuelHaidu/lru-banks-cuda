@@ -52,6 +52,7 @@ Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, i
         LBC_CUDA(cudaHostAlloc(&s.hb.ids, n * sizeof(int), cudaHostAllocDefault));
         LBC_CUDA(cudaHostAlloc(&s.hb.y, n * sizeof(int), cudaHostAllocDefault));
         LBC_CUDA(cudaHostAlloc(&s.hb.reset, n, cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&s.hb.inv_n, sizeof(float), cudaHostAllocDefault));
         LBC_CUDA(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming));
     }
     thread_ = std::thread([this] { run(); });
@@ -68,6 +69,7 @@ Loader::~Loader() {
         cudaFreeHost(s.hb.ids);
         cudaFreeHost(s.hb.y);
         cudaFreeHost(s.hb.reset);
+        cudaFreeHost(s.hb.inv_n);
         cudaEventDestroy(s.done);
     }
 }
@@ -97,6 +99,7 @@ void Loader::fill(HostBatch& hb) {
     }
     pos_ += B_;
     hb.n_targets = targets;
+    *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
 }
 
 void Loader::run() {

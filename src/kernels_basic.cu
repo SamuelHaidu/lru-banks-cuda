@@ -134,7 +134,8 @@ __global__ void k_embed_scatter(const int* __restrict__ ids, const float* __rest
 
 __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logits, const int* __restrict__ y,
                                                  bf16* __restrict__ dlogits, float* __restrict__ loss_sum, int V,
-                                                 float inv_n) {
+                                                 const float* __restrict__ inv_n_ptr) {
+    const float inv_n = *inv_n_ptr;
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
     const float* l = logits + row * V;
@@ -177,8 +178,9 @@ __global__ void k_sumsq(const float* __restrict__ x, size_t n, float* __restrict
 
 __global__ void k_adamw(float* __restrict__ p, const float* __restrict__ g, float* __restrict__ m,
                         float* __restrict__ v, const uint8_t* __restrict__ decay, size_t n, float lr, float b1,
-                        float b2, float eps, float wd, float bc1, float bc2, const float* __restrict__ gsq,
+                        float b2, float eps, float wd, const int* __restrict__ step, const float* __restrict__ gsq,
                         float clip) {
+    const float bc1 = 1.f - powf(b1, float(*step)), bc2 = 1.f - powf(b2, float(*step));
     const float norm = sqrtf(*gsq);
     const float scale = (clip > 0.f && norm > clip) ? clip / (norm + 1e-6f) : 1.f;
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
@@ -192,6 +194,8 @@ __global__ void k_adamw(float* __restrict__ p, const float* __restrict__ g, floa
         p[i] = pi - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
     }
 }
+
+__global__ void k_increment(int* x) { ++*x; }
 
 __global__ void k_prep_weight(const float* __restrict__ W, const float* __restrict__ gain, bf16* __restrict__ Wb,
                               int rows, int cols) {
@@ -260,7 +264,7 @@ void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cu
     LBC_CUDA(cudaGetLastError());
 }
 
-void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, float inv_n,
+void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, const float* inv_n,
              cudaStream_t s) {
     k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, V, inv_n);
     LBC_CUDA(cudaGetLastError());
@@ -272,8 +276,13 @@ void sumsq(const float* x, size_t n, float* out, cudaStream_t s) {
 }
 
 void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, float lr, float beta1,
-           float beta2, float eps, float wd, float bc1, float bc2, const float* gsq, float clip, cudaStream_t s) {
-    k_adamw<<<blocks_for(n), 256, 0, s>>>(p, g, m, v, decay, n, lr, beta1, beta2, eps, wd, bc1, bc2, gsq, clip);
+           float beta2, float eps, float wd, const int* step, const float* gsq, float clip, cudaStream_t s) {
+    k_adamw<<<blocks_for(n), 256, 0, s>>>(p, g, m, v, decay, n, lr, beta1, beta2, eps, wd, step, gsq, clip);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void increment(int* x, cudaStream_t s) {
+    k_increment<<<1, 1, 0, s>>>(x);
     LBC_CUDA(cudaGetLastError());
 }
 

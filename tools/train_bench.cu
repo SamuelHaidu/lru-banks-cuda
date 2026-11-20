@@ -28,7 +28,7 @@ struct Args {
     std::string data, dump;
     int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4, ce_chunk = 256, bank_chunk = 512;
     float gate_w = 2.f, gate_r = 2.f, lr = 2e-3f, budget = 0.f;
-    bool tiny = false, gate_report = false;
+    bool tiny = false, gate_report = false, graph = true;
     float budget_target = 0.5f;
     uint64_t seed = 1;
 };
@@ -60,6 +60,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--bank-chunk") a.bank_chunk = std::atoi(val());
         else if (k == "--tiny") a.tiny = true;
         else if (k == "--gate-report") a.gate_report = true;
+        else if (k == "--no-graph") a.graph = false;
         else if (k == "--budget-target") a.budget_target = std::atof(val());
         else {
             std::fprintf(stderr, "unknown argument %s\n", k.c_str());
@@ -156,6 +157,8 @@ int main(int argc, char** argv) {
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
     uint8_t* d_reset;
+    float* d_inv_n;
+    LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -173,7 +176,8 @@ int main(int argc, char** argv) {
         LBC_CUDA(cudaMemcpyAsync(d_ids, hb->ids, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_y, hb->y, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_reset, hb->reset, ntok, cudaMemcpyHostToDevice, s));
-        const Batch b{d_ids, d_y, d_reset, hb->n_targets};
+        LBC_CUDA(cudaMemcpyAsync(d_inv_n, hb->inv_n, sizeof(float), cudaMemcpyHostToDevice, s));
+        const Batch b{d_ids, d_y, d_reset, d_inv_n};
         return b;
     };
 
@@ -195,6 +199,9 @@ int main(int argc, char** argv) {
     LBC_CUDA(cudaEventCreate(&t0));
     LBC_CUDA(cudaEventCreate(&t1));
     double wait_before = 0.0;
+    // the step (forward, loss, backward, optimizer) as one CUDA graph, captured after an eager first step (which
+    // builds every GEMM plan); the batch copies stay outside it
+    cudaGraphExec_t step_graph = nullptr;
     for (int i = 0; i < total; ++i) {
         if (i == a.warmup) {
             LBC_CUDA(cudaEventRecord(t0, s));
@@ -203,8 +210,21 @@ int main(int argc, char** argv) {
         HostBatch* hb = loader.next();
         const Batch b = copy_batch(hb);
         loader.release(hb, s);
-        model.forward_backward(b, s);
-        model.optimizer_step(i + 1, s);
+        if (!a.graph || i == 0) {
+            model.forward_backward(b, s);
+            model.optimizer_step(s);
+        } else {
+            if (!step_graph) {
+                cudaGraph_t g;
+                LBC_CUDA(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+                model.forward_backward(b, s);
+                model.optimizer_step(s);
+                LBC_CUDA(cudaStreamEndCapture(s, &g));
+                LBC_CUDA(cudaGraphInstantiate(&step_graph, g, 0));
+                LBC_CUDA(cudaGraphDestroy(g));
+            }
+            LBC_CUDA(cudaGraphLaunch(step_graph, s));
+        }
         LBC_CUDA(cudaMemcpyAsync(d_hist + i, model.loss_device(), sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
     LBC_CUDA(cudaEventRecord(t1, s));
@@ -212,8 +232,8 @@ int main(int argc, char** argv) {
     float ms = 0.f;
     LBC_CUDA(cudaEventElapsedTime(&ms, t0, t1));
     const double step_ms = ms / a.steps;
-    std::printf("\n%d timed steps (after %d warm-up): %.1f ms per step, %.0f tokens/s, %.2f updates/s\n", a.steps,
-                a.warmup, step_ms, ntok / (step_ms * 1e-3), 1e3 / step_ms);
+    std::printf("\n%d timed steps (after %d warm-up)%s: %.1f ms per step, %.0f tokens/s, %.2f updates/s\n", a.steps,
+                a.warmup, a.graph ? ", CUDA graph" : "", step_ms, ntok / (step_ms * 1e-3), 1e3 / step_ms);
     std::printf("loader: waited %.1f ms in total over the timed steps; filling took %.2f ms per batch (thread)\n",
                 loader.wait_ms() - wait_before, loader.fill_ms() / total);
 
@@ -255,7 +275,7 @@ int main(int argc, char** argv) {
         const Batch b = copy_batch(hb);
         loader.release(hb, s);
         model.forward_backward(b, s);
-        model.optimizer_step(total + 1, s);
+        model.optimizer_step(s);
     }
     model.set_profile(false);
     float sum = 0.f;

@@ -151,6 +151,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     loss_ = alloc<float>(1);
     stats_ = alloc<float>(size_t(6) * c.L);
     gsq_ = alloc<float>(1);
+    step_ = alloc<int>(1);
+    LBC_CUDA(cudaMemset(step_, 0, sizeof(int)));
     carry_ = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
     cflags_ = nchunks > 1 ? alloc<int>(size_t(c.B) * H * nchunks) : nullptr;
     init(seed);
@@ -430,13 +432,12 @@ void Model::forward_backward(const Batch& b, cudaStream_t s) {
     rmsnorm_fwd(h_, xhF_, rstdF_, M, D, s);
     toc(s);
     mm(s, false, false, M, E0, D, xhF_, D, Woutb_, E0, hr_, E0, Out::BF16);
-    const float inv_n = 1.f / float(std::max(1, b.n_targets));
     const int Mc = std::min(c_.ce_chunk, M);
     for (int r0 = 0; r0 < M; r0 += Mc) {
         const int rows = std::min(Mc, M - r0);
         mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eb_, E0, logits_, V, Out::F32);
         tic(s, "ce_softmax");
-        ce_rows(logits_, b.y + r0, dlog_, loss_, rows, V, inv_n, s);
+        ce_rows(logits_, b.y + r0, dlog_, loss_, rows, V, b.inv_n, s);
         toc(s);
         mm(s, false, false, rows, E0, V, dlog_, V, Eb_, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
         mm(s, true, false, V, E0, rows, dlog_, V, hr_ + size_t(r0) * E0, E0, g(E_), E0, Out::F32, 1.f);
@@ -457,12 +458,12 @@ void Model::forward_backward(const Batch& b, cudaStream_t s) {
     toc(s);
 }
 
-void Model::optimizer_step(int step, cudaStream_t s) {
+void Model::optimizer_step(cudaStream_t s) {
     tic(s, "optimizer");
     LBC_CUDA(cudaMemsetAsync(gsq_, 0, sizeof(float), s));
     sumsq(G_, n_, gsq_, s);
-    const float bc1 = 1.f - std::pow(c_.beta1, float(step)), bc2 = 1.f - std::pow(c_.beta2, float(step));
-    adamw(P_, G_, M1_, M2_, decay_, n_, c_.lr, c_.beta1, c_.beta2, c_.eps, c_.wd, bc1, bc2, gsq_, c_.clip, s);
+    increment(step_, s);
+    adamw(P_, G_, M1_, M2_, decay_, n_, c_.lr, c_.beta1, c_.beta2, c_.eps, c_.wd, step_, gsq_, c_.clip, s);
     prepare_weights(s);
     toc(s);
 }
