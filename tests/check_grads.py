@@ -139,7 +139,7 @@ for n in range(L):
     d = dec[n]
     PV = bf(bf(rms(h)) @ bf(p_("Wa") * p_("norm1").T))
     s = lru(PV[..., :2 * N], p_("nu")[0], p_("theta")[0])
-    G = bf(s) @ bf(p_("Ws"))
+    G = bf(bf(s) @ bf(p_("Ws")))  # the C++ GEMM writes bf16
     kraw = G[..., :HD]
     kprev = torch.cat([torch.zeros(B, 1, HD), kraw[:, :-1]], 1) * (~reset).double()[..., None]
     k = bf(normalize((kprev + p_("bk")[0]).reshape(B, T, H, DH)))
@@ -162,7 +162,7 @@ for n in range(L):
     h = h + bf(o1) @ bf(p_("Wo"))
     z = bf(bf(bf(rms(h)) @ bf(p_("W1") * p_("ffn_norm").T)) + p_("b1")[0])
     h = h + bf(gelu(z)) @ bf(p_("W2")) + p_("b2")[0]
-    G2 = bf(rms(h)) @ bf(p_("Wq2") * p_("q2_norm").T)
+    G2 = bf(bf(rms(h)) @ bf(p_("Wq2") * p_("q2_norm").T))
     q2 = bf(normalize(G2[..., :HD].reshape(B, T, H, DH)))
     ar2 = G2[..., HD:HD + H] + p_("brg2")[0]
     gr2 = ste(d["gr2"], ar2, d["gr2"].bool())

@@ -60,7 +60,7 @@ void lru_bwd(const float* ds, const float* s, const bf16* P, int ldp, const floa
 // -- addressing: keys, queries, routing, gates (kernels_lru_addr.cu) ----------------------------------------------
 
 struct AddrFwd {
-    const float* G;  // [M][ldG]: [k_pre (H*DH) | q_pre (H*DH) | read gate (H) | write gate (H)], k_pre unshifted
+    const bf16* G;   // [M][ldG]: [k_pre (H*DH) | q_pre (H*DH) | read gate (H) | write gate (H)], k_pre unshifted
     int ldG;
     const float *bk, *brg, *bwg;  // key bias [H*DH], gate biases [H]
     const float* R;               // router [H][DH][SLOTS]
@@ -82,7 +82,8 @@ void addr_fwd(const AddrFwd& a, cudaStream_t s);
 struct AddrBwd {
     // from the bank adjoint, per (row, head) and routed slot s = 0, 1: dk2 / dv2 [M][H][2][DH] (written only when
     // the write gate is open), dr2 [M][H][2] the gradient of the slot's write weight
-    const float *dk2, *dv2, *dr2;
+    const bf16 *dk2, *dv2;
+    const float* dr2;
     const float* dq;                 // [M][H][DH] gradient of the normalized query
     const float* dgr;                // [M][H] read gate (dy . o)
     const uint8_t* gw;
@@ -97,14 +98,14 @@ struct AddrBwd {
     // (stats[0] / count: write gates, stats[2] / count: read gates; count = M * H)
     const float* stats;
     float budget, target, count;
-    bf16* dG;  // [M][ldG], zeroed before
+    bf16* dG;  // [M][ldG] (every used column written; padding columns must be zero)
     int ldG, M, T, H;
 };
 void addr_bwd(const AddrBwd& a, cudaStream_t s);
 
 // Hop-2 query: G2 [M][ldG2] = [q2_pre (H*DH) | read gate (H)]
 struct Q2Fwd {
-    const float* G2;
+    const bf16* G2;
     int ldG2;
     const float* brg;
     bf16* q;
@@ -161,7 +162,8 @@ struct BankAdjoint {
     const float* dy[2];
     const bf16* coef[2];
     int hops;                 // the reads' gates come from the step words (flags 2 and 8)
-    float *dk2, *dv2, *dr2;   // see AddrBwd
+    bf16 *dk2, *dv2;          // see AddrBwd
+    float* dr2;
 };
 void bank_adjoint(const BankWrites& w, const BankAdjoint& a, cudaStream_t s);
 

@@ -87,11 +87,19 @@ __device__ __forceinline__ void load32(const float* p, float (&x)[DH]) {
     }
 }
 
-__device__ __forceinline__ void store32(float* p, const float (&x)[DH], float scale) {
-    float4* q = reinterpret_cast<float4*>(p);
+// scale * x as 32 bf16 (64-byte aligned)
+__device__ __forceinline__ void store32(bf16* p, const float (&x)[DH], float scale) {
+    uint4* q = reinterpret_cast<uint4*>(p);
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        q[i] = make_float4(scale * x[4 * i], scale * x[4 * i + 1], scale * x[4 * i + 2], scale * x[4 * i + 3]);
+    for (int i = 0; i < 4; ++i) {
+        unsigned w[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const __nv_bfloat162 v = __floats2bfloat162_rn(scale * x[8 * i + 2 * j], scale * x[8 * i + 2 * j + 1]);
+            w[j] = *reinterpret_cast<const unsigned*>(&v);
+        }
+        q[i] = make_uint4(w[0], w[1], w[2], w[3]);
+    }
 }
 
 struct Info {

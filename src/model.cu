@@ -115,8 +115,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     xhF_ = alloc<bf16>(size_t(M) * D);
     rstdF_ = alloc<float>(M);
     hr_ = alloc<bf16>(size_t(M) * E0);
-    Gt_ = alloc<float>(size_t(M) * c.ldG());
-    G2t_ = alloc<float>(size_t(M) * c.ldG2());
+    Gt_ = alloc<bf16>(size_t(M) * c.ldG());
+    G2t_ = alloc<bf16>(size_t(M) * c.ldG2());
     logits_ = alloc<float>(size_t(Mc) * V);
     dlog_ = alloc<bf16>(size_t(Mc) * V);
     dhr_ = alloc<float>(size_t(M) * E0);
@@ -132,8 +132,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     dG2_ = alloc<bf16>(size_t(M) * c.ldG2());
     dS_ = alloc<float>(size_t(M) * S2);
     dPV_ = alloc<bf16>(size_t(M) * c.ldPV());
-    dk2_ = alloc<float>(size_t(M) * HD * 2);
-    dv2_ = alloc<float>(size_t(M) * HD * 2);
+    dk2_ = alloc<bf16>(size_t(M) * HD * 2);
+    dv2_ = alloc<bf16>(size_t(M) * HD * 2);
     dr2_ = alloc<float>(size_t(M) * H * 2);
     dq1_ = alloc<float>(size_t(M) * HD);
     dq2_ = alloc<float>(size_t(M) * HD);
@@ -299,8 +299,8 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "lru");
     lru_fwd(a.PV, c_.ldPV(), p(x.nu), p(x.theta), b.reset, a.s, a.sb, c_.B, c_.T, c_.N, s);
     toc(s);
-    mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::F32);
-    tic(s, "addr");
+    mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::BF16);
+    tic(s, "addr_fwd");
     addr_fwd(AddrFwd{Gt_, c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q, a.kn, a.qn, a.ridx, a.rp1,
                      a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H},
              s);
@@ -322,8 +322,8 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     add_bias(h_, p(x.b2), M, D, s);
     rmsnorm_fwd(h_, a.xh3, a.rstd3, M, D, s);
     toc(s);
-    mm(s, false, false, M, c_.ldG2(), D, a.xh3, D, w.Wq2, c_.ldG2(), G2t_, c_.ldG2(), Out::F32);
-    tic(s, "addr");
+    mm(s, false, false, M, c_.ldG2(), D, a.xh3, D, w.Wq2, c_.ldG2(), G2t_, c_.ldG2(), Out::BF16);
+    tic(s, "addr_q2");
     q2_fwd(Q2Fwd{G2t_, c_.ldG2(), p(x.brg2), a.q2, a.q2n, a.ar2, a.gr2, st + 4, a.info, M, H}, s);
     toc(s);
     tic(s, "bank_fwd");
@@ -350,7 +350,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_rewalk");
     bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
     toc(s);
-    tic(s, "addr");
+    tic(s, "addr_q2");
     q2_bwd(Q2Bwd{dq2_, dgr2_, a.q2, a.q2n, a.ar2, g(x.brg2), st + 4, c_.budget, c_.budget_target, count, dG2_,
                  c_.ldG2(), M, H},
            s);
@@ -387,8 +387,9 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_adjoint");
     bank_adjoint(bw, BankAdjoint{{a.q, a.q2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk2_, dv2_, dr2_}, s);
     toc(s);
-    tic(s, "addr");
-    LBC_CUDA(cudaMemsetAsync(dG_, 0, size_t(M) * c_.ldG() * sizeof(bf16), s));
+    tic(s, "addr_bwd");
+    if (c_.ldG() != 2 * HD + 2 * H)  // padding columns (small widths only) must stay zero for the GEMMs
+        LBC_CUDA(cudaMemsetAsync(dG_, 0, size_t(M) * c_.ldG() * sizeof(bf16), s));
     addr_bwd(AddrBwd{dk2_, dv2_, dr2_, dq1_, dgr1_, a.gw, dPV_ + S2, c_.ldPV(), a.k, a.q, a.kn, a.qn, a.rp1, a.aw,
                      a.ar, a.ridx, b.reset, p(x.R),
                      g(x.R), g(x.bk), g(x.brg), g(x.bwg), st, c_.budget, c_.budget_target, count, dG_, c_.ldG(), M,

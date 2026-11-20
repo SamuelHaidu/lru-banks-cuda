@@ -136,9 +136,11 @@ __global__ void k_lru_bwd(const float* __restrict__ ds, const float* __restrict_
 // One block per (head, chunk of rows); the head's router (DH x SLOTS) sits in shared memory.
 __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block) {
     __shared__ float Rs[DH * RPAD];
+    __shared__ float st_s[4];
     const int h = blockIdx.x, H = a.H, HD = H * DH;
     for (int i = threadIdx.x; i < DH * SLOTS; i += blockDim.x)
         Rs[(i / SLOTS) * RPAD + i % SLOTS] = a.R[size_t(h) * DH * SLOTS + i];
+    if (threadIdx.x < 4) st_s[threadIdx.x] = 0.f;
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     const int r0 = blockIdx.y * rows_per_block, r1 = min(a.M, r0 + rows_per_block);
@@ -147,10 +149,10 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
         const int t = r % a.T;
         const bool rst = a.reset[r];
         float kp = a.bk[h * DH + lane];
-        if (t > 0 && !rst) kp += a.G[size_t(r - 1) * a.ldG + h * DH + lane];
+        if (t > 0 && !rst) kp += __bfloat162float(a.G[size_t(r - 1) * a.ldG + h * DH + lane]);
         const float kn = sqrtf(warp_sum(kp * kp));
         const float k = kp / fmaxf(kn, NORM_EPS);
-        const float qp = a.G[size_t(r) * a.ldG + HD + h * DH + lane];
+        const float qp = __bfloat162float(a.G[size_t(r) * a.ldG + HD + h * DH + lane]);
         const float qn = sqrtf(warp_sum(qp * qp));
         const float q = qp / fmaxf(qn, NORM_EPS);
         // router logits l_m = k . R[:, m], lane holds m = lane + 32 j
@@ -186,8 +188,8 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
         a.k[rh * DH + lane] = __float2bfloat16(k);
         a.q[rh * DH + lane] = __float2bfloat16(q);
         if (lane == 0) {
-            const float aw = a.G[size_t(r) * a.ldG + 2 * HD + H + h] + a.bwg[h];
-            const float ar = a.G[size_t(r) * a.ldG + 2 * HD + h] + a.brg[h];
+            const float aw = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * HD + H + h]) + a.bwg[h];
+            const float ar = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * HD + h]) + a.brg[h];
             const bool gw = !rst && t > 0 && aw > 0.f, gr = ar > 0.f;  // no write without a previous state
             a.kn[rh] = kn;
             a.qn[rh] = qn;
@@ -207,12 +209,14 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
             cr += gr;
         }
     }
-    if (lane == 0) {
-        atomicAdd(a.stats + 0, sw);
-        atomicAdd(a.stats + 1, cw);
-        atomicAdd(a.stats + 2, sr);
-        atomicAdd(a.stats + 3, cr);
+    if (lane == 0) {  // per block, not per warp: these four addresses are shared by the whole grid
+        atomicAdd(&st_s[0], sw);
+        atomicAdd(&st_s[1], cw);
+        atomicAdd(&st_s[2], sr);
+        atomicAdd(&st_s[3], cr);
     }
+    __syncthreads();
+    if (threadIdx.x < 4) atomicAdd(a.stats + threadIdx.x, st_s[threadIdx.x]);
 }
 
 __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block) {
@@ -237,9 +241,10 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
         const float k = __bfloat162float(a.k[rh * DH + lane]);
         const bool gw = a.gw[rh];
         // the write's gradients from the two routed slots (bank adjoint): key, value, slot weights
-        float dk = gw ? a.dk2[rh * 2 * DH + lane] + a.dk2[(rh * 2 + 1) * DH + lane] : 0.f;
-        a.dv[size_t(r) * a.lddv + h * DH + lane] =
-            __float2bfloat16(gw ? a.dv2[rh * 2 * DH + lane] + a.dv2[(rh * 2 + 1) * DH + lane] : 0.f);
+        float dk = gw ? __bfloat162float(a.dk2[rh * 2 * DH + lane]) + __bfloat162float(a.dk2[(rh * 2 + 1) * DH + lane])
+                      : 0.f;
+        a.dv[size_t(r) * a.lddv + h * DH + lane] = __float2bfloat16(
+            gw ? __bfloat162float(a.dv2[rh * 2 * DH + lane]) + __bfloat162float(a.dv2[(rh * 2 + 1) * DH + lane]) : 0.f);
         const float dr1 = a.dr2[rh * 2], dr2 = a.dr2[rh * 2 + 1];
         // routing: weights gw p1, gw (1 - p1) with p1 = sigmoid(l1 - l2), l_m = k . R[:, m]
         const int m1 = a.ridx[rh * 2], m2 = a.ridx[rh * 2 + 1];
@@ -251,7 +256,10 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
         atomicAdd(&dRs[lane * RPAD + m2], -dl * k);
         // k = k_pre / |k_pre|
         const float dkp = (dk - k * warp_sum(k * dk)) / fmaxf(a.kn[rh], NORM_EPS);
-        if (t > 0 && !rst) a.dG[size_t(r - 1) * a.ldG + h * DH + lane] = __float2bfloat16(dkp);
+        // k_pre at row r is G_k at row r - 1 (zero without a previous state); every G_k row gets written here:
+        // row r - 1 by row r, a row's last token by itself (nothing reads it)
+        if (t > 0) a.dG[size_t(r - 1) * a.ldG + h * DH + lane] = __float2bfloat16(rst ? 0.f : dkp);
+        if (t == a.T - 1) a.dG[size_t(r) * a.ldG + h * DH + lane] = __float2bfloat16(0.f);
         atomicAdd(&dbk_s[lane], dkp);
         const float q = __bfloat162float(a.q[rh * DH + lane]);
         const float dq = a.dq[rh * DH + lane];
@@ -280,41 +288,63 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
     }
 }
 
-__global__ void __launch_bounds__(256) k_q2_fwd(Q2Fwd a) {
-    const int lane = threadIdx.x & 31;
-    const size_t w = blockIdx.x * size_t(blockDim.x >> 5) + (threadIdx.x >> 5);  // (row, head)
-    if (w >= size_t(a.M) * a.H) return;
-    const int r = int(w / a.H), h = int(w % a.H), HD = a.H * DH;
-    const float qp = a.G2[size_t(r) * a.ldG2 + h * DH + lane];
-    const float qn = sqrtf(warp_sum(qp * qp));
-    a.q[w * DH + lane] = __float2bfloat16(qp / fmaxf(qn, NORM_EPS));
-    if (lane == 0) {
-        const float ar = a.G2[size_t(r) * a.ldG2 + HD + h] + a.brg[h];
-        a.qn[w] = qn;
-        a.ar[w] = ar;
-        a.gr[w] = ar > 0.f;
-        if (ar > 0.f) a.info[w].x |= 8u << 16;
-        atomicAdd(a.stats + 0, sigmoid(ar));
-        atomicAdd(a.stats + 1, ar > 0.f ? 1.f : 0.f);
+// one block per (head, chunk of rows), a warp per row; sums reduced per block before the global atomics
+__global__ void __launch_bounds__(256) k_q2_fwd(Q2Fwd a, int rows_per_block) {
+    __shared__ float st_s[2];
+    if (threadIdx.x < 2) st_s[threadIdx.x] = 0.f;
+    __syncthreads();
+    const int h = blockIdx.x, HD = a.H * DH;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int r0 = blockIdx.y * rows_per_block, r1 = min(a.M, r0 + rows_per_block);
+    float ss = 0.f, so = 0.f;
+    for (int r = r0 + warp; r < r1; r += nw) {
+        const size_t w = size_t(r) * a.H + h;
+        const float qp = __bfloat162float(a.G2[size_t(r) * a.ldG2 + h * DH + lane]);
+        const float qn = sqrtf(warp_sum(qp * qp));
+        a.q[w * DH + lane] = __float2bfloat16(qp / fmaxf(qn, NORM_EPS));
+        if (lane == 0) {
+            const float ar = __bfloat162float(a.G2[size_t(r) * a.ldG2 + HD + h]) + a.brg[h];
+            a.qn[w] = qn;
+            a.ar[w] = ar;
+            a.gr[w] = ar > 0.f;
+            if (ar > 0.f) a.info[w].x |= 8u << 16;
+            ss += sigmoid(ar);
+            so += ar > 0.f ? 1.f : 0.f;
+        }
     }
+    if (lane == 0) {
+        atomicAdd(&st_s[0], ss);
+        atomicAdd(&st_s[1], so);
+    }
+    __syncthreads();
+    if (threadIdx.x < 2) atomicAdd(a.stats + threadIdx.x, st_s[threadIdx.x]);
 }
 
-__global__ void __launch_bounds__(256) k_q2_bwd(Q2Bwd a) {
-    const int lane = threadIdx.x & 31;
-    const size_t w = blockIdx.x * size_t(blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (w >= size_t(a.M) * a.H) return;
-    const int r = int(w / a.H), h = int(w % a.H), HD = a.H * DH;
-    const float q = __bfloat162float(a.q[w * DH + lane]);
-    const float dq = a.dq[w * DH + lane];
-    const float dqp = (dq - q * warp_sum(q * dq)) / fmaxf(a.qn[w], NORM_EPS);
-    a.dG2[size_t(r) * a.ldG2 + h * DH + lane] = __float2bfloat16(dqp);
-    if (lane == 0) {
-        const float br = a.budget > 0.f ? 2.f * a.budget * (a.stats[0] / a.count - a.target) / a.count : 0.f;
-        const float sr = sigmoid(a.ar[w]);
-        const float dar = (a.dgr[w] + br) * sr * (1.f - sr);
-        a.dG2[size_t(r) * a.ldG2 + HD + h] = __float2bfloat16(dar);
-        atomicAdd(a.dbrg + h, dar);
+__global__ void __launch_bounds__(256) k_q2_bwd(Q2Bwd a, int rows_per_block) {
+    __shared__ float db_s;
+    if (threadIdx.x == 0) db_s = 0.f;
+    __syncthreads();
+    const int h = blockIdx.x, HD = a.H * DH;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int r0 = blockIdx.y * rows_per_block, r1 = min(a.M, r0 + rows_per_block);
+    const float br = a.budget > 0.f ? 2.f * a.budget * (a.stats[0] / a.count - a.target) / a.count : 0.f;
+    float db = 0.f;
+    for (int r = r0 + warp; r < r1; r += nw) {
+        const size_t w = size_t(r) * a.H + h;
+        const float q = __bfloat162float(a.q[w * DH + lane]);
+        const float dq = a.dq[w * DH + lane];
+        const float dqp = (dq - q * warp_sum(q * dq)) / fmaxf(a.qn[w], NORM_EPS);
+        a.dG2[size_t(r) * a.ldG2 + h * DH + lane] = __float2bfloat16(dqp);
+        if (lane == 0) {
+            const float sr = sigmoid(a.ar[w]);
+            const float dar = (a.dgr[w] + br) * sr * (1.f - sr);
+            a.dG2[size_t(r) * a.ldG2 + HD + h] = __float2bfloat16(dar);
+            db += dar;
+        }
     }
+    if (lane == 0) atomicAdd(&db_s, db);
+    __syncthreads();
+    if (threadIdx.x == 0) atomicAdd(a.dbrg + h, db_s);
 }
 
 }  // namespace
@@ -333,27 +363,31 @@ void lru_bwd(const float* ds, const float* s, const bf16* P, int ldp, const floa
     LBC_CUDA(cudaGetLastError());
 }
 
+// 512 rows per block: each block flushes its head's router gradient (DH x SLOTS) once, so fewer blocks mean fewer
+// global atomics (64 rows per block was 33.5M per layer)
+constexpr int ADDR_ROWS = 512;
+
 void addr_fwd(const AddrFwd& a, cudaStream_t s) {
-    const int rows = 64;
+    const int rows = ADDR_ROWS;
     k_addr_fwd<<<dim3(a.H, (a.M + rows - 1) / rows), 256, 0, s>>>(a, rows);
     LBC_CUDA(cudaGetLastError());
 }
 
 void addr_bwd(const AddrBwd& a, cudaStream_t s) {
-    const int rows = 64;
+    const int rows = ADDR_ROWS;
     k_addr_bwd<<<dim3(a.H, (a.M + rows - 1) / rows), 256, 0, s>>>(a, rows);
     LBC_CUDA(cudaGetLastError());
 }
 
 void q2_fwd(const Q2Fwd& a, cudaStream_t s) {
-    const size_t warps = size_t(a.M) * a.H;
-    k_q2_fwd<<<unsigned((warps + 7) / 8), 256, 0, s>>>(a);
+    const int rows = ADDR_ROWS;
+    k_q2_fwd<<<dim3(a.H, (a.M + rows - 1) / rows), 256, 0, s>>>(a, rows);
     LBC_CUDA(cudaGetLastError());
 }
 
 void q2_bwd(const Q2Bwd& a, cudaStream_t s) {
-    const size_t warps = size_t(a.M) * a.H;
-    k_q2_bwd<<<unsigned((warps + 7) / 8), 256, 0, s>>>(a);
+    const int rows = ADDR_ROWS;
+    k_q2_bwd<<<dim3(a.H, (a.M + rows - 1) / rows), 256, 0, s>>>(a, rows);
     LBC_CUDA(cudaGetLastError());
 }
 

@@ -133,10 +133,12 @@ class Model {
     // forward buffers
     float* h_;
     bf16 *x0_, *xhF_, *hr_;
-    float *rstdF_, *Gt_, *G2t_, *logits_;
+    float *rstdF_, *logits_;
+    bf16 *Gt_, *G2t_;
     bf16* dlog_;
     // backward buffers
-    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dk2_, *dv2_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
+    bf16 *dk2_, *dv2_;
+    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
         *dWp_;
     bf16 *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
     float *loss_, *stats_, *gsq_;

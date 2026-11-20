@@ -20,5 +20,5 @@ for mode in "B1 all gates open:--gate-w 20 --gate-r 20" "B2 reads closed:--gate-
     echo "== $name"
     # shellcheck disable=SC2086
     "$BIN" --data "$DATA" --steps 20 --warmup 3 $args "$@" |
-        grep -E "timed steps|GPU memory in use:|^  [a-z_+]+ +[0-9.]+ ms"
+        grep -E "timed steps|GPU memory in use:|^  [a-z0-9_+]+ +[0-9.]+ ms"
 done
