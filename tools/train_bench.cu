@@ -28,7 +28,8 @@ struct Args {
     std::string data, dump;
     int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4, ce_chunk = 256, bank_chunk = 512;
     float gate_w = 2.f, gate_r = 2.f, lr = 2e-3f, budget = 0.f;
-    bool tiny = false;
+    bool tiny = false, gate_report = false;
+    float budget_target = 0.5f;
     uint64_t seed = 1;
 };
 
@@ -58,6 +59,8 @@ Args parse(int argc, char** argv) {
         else if (k == "--ce-chunk") a.ce_chunk = std::atoi(val());
         else if (k == "--bank-chunk") a.bank_chunk = std::atoi(val());
         else if (k == "--tiny") a.tiny = true;
+        else if (k == "--gate-report") a.gate_report = true;
+        else if (k == "--budget-target") a.budget_target = std::atof(val());
         else {
             std::fprintf(stderr, "unknown argument %s\n", k.c_str());
             std::exit(2);
@@ -130,6 +133,7 @@ int main(int argc, char** argv) {
     c.gate_bias_r = a.gate_r;
     c.lr = a.lr;
     c.budget = a.budget;
+    c.budget_target = a.budget_target;
     c.ce_chunk = a.ce_chunk;
     c.bank_chunk = a.bank_chunk;
     if (a.tiny) {  // small widths for the gradient check (DH and SLOTS are fixed by the kernels)
@@ -223,6 +227,26 @@ int main(int argc, char** argv) {
     std::printf("open gates (last step), per layer write / read 1 / read 2:");
     for (int n = 0; n < c.L; ++n) std::printf("  L%d %.2f %.2f %.2f", n, g[3 * n], g[3 * n + 1], g[3 * n + 2]);
     std::printf("\n");
+
+    if (a.gate_report) {  // the last step's read gates: how often all heads of a token are closed (rows a GEMM could skip)
+        std::printf("gate report (last step): per layer, hop: open reads, tokens with every head closed\n");
+        for (int n = 0; n < c.L; ++n) {
+            std::vector<uint8_t> ridx, gw, gr, gr2;
+            model.decisions(n, ridx, gw, gr, gr2, s);
+            for (int hop = 0; hop < 2; ++hop) {
+                const std::vector<uint8_t>& g = hop == 0 ? gr : gr2;
+                size_t open = 0, all_closed = 0;
+                for (size_t r = 0; r < ntok; ++r) {
+                    int o = 0;
+                    for (int h = 0; h < c.H; ++h) o += g[r * c.H + h];
+                    open += o;
+                    all_closed += o == 0;
+                }
+                std::printf("  L%d hop %d: open %.3f, all heads closed %.4f\n", n, hop + 1,
+                            double(open) / (double(ntok) * c.H), double(all_closed) / double(ntok));
+            }
+        }
+    }
 
     // one more step with an event pair around every launch: GPU time per category
     model.set_profile(true);
