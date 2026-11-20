@@ -132,17 +132,52 @@ __global__ void k_embed_scatter(const int* __restrict__ ids, const float* __rest
         atomicAdd(dE + size_t(ids[i / E0]) * E0 + i % E0, dx[i]);
 }
 
+__global__ void k_embed_gather_f32(const int* __restrict__ ids, const float* __restrict__ E,
+                                   float* __restrict__ x, size_t n, int E0) {
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+        x[i] = E[size_t(ids[i / E0]) * E0 + i % E0];
+}
+
+__global__ void k_scale_cols(const bf16* __restrict__ x, const float* __restrict__ g, bf16* __restrict__ y, size_t n,
+                             int D) {
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+        y[i] = __float2bfloat16(__bfloat162float(x[i]) * g[i % D]);
+}
+
+// SCALE_ROWS rows per block, a thread per column (strided): the column sums in registers, one atomic per column
+// per block
+constexpr int SCALE_ROWS = 64;
+
+__global__ void __launch_bounds__(256) k_scale_cols_bwd(const bf16* __restrict__ dy, const bf16* __restrict__ x,
+                                                        const float* __restrict__ g, float* __restrict__ dx,
+                                                        float* __restrict__ dg, int M, int D) {
+    const int r0 = blockIdx.x * SCALE_ROWS, r1 = min(M, r0 + SCALE_ROWS);
+    for (int j = threadIdx.x; j < D; j += blockDim.x) {
+        const float gj = g[j];
+        float acc = 0.f;
+        for (int r = r0; r < r1; ++r) {
+            const size_t i = size_t(r) * D + j;
+            const float d = __bfloat162float(dy[i]);
+            dx[i] = d * gj;
+            acc += d * __bfloat162float(x[i]);
+        }
+        atomicAdd(dg + j, acc);
+    }
+}
+
 __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logits, const int* __restrict__ y,
-                                                 bf16* __restrict__ dlogits, float* __restrict__ loss_sum, int V,
+                                                 bf16* __restrict__ dlogits, float* __restrict__ loss_sum,
+                                                 float* __restrict__ correct_sum, int V,
                                                  const float* __restrict__ inv_n_ptr) {
     const float inv_n = *inv_n_ptr;
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
     const float* l = logits + row * V;
-    bf16* d = dlogits + row * V;
+    bf16* d = dlogits ? dlogits + row * V : nullptr;
     const int target = y[row];
     if (target < 0) {
-        for (int j = threadIdx.x; j < V; j += blockDim.x) d[j] = __float2bfloat16(0.f);
+        if (d)
+            for (int j = threadIdx.x; j < V; j += blockDim.x) d[j] = __float2bfloat16(0.f);
         return;
     }
     // one pass for the max and the sum (online softmax), merged over the block
@@ -160,12 +195,16 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     s = block_sum(m > -INFINITY ? s * __expf(m - mb) : 0.f, sh);
     m = mb;
     const float inv = 1.f / s;
-    for (int j = threadIdx.x; j < V; j += blockDim.x) {
-        float p = __expf(l[j] - m) * inv;
-        if (j == target) p -= 1.f;
-        d[j] = __float2bfloat16(p * inv_n);
+    if (d)
+        for (int j = threadIdx.x; j < V; j += blockDim.x) {
+            float p = __expf(l[j] - m) * inv;
+            if (j == target) p -= 1.f;
+            d[j] = __float2bfloat16(p * inv_n);
+        }
+    if (threadIdx.x == 0) {
+        atomicAdd(loss_sum, (logf(s) + m - l[target]) * inv_n);
+        if (l[target] >= m) atomicAdd(correct_sum, inv_n);  // the target is the row's (first) maximum
     }
-    if (threadIdx.x == 0) atomicAdd(loss_sum, (logf(s) + m - l[target]) * inv_n);
 }
 
 __global__ void k_sumsq(const float* __restrict__ x, size_t n, float* __restrict__ out) {
@@ -177,10 +216,12 @@ __global__ void k_sumsq(const float* __restrict__ x, size_t n, float* __restrict
 }
 
 __global__ void k_adamw(float* __restrict__ p, const float* __restrict__ g, float* __restrict__ m,
-                        float* __restrict__ v, const uint8_t* __restrict__ decay, size_t n, float lr, float b1,
+                        float* __restrict__ v, const uint8_t* __restrict__ decay, size_t n, Schedule sched, float b1,
                         float b2, float eps, float wd, const int* __restrict__ step, const float* __restrict__ gsq,
-                        float clip) {
+                        float clip, float* __restrict__ lr_out) {
     const float bc1 = 1.f - powf(b1, float(*step)), bc2 = 1.f - powf(b2, float(*step));
+    const float lr = schedule_lr(sched, *step - 1);  // *step counts this update already
+    if (blockIdx.x == 0 && threadIdx.x == 0 && lr_out) *lr_out = lr;
     const float norm = sqrtf(*gsq);
     const float scale = (clip > 0.f && norm > clip) ? clip / (norm + 1e-6f) : 1.f;
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
@@ -258,15 +299,33 @@ void embed_gather(const int* ids, const bf16* E, bf16* x, int M, int E0, cudaStr
     LBC_CUDA(cudaGetLastError());
 }
 
+void embed_gather_f32(const int* ids, const float* E, float* x, int M, int E0, cudaStream_t s) {
+    const size_t n = size_t(M) * E0;
+    k_embed_gather_f32<<<blocks_for(n), 256, 0, s>>>(ids, E, x, n, E0);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void scale_cols(const bf16* x, const float* g, bf16* y, int M, int D, cudaStream_t s) {
+    const size_t n = size_t(M) * D;
+    k_scale_cols<<<blocks_for(n), 256, 0, s>>>(x, g, y, n, D);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void scale_cols_bwd(const bf16* dy, const bf16* x, const float* g, float* dx, float* dg, int M, int D,
+                    cudaStream_t s) {
+    k_scale_cols_bwd<<<(M + SCALE_ROWS - 1) / SCALE_ROWS, 256, 0, s>>>(dy, x, g, dx, dg, M, D);
+    LBC_CUDA(cudaGetLastError());
+}
+
 void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cudaStream_t s) {
     const size_t n = size_t(M) * E0;
     k_embed_scatter<<<blocks_for(n), 256, 0, s>>>(ids, dx, dE, n, E0);
     LBC_CUDA(cudaGetLastError());
 }
 
-void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, const float* inv_n,
-             cudaStream_t s) {
-    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, V, inv_n);
+void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
+             const float* inv_n, cudaStream_t s) {
+    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n);
     LBC_CUDA(cudaGetLastError());
 }
 
@@ -275,9 +334,11 @@ void sumsq(const float* x, size_t n, float* out, cudaStream_t s) {
     LBC_CUDA(cudaGetLastError());
 }
 
-void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, float lr, float beta1,
-           float beta2, float eps, float wd, const int* step, const float* gsq, float clip, cudaStream_t s) {
-    k_adamw<<<blocks_for(n), 256, 0, s>>>(p, g, m, v, decay, n, lr, beta1, beta2, eps, wd, step, gsq, clip);
+void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, const Schedule& sched,
+           float beta1, float beta2, float eps, float wd, const int* step, const float* gsq, float clip,
+           float* lr_out, cudaStream_t s) {
+    k_adamw<<<blocks_for(n), 256, 0, s>>>(p, g, m, v, decay, n, sched, beta1, beta2, eps, wd, step, gsq, clip,
+                                          lr_out);
     LBC_CUDA(cudaGetLastError());
 }
 

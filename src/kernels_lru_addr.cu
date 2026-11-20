@@ -250,7 +250,17 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
         const int m1 = a.ridx[rh * 2], m2 = a.ridx[rh * 2 + 1];
         const float p1 = a.rp1[rh];
         const float dl = (gw ? dr1 - dr2 : 0.f) * p1 * (1.f - p1);
-        const float dgw = p1 * dr1 + (1.f - p1) * dr2;  // straight-through: computed for closed write gates too
+        // straight-through, for closed write gates too. A closed gate's slot gradient dr is the tangent at weight 0,
+        // (k - average) / Z: unbounded as the slot's mass Z decays. Its secant to the open state (the weight r the
+        // write would have had) is the tangent times Z / (Z + r), Z the slot's mass just before the write (zpre,
+        // from the hop-1 forward walk); bounded, and exact when no other write follows before the reads.
+        float s1 = 1.f, s2 = 1.f;
+        if (!gw && a.zpre) {
+            const float z1 = a.zpre[rh * 2], z2 = a.zpre[rh * 2 + 1];
+            s1 = z1 / fmaxf(z1 + p1, 1e-30f);  // (1 - p1 can round to 0)
+            s2 = z2 / fmaxf(z2 + (1.f - p1), 1e-30f);
+        }
+        const float dgw = p1 * dr1 * s1 + (1.f - p1) * dr2 * s2;
         dk += dl * (Rs[lane * RPAD + m1] - Rs[lane * RPAD + m2]);
         atomicAdd(&dRs[lane * RPAD + m1], dl * k);
         atomicAdd(&dRs[lane * RPAD + m2], -dl * k);

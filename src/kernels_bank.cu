@@ -257,6 +257,8 @@ __global__ void __launch_bounds__(SLOTS) k_bank_fwd(BankWrites w, BankRead rd) {
         const Info si = unpack(nxt);
         if (t + 1 < t1) nxt = w.info[(base + t + 1) * H + h];
         const size_t r = base + t, rh = r * H + h;
+        if (rd.zpre && (m == si.m1 || m == si.m2))  // the routed slots' mass before this token's write
+            rd.zpre[rh * 2 + (m == si.m1 ? 0 : 1)] = (si.flags & 4) ? 0.f : Zs * __expf(la * float(t - tm));
         step_state(Kb, Vb, Zs, tm, la, t, m, si, w, r, h);
         bf16* out = rd.o + r * H * DH + h * DH;
         if (si.flags & rd.gate_bit) {

@@ -22,19 +22,47 @@ void rmsnorm_bwd(const float* dxh, const bf16* xh, const float* rstd, float* dh,
 void to_bf16(const float* x, bf16* y, size_t n, cudaStream_t s);
 void add_to_f32(const bf16* x, float* y, size_t n, cudaStream_t s);  // y += x
 void embed_gather(const int* ids, const bf16* E, bf16* x, int M, int E0, cudaStream_t s);
+void embed_gather_f32(const int* ids, const float* E, float* x, int M, int E0, cudaStream_t s);  // unfactorized: h
 void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cudaStream_t s);
-// Rows of logits [rows][V]: loss_sum += sum (lse - logit[y]) * inv_n; dlogits = (softmax - onehot) * inv_n, with
-// inv_n = 1 / targets read from the device (the step can be a CUDA graph). Rows with y < 0 add nothing.
-void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, int rows, int V, const float* inv_n,
-             cudaStream_t s);
+// y = bf16(x * g) per column (the unfactorized readout's norm gain), and its backward: dx = dy * g (written),
+// dg += column sums of dy * x
+void scale_cols(const bf16* x, const float* g, bf16* y, int M, int D, cudaStream_t s);
+void scale_cols_bwd(const bf16* dy, const bf16* x, const float* g, float* dx, float* dg, int M, int D,
+                    cudaStream_t s);
+// Rows of logits [rows][V]: loss_sum += sum (lse - logit[y]) * inv_n; correct_sum += [logit[y] is the row's max] *
+// inv_n (the accuracy); dlogits = (softmax - onehot) * inv_n, with inv_n = 1 / targets read from the device (the
+// step can be a CUDA graph). Rows with y < 0 add nothing. dlogits may be null (validation: no gradient).
+void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
+             const float* inv_n, cudaStream_t s);
 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 
+// The learning rate of update `step` (0-based: updates done before it), as the Python pipeline's LinearWarmup:
+// linear warmup to lr over `warmup` updates, then constant; with decay_steps > 0, from update decay_start a linear
+// fall to min_ratio x lr over decay_steps updates.
+struct Schedule {
+    float lr;
+    int warmup, decay_start, decay_steps;
+    float min_ratio;
+};
+__host__ __device__ inline float schedule_lr(const Schedule& s, int step) {
+    float frac = float(step + 1) / float(s.warmup > 1 ? s.warmup : 1);
+    frac = frac < 1.f ? frac : 1.f;
+    if (s.decay_steps > 0) {
+        float done = float(step - s.decay_start) / float(s.decay_steps);
+        done = done < 0.f ? 0.f : (done > 1.f ? 1.f : done);
+        frac *= 1.f - (1.f - s.min_ratio) * done;
+    }
+    return s.lr * frac;
+}
+
 void sumsq(const float* x, size_t n, float* out, cudaStream_t s);
 // AdamW with the update scaled by min(1, clip / ||g||) (||g||^2 read from gsq on the device: no host sync); the
-// step count (for the bias corrections) is read from the device as well, so the step can be a CUDA graph.
-void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, float lr, float beta1,
-           float beta2, float eps, float wd, const int* step, const float* gsq, float clip, cudaStream_t s);
+// step count (already incremented: the bias corrections and the schedule) is read from the device as well, so the
+// step can be a CUDA graph. The learning rate used is written to lr_out.
+void adamw(float* p, const float* g, float* m, float* v, const uint8_t* decay, size_t n, const Schedule& sched,
+           float beta1, float beta2, float eps, float wd, const int* step, const float* gsq, float clip,
+           float* lr_out, cudaStream_t s);
 void increment(int* x, cudaStream_t s);
 // Wb = bf16(diag(gain) W) (gain may be null)
 void prep_weight(const float* W, const float* gain, bf16* Wb, int rows, int cols, cudaStream_t s);
@@ -96,6 +124,9 @@ struct AddrBwd {
     float budget, target, count;
     bf16* dG;  // [M][ldG] (every used column written; padding columns must be zero)
     int ldG, M, T, H;
+    // [M][H][2] each routed slot's mass just before the write (BankRead::zpre): a closed write gate's gradient is
+    // the secant to the open state (see addr_bwd); null: the tangent at weight 0
+    const float* zpre = nullptr;
 };
 void addr_bwd(const AddrBwd& a, cudaStream_t s);
 
@@ -159,6 +190,7 @@ struct BankRead {
     float* dg;              // [M][H] dy . read (open reads), 0 (closed)
     bf16* coef;             // scratch [3][M*H*SLOTS]: the read's local gradients on each slot's K, V, Z
     float* dlog_tau;        // [H] accumulated
+    float* zpre = nullptr;  // forward (hop 1): [M][H][2] each routed slot's mass just before the write (for AddrBwd)
 };
 void bank_fwd(const BankWrites& w, const BankRead& r, cudaStream_t s);
 void bank_rewalk(const BankWrites& w, const BankRead& r, cudaStream_t s);

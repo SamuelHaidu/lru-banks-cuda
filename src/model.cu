@@ -26,11 +26,15 @@ T* Model::alloc(size_t n) {
 
 Model::Model(const Config& c, uint64_t seed) : c_(c) {
     const int D = c.D, HD = c.HD(), S2 = c.S2(), H = c.H, F = c.F, E0 = c.E0, V = c.V, M = c.M();
+    if (int(c.hops.size()) != 0 && int(c.hops.size()) != c.L) fail("Model", "hops needs one entry per layer", __FILE__, __LINE__);
+    if (!c.factorized && E0 != D) fail("Model", "an unfactorized embedding is D wide (E0 = D)", __FILE__, __LINE__);
     E_ = add("E", V, E0, true);
-    W_in_ = add("W_in", E0, D, true);
+    if (!c.tied) E_out_ = add("E_out", V, E0, true);
+    if (c.factorized) W_in_ = add("W_in", E0, D, true);
     final_norm_ = add("final_norm", 1, D, false);
-    W_out_ = add("W_out", D, E0, true);
+    if (c.factorized) W_out_ = add("W_out", D, E0, true);
     for (int n = 0; n < c.L; ++n) {
+        const bool two = c.hops_of(n) == 2;
         const std::string l = "l" + std::to_string(n) + "_";
         LayerIdx x;
         x.norm1 = add(l + "norm1", 1, D, false);
@@ -43,17 +47,19 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         x.bwg = add(l + "bwg", 1, H, false);
         x.R = add(l + "R", H, DH * SLOTS, false);
         x.ltau = add(l + "log_tau", 1, H, false);
-        x.ltau2 = add(l + "log_tau2", 1, H, false);
+        if (two) x.ltau2 = add(l + "log_tau2", 1, H, false);
         x.Wo = add(l + "Wo", HD, D, true);
-        x.Wo2 = add(l + "Wo2", HD, D, true);
+        if (two) x.Wo2 = add(l + "Wo2", HD, D, true);
         x.ffn_norm = add(l + "ffn_norm", 1, D, false);
         x.W1 = add(l + "W1", D, F, true);
         x.b1 = add(l + "b1", 1, F, false);
         x.W2 = add(l + "W2", F, D, true);
         x.b2 = add(l + "b2", 1, D, false);
-        x.q2_norm = add(l + "q2_norm", 1, D, false);
-        x.Wq2 = add(l + "Wq2", D, c.ldG2(), true);
-        x.brg2 = add(l + "brg2", 1, H, false);
+        if (two) {
+            x.q2_norm = add(l + "q2_norm", 1, D, false);
+            x.Wq2 = add(l + "Wq2", D, c.ldG2(), true);
+            x.brg2 = add(l + "brg2", 1, H, false);
+        }
         li_.push_back(x);
     }
     P_ = alloc<float>(n_);
@@ -64,24 +70,30 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     LBC_CUDA(cudaMemset(M1_, 0, n_ * 4));
     LBC_CUDA(cudaMemset(M2_, 0, n_ * 4));
 
-    Eb_ = alloc<bf16>(size_t(V) * E0);
-    Winb_ = alloc<bf16>(size_t(E0) * D);
-    Woutb_ = alloc<bf16>(size_t(D) * E0);
+    if (c.factorized || c.tied) Eb_ = alloc<bf16>(size_t(V) * E0);  // the input gather and / or the tied readout
+    if (!c.tied) Eoutb_ = alloc<bf16>(size_t(V) * E0);
+    if (c.factorized) {
+        Winb_ = alloc<bf16>(size_t(E0) * D);
+        Woutb_ = alloc<bf16>(size_t(D) * E0);
+    }
     loga_ = alloc<float>(size_t(H) * SLOTS);
     const int nchunks = (c.T + c.bank_chunk - 1) / c.bank_chunk;
     const size_t ckpt_floats = size_t(c.B) * H * nchunks * CKPT_FIELDS * SLOTS;
+    bool any_two = false;
     for (int n = 0; n < c.L; ++n) {
-        LayerW w;
+        const bool two = c.hops_of(n) == 2;
+        any_two |= two;
+        LayerW w{};
         w.Wa = alloc<bf16>(size_t(D) * c.ldPV());
         w.Ws = alloc<bf16>(size_t(S2) * c.ldG());
         w.Wo = alloc<bf16>(size_t(HD) * D);
-        w.Wo2 = alloc<bf16>(size_t(HD) * D);
+        if (two) w.Wo2 = alloc<bf16>(size_t(HD) * D);
         w.W1 = alloc<bf16>(size_t(D) * F);
         w.W2 = alloc<bf16>(size_t(F) * D);
-        w.Wq2 = alloc<bf16>(size_t(D) * c.ldG2());
+        if (two) w.Wq2 = alloc<bf16>(size_t(D) * c.ldG2());
         w.b1 = alloc<bf16>(F);
         lw_.push_back(w);
-        LayerA a;
+        LayerA a{};
         a.xh1 = alloc<bf16>(size_t(M) * D);
         a.rstd1 = alloc<float>(M);
         a.PV = alloc<bf16>(size_t(M) * c.ldPV());
@@ -102,25 +114,28 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         a.rstd2 = alloc<float>(M);
         a.Z = alloc<bf16>(size_t(M) * F);
         a.U = alloc<bf16>(size_t(M) * F);
-        a.xh3 = alloc<bf16>(size_t(M) * D);
-        a.rstd3 = alloc<float>(M);
-        a.q2 = alloc<bf16>(size_t(M) * HD);
-        a.q2n = alloc<float>(size_t(M) * H);
-        a.ar2 = alloc<float>(size_t(M) * H);
-        a.gr2 = alloc<uint8_t>(size_t(M) * H);
-        a.o2 = alloc<bf16>(size_t(M) * HD);
+        if (two) {
+            a.xh3 = alloc<bf16>(size_t(M) * D);
+            a.rstd3 = alloc<float>(M);
+            a.q2 = alloc<bf16>(size_t(M) * HD);
+            a.q2n = alloc<float>(size_t(M) * H);
+            a.ar2 = alloc<float>(size_t(M) * H);
+            a.gr2 = alloc<uint8_t>(size_t(M) * H);
+            a.o2 = alloc<bf16>(size_t(M) * HD);
+        }
         a.info = alloc<uint2>(size_t(M) * H);
+        a.zpre = alloc<float>(size_t(M) * H * 2);
         a.ckpt = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
         la_.push_back(a);
     }
     const int Mc = std::min(c.ce_chunk, M);
     h_ = alloc<float>(size_t(M) * D);
-    x0_ = alloc<bf16>(size_t(M) * E0);
+    if (c.factorized) x0_ = alloc<bf16>(size_t(M) * E0);
     xhF_ = alloc<bf16>(size_t(M) * D);
     rstdF_ = alloc<float>(M);
     hr_ = alloc<bf16>(size_t(M) * E0);
     Gt_ = alloc<bf16>(size_t(M) * c.ldG());
-    G2t_ = alloc<bf16>(size_t(M) * c.ldG2());
+    G2t_ = any_two ? alloc<bf16>(size_t(M) * c.ldG2()) : nullptr;
     logits_ = alloc<float>(size_t(Mc) * V);
     dlog_ = alloc<bf16>(size_t(Mc) * V);
     dhrb_ = alloc<bf16>(size_t(M) * E0);
@@ -128,29 +143,33 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     dhb_ = alloc<bf16>(size_t(M) * D);
     dxh_ = alloc<float>(size_t(M) * D);
     dO1_ = alloc<float>(size_t(M) * HD);
-    dO2_ = alloc<float>(size_t(M) * HD);
+    dO2_ = any_two ? alloc<float>(size_t(M) * HD) : nullptr;
     db1b_ = alloc<bf16>(F);
     dZ_ = alloc<bf16>(size_t(M) * F);
     dG_ = alloc<bf16>(size_t(M) * c.ldG());
-    dG2_ = alloc<bf16>(size_t(M) * c.ldG2());
+    dG2_ = any_two ? alloc<bf16>(size_t(M) * c.ldG2()) : nullptr;
     dS_ = alloc<float>(size_t(M) * S2);
     dPV_ = alloc<bf16>(size_t(M) * c.ldPV());
     dk2_ = alloc<bf16>(size_t(M) * HD * 2);
     dv2_ = alloc<bf16>(size_t(M) * HD * 2);
     dr2_ = alloc<float>(size_t(M) * H * 2);
     dq1_ = alloc<float>(size_t(M) * HD);
-    dq2_ = alloc<float>(size_t(M) * HD);
+    dq2_ = any_two ? alloc<float>(size_t(M) * HD) : nullptr;
     dgr1_ = alloc<float>(size_t(M) * H);
-    dgr2_ = alloc<float>(size_t(M) * H);
+    dgr2_ = any_two ? alloc<float>(size_t(M) * H) : nullptr;
     coef1_ = alloc<bf16>(3 * size_t(M) * H * SLOTS);
-    coef2_ = alloc<bf16>(3 * size_t(M) * H * SLOTS);
-    dx0_ = alloc<float>(size_t(M) * E0);
+    coef2_ = any_two ? alloc<bf16>(3 * size_t(M) * H * SLOTS) : nullptr;
+    if (c.factorized) dx0_ = alloc<float>(size_t(M) * E0);
     size_t wmax = 0;
     for (const auto& t : tensors_) wmax = std::max(wmax, size_t(t.rows) * t.cols);
     dWp_ = alloc<float>(wmax);
-    loss_ = alloc<float>(1);
-    stats_ = alloc<float>(size_t(6) * c.L);
-    gsq_ = alloc<float>(1);
+    metrics_ = alloc<float>(size_t(metrics_count()));
+    LBC_CUDA(cudaMemset(metrics_, 0, size_t(metrics_count()) * sizeof(float)));
+    loss_ = metrics_;
+    acc_ = metrics_ + 1;
+    stats_ = metrics_ + 2;
+    gsq_ = metrics_ + 2 + 6 * c.L;
+    lr_ = gsq_ + 1;
     step_ = alloc<int>(1);
     LBC_CUDA(cudaMemset(step_, 0, sizeof(int)));
     carry_ = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
@@ -179,11 +198,14 @@ void Model::init(uint64_t seed) {
         const Tensor& t = tensors_[i];
         std::fill(hp.begin() + t.off, hp.begin() + t.off + size_t(t.rows) * t.cols, v);
     };
-    const float out_std = 0.02f / std::sqrt(2.f * 2.f * c_.L);  // 2 reads per layer write into the stream
+    int reads = 0;
+    for (int n = 0; n < c_.L; ++n) reads += c_.hops_of(n);
+    const float out_std = 0.02f / std::sqrt(2.f * reads);  // every read writes into the stream
     normal(E_, 0.02f);
-    normal(W_in_, 0.02f);
+    if (E_out_ >= 0) normal(E_out_, 0.02f);
+    if (W_in_ >= 0) normal(W_in_, 0.02f);
     fill(final_norm_, 1.f);
-    normal(W_out_, 0.02f);
+    if (W_out_ >= 0) normal(W_out_, 0.02f);
     const int N = c_.N;
     for (int n = 0; n < c_.L; ++n) {
         const LayerIdx& x = li_[n];
@@ -202,18 +224,21 @@ void Model::init(uint64_t seed) {
         fill(x.brg, c_.gate_bias_r);
         fill(x.bwg, c_.gate_bias_w);
         normal(x.R, 1.f / std::sqrt(float(DH)));
+        const bool two = c_.hops_of(n) == 2;  // (the draws keep the order of the all-2-hop model)
         fill(x.ltau, std::log(c_.tau));
-        fill(x.ltau2, std::log(c_.tau));
+        if (two) fill(x.ltau2, std::log(c_.tau));
         normal(x.Wo, out_std);
-        normal(x.Wo2, out_std);
+        if (two) normal(x.Wo2, out_std);
         fill(x.ffn_norm, 1.f);
         normal(x.W1, 0.02f);
         fill(x.b1, 0.f);
         normal(x.W2, out_std);
         fill(x.b2, 0.f);
-        fill(x.q2_norm, 1.f);
-        normal(x.Wq2, 0.02f);
-        fill(x.brg2, c_.gate_bias_r);
+        if (two) {
+            fill(x.q2_norm, 1.f);
+            normal(x.Wq2, 0.02f);
+            fill(x.brg2, c_.gate_bias_r);
+        }
     }
     for (const auto& t : tensors_)
         if (t.decay) std::fill(hd.begin() + t.off, hd.begin() + t.off + size_t(t.rows) * t.cols, 1);
@@ -233,19 +258,24 @@ void Model::init(uint64_t seed) {
 
 void Model::prepare_weights(cudaStream_t s) {
     const int D = c_.D, HD = c_.HD(), F = c_.F, E0 = c_.E0;
-    prep_weight(p(E_), nullptr, Eb_, c_.V, E0, s);
-    prep_weight(p(W_in_), nullptr, Winb_, E0, D, s);
-    prep_weight(p(W_out_), p(final_norm_), Woutb_, D, E0, s);
+    if (Eb_) prep_weight(p(E_), nullptr, Eb_, c_.V, E0, s);
+    if (Eoutb_) prep_weight(p(E_out_), nullptr, Eoutb_, c_.V, E0, s);
+    if (c_.factorized) {
+        prep_weight(p(W_in_), nullptr, Winb_, E0, D, s);
+        prep_weight(p(W_out_), p(final_norm_), Woutb_, D, E0, s);
+    }
     for (int n = 0; n < c_.L; ++n) {
         const LayerIdx& x = li_[n];
         const LayerW& w = lw_[n];
         prep_weight(p(x.Wa), p(x.norm1), w.Wa, D, c_.ldPV(), s);
         prep_weight(p(x.Ws), nullptr, w.Ws, c_.S2(), c_.ldG(), s);
         prep_weight(p(x.Wo), nullptr, w.Wo, HD, D, s);
-        prep_weight(p(x.Wo2), nullptr, w.Wo2, HD, D, s);
+        if (c_.hops_of(n) == 2) {
+            prep_weight(p(x.Wo2), nullptr, w.Wo2, HD, D, s);
+            prep_weight(p(x.Wq2), p(x.q2_norm), w.Wq2, D, c_.ldG2(), s);
+        }
         prep_weight(p(x.W1), p(x.ffn_norm), w.W1, D, F, s);
         prep_weight(p(x.W2), nullptr, w.W2, F, D, s);
-        prep_weight(p(x.Wq2), p(x.q2_norm), w.Wq2, D, c_.ldG2(), s);
         prep_weight(p(x.b1), nullptr, w.b1, 1, F, s);
     }
 }
@@ -320,7 +350,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
         toc(s);
     }
     tic(s, "bank_fwd");
-    bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
+    bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr, a.zpre}, s);
     toc(s);
     mm(s, false, false, M, D, HD, a.o1, HD, w.Wo, D, h_, D, Out::F32, 1.f);
     tic(s, "norm+elementwise");
@@ -330,6 +360,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, false, M, F, D, a.xh2, D, w.W1, F, a.U, F, Out::BF16, 0.f,
        Epilogue{Epilogue::GeluAuxBias, w.b1, nullptr, a.Z, F});
     mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2)});
+    if (c_.hops_of(n) == 1) return;
     tic(s, "norm+elementwise");
     rmsnorm_fwd(h_, a.xh3, a.rstd3, M, D, s);
     toc(s);
@@ -351,24 +382,29 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     const float* st = stats_ + 6 * n;
     const float count = float(M) * H;
     const BankWrites bw = writes(n, b);
+    const bool two = c_.hops_of(n) == 2;
 
-    // hop 2: h += o2 Wo2 (dhb = bf16(dh), written by the norm backward above)
-    mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
-    mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32);
-    tic(s, "bank_rewalk");
-    bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
-    toc(s);
-    tic(s, "addr_q2");
-    q2_bwd(Q2Bwd{dq2_, dgr2_, a.q2, a.q2n, a.ar2, g(x.brg2), st + 4, c_.budget, c_.budget_target, count, dG2_,
-                 c_.ldG2(), M, H},
-           s);
-    toc(s);
-    mm(s, false, true, M, D, c_.ldG2(), dG2_, c_.ldG2(), w.Wq2, c_.ldG2(), dxh_, D, Out::F32);
-    mm(s, true, false, D, c_.ldG2(), M, a.xh3, D, dG2_, c_.ldG2(), dWp_, c_.ldG2(), Out::F32);
-    tic(s, "norm+elementwise");
-    unfold_grad(dWp_, p(x.Wq2), p(x.q2_norm), g(x.Wq2), g(x.q2_norm), D, c_.ldG2(), s);
-    rmsnorm_bwd(dxh_, a.xh3, a.rstd3, dh_, dhb_, g(x.b2), M, D, true, s);  // and b2's gradient
-    toc(s);
+    // hop 2: h += o2 Wo2 (dhb = bf16(dh), written by the norm backward above). In a 1-hop layer the backward starts
+    // at the FFN, and b2's gradient (the column sums of dh at the layer's output) came with the norm backward that
+    // wrote dh (the next layer's norm1, or the final norm)
+    if (two) {
+        mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
+        mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32);
+        tic(s, "bank_rewalk");
+        bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
+        toc(s);
+        tic(s, "addr_q2");
+        q2_bwd(Q2Bwd{dq2_, dgr2_, a.q2, a.q2n, a.ar2, g(x.brg2), st + 4, c_.budget, c_.budget_target, count, dG2_,
+                     c_.ldG2(), M, H},
+               s);
+        toc(s);
+        mm(s, false, true, M, D, c_.ldG2(), dG2_, c_.ldG2(), w.Wq2, c_.ldG2(), dxh_, D, Out::F32);
+        mm(s, true, false, D, c_.ldG2(), M, a.xh3, D, dG2_, c_.ldG2(), dWp_, c_.ldG2(), Out::F32);
+        tic(s, "norm+elementwise");
+        unfold_grad(dWp_, p(x.Wq2), p(x.q2_norm), g(x.Wq2), g(x.q2_norm), D, c_.ldG2(), s);
+        rmsnorm_bwd(dxh_, a.xh3, a.rstd3, dh_, dhb_, g(x.b2), M, D, true, s);  // and b2's gradient
+        toc(s);
+    }
     // FFN: h += W2 gelu(W1 rms(h) + b1) + b2; dZ = (dh W2^T) gelu'(Z) and b1's gradient from the GEMM epilogue
     mm(s, false, true, M, F, D, dhb_, D, w.W2, D, dZ_, F, Out::BF16, 0.f,
        Epilogue{Epilogue::DGeluBgrad, nullptr, db1b_, a.Z, F});
@@ -390,7 +426,10 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     // the writes, for both reads
     tic(s, "bank_adjoint");
-    bank_adjoint(bw, BankAdjoint{{a.q, a.q2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk2_, dv2_, dr2_, carry_, cflags_}, s);
+    bank_adjoint(bw,
+                 BankAdjoint{{a.q, a.q2}, {dO1_, two ? dO2_ : nullptr}, {coef1_, two ? coef2_ : nullptr}, two ? 2 : 1,
+                             dk2_, dv2_, dr2_, carry_, cflags_},
+                 s);
     toc(s);
     tic(s, "addr_bwd");
     if (c_.ldG() != 2 * HD + 2 * H)  // padding columns (small widths only) must stay zero for the GEMMs
@@ -398,7 +437,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     addr_bwd(AddrBwd{dk2_, dv2_, dr2_, dq1_, dgr1_, a.gw, dPV_ + S2, c_.ldPV(), a.k, a.q, a.kn, a.qn, a.rp1, a.aw,
                      a.ar, a.ridx, b.reset, p(x.R),
                      g(x.R), g(x.bk), g(x.brg), g(x.bwg), st, c_.budget, c_.budget_target, count, dG_, c_.ldG(), M,
-                     c_.T, H},
+                     c_.T, H, a.zpre},
              s);
     toc(s);
     mm(s, false, true, M, S2, c_.ldG(), dG_, c_.ldG(), w.Ws, c_.ldG(), dS_, S2, Out::F32);
@@ -411,51 +450,82 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, true, false, D, c_.ldPV(), M, a.xh1, D, dPV_, c_.ldPV(), dWp_, c_.ldPV(), Out::F32);
     tic(s, "norm+elementwise");
     unfold_grad(dWp_, p(x.Wa), p(x.norm1), g(x.Wa), g(x.norm1), D, c_.ldPV(), s);
-    rmsnorm_bwd(dxh_, a.xh1, a.rstd1, dh_, dhb_, nullptr, M, D, true, s);
+    rmsnorm_bwd(dxh_, a.xh1, a.rstd1, dh_, dhb_, n > 0 ? b2_colsum(n - 1) : nullptr, M, D, true, s);
+    toc(s);
+}
+
+float* Model::b2_colsum(int n) { return c_.hops_of(n) == 1 ? g(li_[n].b2) : nullptr; }
+
+void Model::embed_fwd(const Batch& b, cudaStream_t s) {
+    const int M = c_.M(), D = c_.D, E0 = c_.E0;
+    tic(s, "embed");
+    if (c_.factorized)
+        embed_gather(b.ids, Eb_, x0_, M, E0, s);
+    else
+        embed_gather_f32(b.ids, p(E_), h_, M, D, s);
+    toc(s);
+    if (c_.factorized) mm(s, false, false, M, D, E0, x0_, E0, Winb_, D, h_, D, Out::F32);
+}
+
+// the final norm, the readout and the loss, one chunk of rows at a time (logits = hr E^T); with `backward`, also the
+// readout's gradients and dh (into dh_ / dhb_)
+void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
+    const int M = c_.M(), D = c_.D, E0 = c_.E0, V = c_.V;
+    const bf16* Eo = readout_table();
+    float* gEo = g(c_.tied ? E_ : E_out_);
+    tic(s, "norm+elementwise");
+    rmsnorm_fwd(h_, xhF_, rstdF_, M, D, s);
+    if (!c_.factorized) scale_cols(xhF_, p(final_norm_), hr_, M, D, s);
+    toc(s);
+    if (c_.factorized) mm(s, false, false, M, E0, D, xhF_, D, Woutb_, E0, hr_, E0, Out::BF16);
+    const int Mc = std::min(c_.ce_chunk, M);
+    for (int r0 = 0; r0 < M; r0 += Mc) {
+        const int rows = std::min(Mc, M - r0);
+        mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eo, E0, logits_, V, Out::F32);
+        tic(s, "ce_softmax");
+        ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s);
+        toc(s);
+        if (!backward) continue;
+        mm(s, false, false, rows, E0, V, dlog_, V, Eo, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
+        mm(s, true, false, V, E0, rows, dlog_, V, hr_ + size_t(r0) * E0, E0, gEo, E0, Out::F32, 1.f);
+    }
+    if (!backward) return;
+    if (c_.factorized) {
+        mm(s, false, true, M, D, E0, dhrb_, E0, Woutb_, E0, dxh_, D, Out::F32);
+        mm(s, true, false, D, E0, M, xhF_, D, dhrb_, E0, dWp_, E0, Out::F32);
+    }
+    tic(s, "norm+elementwise");
+    if (c_.factorized)
+        unfold_grad(dWp_, p(W_out_), p(final_norm_), g(W_out_), g(final_norm_), D, E0, s);
+    else
+        scale_cols_bwd(dhrb_, xhF_, p(final_norm_), dxh_, g(final_norm_), M, D, s);
+    rmsnorm_bwd(dxh_, xhF_, rstdF_, dh_, dhb_, b2_colsum(c_.L - 1), M, D, false, s);
     toc(s);
 }
 
 void Model::forward_backward(const Batch& b, cudaStream_t s) {
-    const int M = c_.M(), D = c_.D, E0 = c_.E0, V = c_.V;
+    const int M = c_.M(), D = c_.D, E0 = c_.E0;
     LBC_CUDA(cudaMemsetAsync(G_, 0, n_ * sizeof(float), s));
-    LBC_CUDA(cudaMemsetAsync(loss_, 0, sizeof(float), s));
-    LBC_CUDA(cudaMemsetAsync(stats_, 0, size_t(6) * c_.L * sizeof(float), s));
+    LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));  // loss, accuracy, gate stats
 
-    tic(s, "embed");
-    embed_gather(b.ids, Eb_, x0_, M, E0, s);
-    toc(s);
-    mm(s, false, false, M, D, E0, x0_, E0, Winb_, D, h_, D, Out::F32);
+    embed_fwd(b, s);
     for (int n = 0; n < c_.L; ++n) layer_fwd(n, b, s);
-
-    // the loss and its gradient, one chunk of rows at a time: logits = hr E^T
-    tic(s, "norm+elementwise");
-    rmsnorm_fwd(h_, xhF_, rstdF_, M, D, s);
-    toc(s);
-    mm(s, false, false, M, E0, D, xhF_, D, Woutb_, E0, hr_, E0, Out::BF16);
-    const int Mc = std::min(c_.ce_chunk, M);
-    for (int r0 = 0; r0 < M; r0 += Mc) {
-        const int rows = std::min(Mc, M - r0);
-        mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eb_, E0, logits_, V, Out::F32);
-        tic(s, "ce_softmax");
-        ce_rows(logits_, b.y + r0, dlog_, loss_, rows, V, b.inv_n, s);
-        toc(s);
-        mm(s, false, false, rows, E0, V, dlog_, V, Eb_, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
-        mm(s, true, false, V, E0, rows, dlog_, V, hr_ + size_t(r0) * E0, E0, g(E_), E0, Out::F32, 1.f);
-    }
-
-    // backward
-    mm(s, false, true, M, D, E0, dhrb_, E0, Woutb_, E0, dxh_, D, Out::F32);
-    mm(s, true, false, D, E0, M, xhF_, D, dhrb_, E0, dWp_, E0, Out::F32);
-    tic(s, "norm+elementwise");
-    unfold_grad(dWp_, p(W_out_), p(final_norm_), g(W_out_), g(final_norm_), D, E0, s);
-    rmsnorm_bwd(dxh_, xhF_, rstdF_, dh_, dhb_, nullptr, M, D, false, s);
-    toc(s);
+    readout_loss(b, true, s);
     for (int n = c_.L - 1; n >= 0; --n) layer_bwd(n, b, s);
-    mm(s, false, true, M, E0, D, dhb_, D, Winb_, D, dx0_, E0, Out::F32);
-    mm(s, true, false, E0, D, M, x0_, E0, dhb_, D, g(W_in_), D, Out::F32);
+    if (c_.factorized) {
+        mm(s, false, true, M, E0, D, dhb_, D, Winb_, D, dx0_, E0, Out::F32);
+        mm(s, true, false, E0, D, M, x0_, E0, dhb_, D, g(W_in_), D, Out::F32);
+    }
     tic(s, "embed");
-    embed_scatter(b.ids, dx0_, g(E_), M, E0, s);
+    embed_scatter(b.ids, c_.factorized ? dx0_ : dh_, g(E_), M, E0, s);
     toc(s);
+}
+
+void Model::forward_loss(const Batch& b, cudaStream_t s) {
+    LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));
+    embed_fwd(b, s);
+    for (int n = 0; n < c_.L; ++n) layer_fwd(n, b, s);
+    readout_loss(b, false, s);
 }
 
 void Model::optimizer_step(cudaStream_t s) {
@@ -463,9 +533,35 @@ void Model::optimizer_step(cudaStream_t s) {
     LBC_CUDA(cudaMemsetAsync(gsq_, 0, sizeof(float), s));
     sumsq(G_, n_, gsq_, s);
     increment(step_, s);
-    adamw(P_, G_, M1_, M2_, decay_, n_, c_.lr, c_.beta1, c_.beta2, c_.eps, c_.wd, step_, gsq_, c_.clip, s);
+    adamw(P_, G_, M1_, M2_, decay_, n_, schedule(), c_.beta1, c_.beta2, c_.eps, c_.wd, step_, gsq_, c_.clip, lr_, s);
     prepare_weights(s);
     toc(s);
+}
+
+StepMetrics Model::decode_metrics(const float* r) const {
+    StepMetrics m{};
+    m.loss = r[0];
+    m.accuracy = r[1];
+    const float count = float(c_.M()) * c_.H;
+    int twos = 0;
+    for (int n = 0; n < c_.L; ++n) {
+        const float* st = r + 2 + 6 * n;
+        m.open_w += st[1] / count / c_.L;
+        m.open_r1 += st[3] / count / c_.L;
+        if (c_.hops_of(n) == 2) {
+            m.open_r2 += st[5] / count;
+            ++twos;
+        }
+    }
+    m.open_r2 = twos ? m.open_r2 / twos : -1.f;
+    m.grad_norm = std::sqrt(r[2 + 6 * c_.L]);
+    m.lr = r[3 + 6 * c_.L];
+    return m;
+}
+
+size_t Model::embedding_params() const {
+    size_t n = size_t(c_.V) * c_.E0;
+    return c_.tied ? n : 2 * n;
 }
 
 std::vector<float> Model::gate_stats(cudaStream_t s) {
@@ -491,7 +587,10 @@ void Model::decisions(int n, std::vector<uint8_t>& ridx, std::vector<uint8_t>& g
     LBC_CUDA(cudaMemcpyAsync(ridx.data(), la_[n].ridx, MH * 2, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(gw.data(), la_[n].gw, MH, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(gr.data(), la_[n].gr, MH, cudaMemcpyDeviceToHost, s));
-    LBC_CUDA(cudaMemcpyAsync(gr2.data(), la_[n].gr2, MH, cudaMemcpyDeviceToHost, s));
+    if (la_[n].gr2)
+        LBC_CUDA(cudaMemcpyAsync(gr2.data(), la_[n].gr2, MH, cudaMemcpyDeviceToHost, s));
+    else
+        std::fill(gr2.begin(), gr2.end(), uint8_t(0));
     LBC_CUDA(cudaStreamSynchronize(s));
 }
 
