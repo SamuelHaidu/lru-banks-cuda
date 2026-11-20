@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The protocol behind every row of the research log: the gradient check (2 seeds, the reference's forward rounded to
-# bf16 like the C++), then the throughput at 64 x 512 with every gate open (B1) and with every read closed (B2).
+# bf16 like the C++) of the default model and of each arch option, then the throughput at 64 x 512 with every gate
+# open (B1) and with every read closed (B2).
 #
 #   bash scripts/check_and_bench.sh /root/data/pretrain-mix-bpe32768/train.npy [extra train_bench args]
 set -euo pipefail
@@ -9,11 +10,21 @@ DATA=${1:?token file}
 shift || true
 BIN=build/release/train_bench
 cmake --build --preset release >/dev/null
-for seed in 1 2; do
-    "$BIN" --data "$DATA" --tiny --gate-w 0 --gate-r 0 --seed "$seed" --dump "/tmp/lbc_dump$seed" "$@" >/dev/null
-    printf "grad check seed %s: " "$seed"
-    python3 tests/check_grads.py "/tmp/lbc_dump$seed" --bf16 2>/dev/null | grep -E "^(PASS|FAIL)" || echo "ERROR"
-done
+check() {  # name, then train_bench arguments
+    local name=$1
+    shift
+    for seed in 1 2; do
+        "$BIN" --data "$DATA" --tiny --gate-w 0 --gate-r 0 --seed "$seed" --dump "/tmp/lbc_dump$seed" "$@" >/dev/null
+        out=$(python3 tests/check_grads.py "/tmp/lbc_dump$seed" --bf16 2>/dev/null | grep -E "^(PASS|FAIL)" || true)
+        printf "grad check %-13s seed %s: %s\n" "$name" "$seed" "${out:-ERROR (no verdict)}"
+    done
+}
+check default "$@"
+check untied --set arch_params.tied_embeddings=false "$@"
+check unfactorized --set arch_params.factorized=false "$@"
+check hops-2,1 --set 'arch_params.hops=[2,1]' "$@"
+check all-options --set arch_params.tied_embeddings=false --set arch_params.factorized=false \
+    --set 'arch_params.hops=[1,2]' "$@"
 for mode in "B1 all gates open:--gate-w 20 --gate-r 20" "B2 reads closed:--gate-w 20 --gate-r -20"; do
     name=${mode%%:*}
     args=${mode#*:}
