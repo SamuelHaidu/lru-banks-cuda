@@ -31,6 +31,7 @@ namespace lbc {
 struct Config {
     int V = 32768, E0 = 128, D = 512, L = 4, N = 256, H = 16, F = 2048;
     int B = 64, T = 512;
+    int bank_chunk = 512;  // tokens per bank-walk block (rows longer than this walk in parallel chunks)
     int ce_chunk = 256;  // loss rows per chunk: 256 x V fp32 logits + bf16 gradients (50 MB) stay in the L2
     float lr = 2e-3f, wd = 0.1f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-7f, clip = 1.f;
     float tau = 8.f, lru_hl_min = 1.f, lru_hl_max = 16.f, slot_hl_min = 1.f, slot_hl_max = 1024.f;
@@ -101,6 +102,7 @@ class Model {
         float *rstd1, *s, *kn, *qn, *rp1, *aw, *ar, *rstd2, *rstd3, *q2n, *ar2;
         uint8_t *ridx, *gw, *gr, *gr2;
         uint2* info;
+        float* ckpt;  // slot states at chunk starts (rows longer than bank_chunk), shared by forward and backward
     };
 
     int add(const std::string& name, int rows, int cols, bool decay);
@@ -141,7 +143,8 @@ class Model {
     float *dh_, *dxh_, *dO1_, *dO2_, *dS_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
         *dWp_;
     bf16 *db1b_, *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
-    float *loss_, *stats_, *gsq_;
+    float *loss_, *stats_, *gsq_, *carry_;
+    int* cflags_;
 
     std::vector<void*> allocations_;
     bool profile_ = false;

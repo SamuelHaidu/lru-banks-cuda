@@ -68,6 +68,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     Winb_ = alloc<bf16>(size_t(E0) * D);
     Woutb_ = alloc<bf16>(size_t(D) * E0);
     loga_ = alloc<float>(size_t(H) * SLOTS);
+    const int nchunks = (c.T + c.bank_chunk - 1) / c.bank_chunk;
+    const size_t ckpt_floats = size_t(c.B) * H * nchunks * CKPT_FIELDS * SLOTS;
     for (int n = 0; n < c.L; ++n) {
         LayerW w;
         w.Wa = alloc<bf16>(size_t(D) * c.ldPV());
@@ -108,6 +110,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         a.gr2 = alloc<uint8_t>(size_t(M) * H);
         a.o2 = alloc<bf16>(size_t(M) * HD);
         a.info = alloc<uint2>(size_t(M) * H);
+        a.ckpt = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
         la_.push_back(a);
     }
     const int Mc = std::min(c.ce_chunk, M);
@@ -148,6 +151,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     loss_ = alloc<float>(1);
     stats_ = alloc<float>(size_t(6) * c.L);
     gsq_ = alloc<float>(1);
+    carry_ = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
+    cflags_ = nchunks > 1 ? alloc<int>(size_t(c.B) * H * nchunks) : nullptr;
     init(seed);
 }
 
@@ -283,7 +288,7 @@ void Model::mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16
 BankWrites Model::writes(int n, const Batch& b) {
     const LayerA& a = la_[n];
     (void)b;
-    return BankWrites{a.k, a.PV + c_.S2(), c_.ldPV(), a.info, loga_, c_.B, c_.T, c_.H};
+    return BankWrites{a.k, a.PV + c_.S2(), c_.ldPV(), a.info, loga_, c_.B, c_.T, c_.H, c_.bank_chunk, a.ckpt};
 }
 
 void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
@@ -307,6 +312,11 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
              s);
     toc(s);
     const BankWrites bw = writes(n, b);
+    if (a.ckpt) {
+        tic(s, "bank_fwd");
+        bank_checkpoint(bw, a.ckpt, carry_, cflags_, s);  // the adjoint's scratch is free in the forward
+        toc(s);
+    }
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
     toc(s);
@@ -378,7 +388,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     // the writes, for both reads
     tic(s, "bank_adjoint");
-    bank_adjoint(bw, BankAdjoint{{a.q, a.q2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk2_, dv2_, dr2_}, s);
+    bank_adjoint(bw, BankAdjoint{{a.q, a.q2}, {dO1_, dO2_}, {coef1_, coef2_}, 2, dk2_, dv2_, dr2_, carry_, cflags_}, s);
     toc(s);
     tic(s, "addr_bwd");
     if (c_.ldG() != 2 * HD + 2 * H)  // padding columns (small widths only) must stay zero for the GEMMs

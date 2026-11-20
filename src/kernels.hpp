@@ -134,7 +134,17 @@ struct BankWrites {
     const uint2* info;   // [M][H] routing, gates, reset, p1 (AddrFwd::info)
     const float* loga;   // [H][SLOTS]: log of each slot's decay per token
     int B, T, H;
+    // Chunks: the walks run one block per (row, head, chunk of `chunk` tokens). With more than one chunk per row the
+    // forward and the re-walk start from per-chunk checkpoints of the slot states (bank_checkpoint), and the adjoint
+    // runs in two passes around a sequential combine (exact: the adjoint is linear).
+    int chunk;
+    const float* ckpt;   // [B][H][chunks][CKPT_FIELDS][SLOTS], or null with one chunk per row
 };
+constexpr int CKPT_FIELDS = 2 * DH + 2;  // Kb, Vb, Zs, tm (forward); LK, LV, LZ (adjoint)
+__host__ __device__ inline int bank_chunks(const BankWrites& w) { return (w.T + w.chunk - 1) / w.chunk; }
+// The slot states at every chunk start but the first: local chunk states in parallel (writes only), then a per-slot
+// merge (local, rflags: scratch of the checkpoint's size and [B][H][chunks]).
+void bank_checkpoint(const BankWrites& w, float* ckpt, float* local, int* rflags, cudaStream_t s);
 
 struct BankRead {
     const bf16* q;          // [M][H][DH]
@@ -158,6 +168,8 @@ struct BankAdjoint {
     int hops;                 // the reads' gates come from the step words (flags 2 and 8)
     bf16 *dk2, *dv2;          // see AddrBwd
     float* dr2;
+    float* carry;             // with more than one chunk: [B][H][chunks][CKPT_FIELDS][SLOTS] scratch
+    int* flags;               // [B][H][chunks] scratch
 };
 void bank_adjoint(const BankWrites& w, const BankAdjoint& a, cudaStream_t s);
 
