@@ -55,3 +55,7 @@ GIT_SSH_COMMAND="ssh -i ~/.ssh/github_lru_banks_cuda -o IdentitiesOnly=yes \
   -o UserKnownHostsFile=/workspace/.ssh/known_hosts_github" \
   git clone git@github.com:SamuelHaidu/lru-banks-cuda.git /workspace/lru-banks-cuda
 ```
+
+## License
+
+MIT, see `LICENSE`.
