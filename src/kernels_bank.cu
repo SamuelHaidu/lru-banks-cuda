@@ -8,7 +8,8 @@
 // sum_m p_m Vb_m (one block barrier).
 //
 // Backward, per layer: a re-walk per read recomputes the softmax and stores the read's local gradient on each
-// slot's linear state (K = Zs Kb, V, Z): dK_m = alpha q, dV_m = beta dy, dZ_m = gamma; then one reverse adjoint walk
+// slot's linear state (K = Zs Kb, V, Z): dK_m = alpha q, dV_m = beta dy, dZ_m = gamma (bf16: same range as fp32,
+// half the traffic of the 3 x SLOTS coefficients per open read); then one reverse adjoint walk
 // for both reads. The adjoint has no cross-slot coupling at all (each thread carries its slot's lambda, decayed
 // lazily: lambda_t = local_t + a lambda_{t+1}), so it runs without barriers; the routed threads write their slot's
 // contributions to the write gradients (k, v, routing weight, write gate) into per-slot buffers that the
@@ -205,6 +206,19 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
     __shared__ float s_tau[NWARP];
     float Kb[DH], Vb[DH], Zs = 0.f, dtau = 0.f;
     int tm = 0, nopen = 0;
+    // the dq of an open read is summed over the warps after the next open read's barrier (or after the loop):
+    // one barrier per open read; s_dq is double-buffered by open-read parity
+    size_t pending_rh = 0;
+    int pending_buf = -1;
+    auto flush_dq = [&]() {
+        if (warp == 0 && pending_buf >= 0) {
+            float dq = 0.f;
+#pragma unroll
+            for (int i = 0; i < NWARP; ++i) dq += s_dq[pending_buf][i][lane];
+            rd.dq[pending_rh * DH + lane] = dq;
+        }
+        pending_buf = -1;
+    };
 #pragma unroll
     for (int d = 0; d < DH; ++d) Kb[d] = Vb[d] = 0.f;
     const size_t base = size_t(b) * T;
@@ -241,6 +255,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
                 s_red[buf][warp][2] = wpd;
             }
             __syncthreads();
+            flush_dq();
             float M = -INFINITY;
 #pragma unroll
             for (int i = 0; i < NWARP; ++i) M = fmaxf(M, s_red[buf][i][0]);
@@ -268,17 +283,12 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
 #pragma unroll
             for (int d = 0; d < DH; ++d) u[d] = tds * Kb[d];
             s_dq[buf][warp][lane] = reduce_scatter32(u, lane);  // dq = tau sum_m ds_m Kb_m
-            rd.coef[rh * SLOTS + m] = alpha;
-            rd.coef[plane + rh * SLOTS + m] = beta;
-            rd.coef[2 * plane + rh * SLOTS + m] = gamma;
+            pending_rh = rh;
+            pending_buf = buf;
+            rd.coef[rh * SLOTS + m] = __float2bfloat16(alpha);
+            rd.coef[plane + rh * SLOTS + m] = __float2bfloat16(beta);
+            rd.coef[2 * plane + rh * SLOTS + m] = __float2bfloat16(gamma);
             if (m == 0) rd.dg[rh] = sdp;
-            __syncthreads();
-            if (warp == 0) {
-                float dq = 0.f;
-#pragma unroll
-                for (int i = 0; i < NWARP; ++i) dq += s_dq[buf][i][lane];
-                rd.dq[rh * DH + lane] = dq;
-            }
         } else {
             if (warp == 0) rd.dq[rh * DH + lane] = 0.f;
             if (m == 0) rd.dg[rh] = 0.f;
@@ -287,6 +297,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
     dtau = warp_sum(dtau);
     if (lane == 0) s_tau[warp] = dtau;
     __syncthreads();
+    flush_dq();
     if (m == 0) {
         float tot = 0.f;
 #pragma unroll
@@ -326,9 +337,10 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint(BankWrites w, BankAdjoin
 #pragma unroll
             for (int hop = 0; hop < 2; ++hop) {
                 if (!open[hop]) continue;
-                const float* cf = a.coef[hop];
-                const float alpha = cf[rh * SLOTS + m], beta = cf[plane + rh * SLOTS + m],
-                            gamma = cf[2 * plane + rh * SLOTS + m];
+                const bf16* cf = a.coef[hop];
+                const float alpha = __bfloat162float(cf[rh * SLOTS + m]),
+                            beta = __bfloat162float(cf[plane + rh * SLOTS + m]),
+                            gamma = __bfloat162float(cf[2 * plane + rh * SLOTS + m]);
                 float x[DH];
                 load32(a.q[hop] + rh * DH, x);
 #pragma unroll

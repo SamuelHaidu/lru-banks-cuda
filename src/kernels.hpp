@@ -150,7 +150,7 @@ struct BankRead {
     const float* dy;        // backward: [M][H*DH] gradient of o
     float* dq;              // [M][H][DH]
     float* dg;              // [M][H] dy . read (open reads), 0 (closed)
-    float* coef;            // scratch [3][M*H*SLOTS]: the read's local gradients on each slot's K, V, Z
+    bf16* coef;             // scratch [3][M*H*SLOTS]: the read's local gradients on each slot's K, V, Z
     float* dlog_tau;        // [H] accumulated
 };
 void bank_fwd(const BankWrites& w, const BankRead& r, cudaStream_t s);
@@ -159,7 +159,7 @@ void bank_rewalk(const BankWrites& w, const BankRead& r, cudaStream_t s);
 struct BankAdjoint {
     const bf16* q[2];
     const float* dy[2];
-    const float* coef[2];
+    const bf16* coef[2];
     int hops;                 // the reads' gates come from the step words (flags 2 and 8)
     float *dk2, *dv2, *dr2;   // see AddrBwd
 };

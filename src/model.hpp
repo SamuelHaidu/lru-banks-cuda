@@ -136,9 +136,9 @@ class Model {
     float *rstdF_, *Gt_, *G2t_, *logits_;
     bf16* dlog_;
     // backward buffers
-    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dk2_, *dv2_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *coef1_,
-        *coef2_, *dx0_, *dWp_;
-    bf16 *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
+    float *dhr_, *dh_, *dxh_, *dO1_, *dO2_, *du_, *dS_, *dk2_, *dv2_, *dr2_, *dq1_, *dq2_, *dgr1_, *dgr2_, *dx0_,
+        *dWp_;
+    bf16 *coef1_, *coef2_, *dhrb_, *dhb_, *dZ_, *dG_, *dG2_, *dPV_;
     float *loss_, *stats_, *gsq_;
 
     std::vector<void*> allocations_;

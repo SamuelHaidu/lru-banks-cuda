@@ -139,8 +139,8 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     dq2_ = alloc<float>(size_t(M) * HD);
     dgr1_ = alloc<float>(size_t(M) * H);
     dgr2_ = alloc<float>(size_t(M) * H);
-    coef1_ = alloc<float>(3 * size_t(M) * H * SLOTS);
-    coef2_ = alloc<float>(3 * size_t(M) * H * SLOTS);
+    coef1_ = alloc<bf16>(3 * size_t(M) * H * SLOTS);
+    coef2_ = alloc<bf16>(3 * size_t(M) * H * SLOTS);
     dx0_ = alloc<float>(size_t(M) * E0);
     size_t wmax = 0;
     for (const auto& t : tensors_) wmax = std::max(wmax, size_t(t.rows) * t.cols);
