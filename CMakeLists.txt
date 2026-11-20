@@ -29,8 +29,11 @@ target_compile_options(lbc_common INTERFACE
 
 find_package(Threads REQUIRED)
 
-# The model: kernels, cuBLASLt GEMMs, the data loader.
+# The model: kernels, cuBLASLt GEMMs, the data loader, run configs and checkpoints.
 add_library(lbc STATIC
+  src/json.cpp
+  src/run_config.cpp
+  src/checkpoint.cpp
   src/gemm.cpp
   src/data.cpp
   src/kernels_basic.cu
@@ -42,6 +45,11 @@ target_link_libraries(lbc PUBLIC lbc_common CUDA::cublasLt Threads::Threads)
 
 add_executable(device_info tools/device_info.cu)
 target_link_libraries(device_info PRIVATE lbc_common)
+
+# The trainer: `lbc create / config / train` (the target is lbc_cli: `lbc` is the library)
+add_executable(lbc_cli tools/lbc.cu)
+target_link_libraries(lbc_cli PRIVATE lbc)
+set_target_properties(lbc_cli PROPERTIES OUTPUT_NAME lbc)
 
 add_executable(train_bench tools/train_bench.cu)
 target_link_libraries(train_bench PRIVATE lbc)
