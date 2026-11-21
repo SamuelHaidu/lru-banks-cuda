@@ -37,7 +37,8 @@ import torch
 
 class _FusedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, h: torch.Tensor, kernel: torch.Tensor, y: torch.Tensor, chunk_size: int) -> torch.Tensor:  # type: ignore[override]
+    def forward(ctx: Any, h: torch.Tensor, kernel: torch.Tensor, y: torch.Tensor, chunk_size: int,  # type: ignore[override]
+                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         n = h.shape[0]
         need_dh, need_dk = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
         acc = torch.promote_types(h.dtype, torch.float32)  # softmax/accumulation precision: >= fp32
@@ -57,16 +58,25 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
             probs = torch.softmax((h_c @ kernel).to(acc), dim=1)
             # -log p_y; p_y below the float's smallest normal (loss > ~87 nats)
             # is clamped, which only caps the reported loss, never the gradient.
-            total -= probs.gather(1, y_c[:, None]).clamp_min_(tiny).log_().sum()
+            logp = probs.gather(1, y_c[:, None]).clamp_min_(tiny).log_().squeeze(1)
+            if weights is None:
+                total -= logp.sum()
+                h_y = h_c.to(acc)  # what the one-hot part adds to dK
+            else:  # every row's loss and both gradients scaled by its weight
+                w_c = weights[start:stop].to(acc)
+                total -= (logp * w_c).sum()
+                probs.mul_(w_c[:, None])
+                h_y = h_c.to(acc) * w_c[:, None]
             if need_dh:
-                # (softmax - onehot) @ K^T / n = (probs @ K^T - K[:, y]^T) / n
+                # (softmax - onehot) @ K^T / n = (probs @ K^T - K[:, y]^T) / n (rows times their weights)
                 dh_c = probs.to(h.dtype) @ kernel.T
-                dh_c -= kernel.index_select(1, y_c).T
+                k_y = kernel.index_select(1, y_c).T
+                dh_c -= k_y if weights is None else k_y * w_c[:, None].to(k_y.dtype)
                 dh[start:stop] = dh_c.mul_(inv_n)
             if need_dk:
                 # h^T (softmax - onehot) / n: dense part via addmm, one-hot part via index_add
                 dk.addmm_(probs.T, h_c.to(acc), alpha=inv_n)
-                dk.index_add_(0, y_c, h_c.to(acc), alpha=-inv_n)
+                dk.index_add_(0, y_c, h_y, alpha=-inv_n)
             del probs
         ctx.save_for_backward(*(t for t in (dh, dk) if t is not None))
         ctx.has = (need_dh, need_dk)
@@ -79,10 +89,11 @@ class _FusedLinearCrossEntropy(torch.autograd.Function):
         need_dh, need_dk = ctx.has
         dh = saved.pop(0) * grad_output if need_dh else None
         dk = (saved.pop(0).T * grad_output).to(ctx.kernel_dtype).contiguous() if need_dk else None
-        return dh, dk, None, None
+        return dh, dk, None, None, None
 
 
-def fused_linear_cross_entropy(h: Any, kernel: Any, y: Any, chunk_size: int = 2048) -> torch.Tensor:
+def fused_linear_cross_entropy(h: Any, kernel: Any, y: Any, chunk_size: int = 2048,
+                               weights: Any = None) -> torch.Tensor:
     """Mean cross-entropy of `h @ kernel` against `y` without materializing all logits.
 
     Args:
@@ -91,6 +102,8 @@ def fused_linear_cross_entropy(h: Any, kernel: Any, y: Any, chunk_size: int = 20
         y: `(N,)` integer targets (same leading shape as `h`).
         chunk_size: Rows per chunk (2048 was 7% faster than 1024 on the Iris Xe at 65k rows; 2048 to 8192 the same);
             peak extra memory is about `2 * chunk_size * V` floats.
+        weights: Optional `(N,)` per-row weights (constants, no gradient): returns `sum_i w_i nll_i / N`, e.g. a
+            policy-gradient loss with w = the advantage (`model/grpo.py`). None: every weight 1.
     """
     h = torch.as_tensor(h)
     kernel = kernel.value if hasattr(kernel, "value") else torch.as_tensor(kernel)
@@ -101,4 +114,8 @@ def fused_linear_cross_entropy(h: Any, kernel: Any, y: Any, chunk_size: int = 20
         raise ValueError(f"h has {h.shape[0]} rows but y has {y.shape[0]} targets")
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    return _FusedLinearCrossEntropy.apply(h, kernel, y, int(chunk_size))
+    if weights is not None:
+        weights = torch.as_tensor(weights, device=h.device).reshape(-1).detach()
+        if weights.shape[0] != y.shape[0]:
+            raise ValueError(f"{weights.shape[0]} weights for {y.shape[0]} targets")
+    return _FusedLinearCrossEntropy.apply(h, kernel, y, int(chunk_size), weights)

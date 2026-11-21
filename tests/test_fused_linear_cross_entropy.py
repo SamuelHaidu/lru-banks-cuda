@@ -71,6 +71,27 @@ class TestFusedLinearCrossEntropy(unittest.TestCase):
             fused_linear_cross_entropy(h3, self.k, y3, chunk_size=7), _reference(self.h[:36], self.k, self.y[:36])
         )
 
+    def test_weights_match_autograd(self):
+        # signed per-row weights (a policy-gradient loss: w = the advantage), any chunking
+        w = torch.randn(self.n, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+
+        def ref(h, k, y):
+            logits = h @ k
+            return ((torch.logsumexp(logits, -1) - logits.gather(1, y[:, None])[:, 0]) * w).mean()
+
+        want = self._grads(ref)
+        for chunk in (1, 5, 37, 1000):
+            with self.subTest(chunk=chunk):
+                got = self._grads(fused_linear_cross_entropy, chunk_size=chunk, weights=w)
+                for a, b in zip(got, want):
+                    torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-12)
+
+    def test_unit_weights_are_the_plain_loss(self):
+        ones = torch.ones(self.n, dtype=torch.float64)
+        for a, b in zip(self._grads(fused_linear_cross_entropy, chunk_size=8, weights=ones),
+                        self._grads(fused_linear_cross_entropy, chunk_size=8)):
+            torch.testing.assert_close(a, b, rtol=1e-12, atol=1e-14)
+
     def test_rejects_mismatched_rows(self):
         with self.assertRaises(ValueError):
             fused_linear_cross_entropy(self.h, self.k, self.y[:-1])
