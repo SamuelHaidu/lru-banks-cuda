@@ -26,10 +26,33 @@ For another GPU: `cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="86;89"`. A 
 
 ```
 include/lbc/   shared headers: check.hpp (error checks), bench.hpp (timing, L2 flush, result lines)
-tools/         device_info
+tools/         lbc (the trainer), train_bench (benchmark, gradient dumps), device_info, check_epilogue, bench_fp8
 bench/         microbenchmarks, one file per question (added as the search goes)
 scripts/       pod_setup.sh
 ```
+
+## Training
+
+```bash
+build/release/lbc create /workspace/runs/NAME --dataset /root/data/pretrain-mix-bpe32768 [section.key=value ...]
+build/release/lbc config /workspace/runs/NAME [section.key value]     # print, or set one key (validated)
+bash scripts/train.sh /workspace/runs/NAME [--epochs N]                # background; tail -f RUN_DIR/train.log
+```
+
+`config.json` holds every setting:
+- `arch_params`: dim, embed_dim, factorized, tied_embeddings, num_layers, hops (per layer, 1 or 2), lru_dim, num_heads,
+  head_dim (32 or 64), bank_slots (per layer, 2..128), ffn_mult, half-lives, tau, gate biases and budget, window_size;
+- `data`: dataset directory, batch_size, epoch_passes (an epoch = that fraction of a pass in shuffled random windows),
+  seed;
+- `training`: learning_rate, warmup_steps, lr_decay_start / lr_decay_steps / lr_min_ratio, weight_decay, betas,
+  epsilon, global_clipnorm, epochs, validation_steps, checkpoint_every;
+- `runtime`: bank_chunk, ce_chunk, cuda_graph.
+
+Every epoch writes `model.lbc` (latest, the resume point: weights and Adam state), `checkpoints/best.lbc` (lowest
+val_loss), `checkpoints/checkpoint_NNNNN.lbc` (every `checkpoint_every` epochs) and a `metrics.csv` row (the research
+repository's columns first). `lbc train` on an existing run resumes at the next epoch with the exact next batch.
+
+The benchmark and gradient-check protocol is `scripts/check_and_bench.sh` (`tools/train_bench.cu`).
 
 ## Conventions
 
