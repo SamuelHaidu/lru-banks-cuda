@@ -116,7 +116,7 @@ class Model {
     void set_profile(bool on) { profile_ = on; }
 
     // analysis: silence[n] bit 1 / 2 / 4 drops layer n's hop-1 read / hop-2 read / FFN from the stream; per-token loss (rows with a
-    // target: lse - logit[y], else 0); the queries (0: hop 1, 1: hop 2) and read outputs (2: hop 1, 3: hop 2) of
+    // target: lse - logit[y], else 0); the queries (0: hop 1, 1: hop 2), read outputs (2: hop 1, 3: hop 2) and keys (4) of
     // layer n after a forward, [M][H*dh] bf16 (empty if the layer has no such read)
     void set_silence(std::vector<int> mask) { silence_ = std::move(mask); }
     void keep_row_loss();

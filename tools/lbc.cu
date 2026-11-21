@@ -508,6 +508,7 @@ int cmd_dump(int argc, char** argv) {
     const std::string run = argv[0];
     std::string which = "latest", split, out = "/tmp/lbc_inspect", silence;
     int rows = 2;
+    double tau_scale = 1.0, write_bias_add = 0.0;  // inference-time interventions (analysis only)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
@@ -515,6 +516,8 @@ int cmd_dump(int argc, char** argv) {
         else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
         else if (a == "--silence" && i + 1 < argc) silence = argv[++i];
+        else if (a == "--tau-scale" && i + 1 < argc) tau_scale = std::atof(argv[++i]);
+        else if (a == "--write-bias-add" && i + 1 < argc) write_bias_add = std::atof(argv[++i]);
         else usage();
     }
     const std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
@@ -529,6 +532,21 @@ int cmd_dump(int argc, char** argv) {
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     if (!silence.empty()) model.set_silence(parse_silence(silence, c.L));
+    if (tau_scale != 1.0 || write_bias_add != 0.0) {  // edit the loaded parameters: read temperatures, write-gate biases
+        std::vector<float> P(model.num_params());
+        LBC_CUDA(cudaMemcpy(P.data(), model.params(), P.size() * 4, cudaMemcpyDeviceToHost));
+        for (const auto& t : model.tensors()) {
+            const bool tau = t.name.find("log_tau") != std::string::npos, bias = t.name.size() > 4 &&
+                             t.name.compare(t.name.size() - 4, 4, "_bwg") == 0;
+            for (size_t i = 0; i < size_t(t.rows) * t.cols; ++i) {
+                if (tau) P[t.off + i] += float(std::log(tau_scale));
+                if (bias) P[t.off + i] += float(write_bias_add);
+            }
+        }
+        LBC_CUDA(cudaMemcpy(model.params(), P.data(), P.size() * 4, cudaMemcpyHostToDevice));
+        model.prepare_weights(s);
+        std::printf("intervention: read temperatures x%.2f, write-gate biases %+.1f\n", tau_scale, write_bias_add);
+    }
     model.keep_row_loss();
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
@@ -587,8 +605,8 @@ int cmd_dump(int argc, char** argv) {
         bin(pfx + "gw.bin", gw.data(), gw.size());
         bin(pfx + "gr.bin", gr.data(), gr.size());
         bin(pfx + "gr2.bin", gr2.data(), gr2.size());
-        const char* names[4] = {"q1", "q2", "o1", "o2"};
-        for (int w = 0; w < 4; ++w) {
+        const char* names[5] = {"q1", "q2", "o1", "o2", "k"};
+        for (int w = 0; w < 5; ++w) {
             const std::vector<bf16> x = model.download_read(l, w, s);
             if (!x.empty()) bin(pfx + names[w] + ".bf16", x.data(), x.size() * sizeof(bf16));
         }

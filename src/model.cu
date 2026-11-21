@@ -548,7 +548,7 @@ std::vector<float> Model::row_loss(cudaStream_t s) {
 
 std::vector<bf16> Model::download_read(int n, int which, cudaStream_t s) {
     const LayerA& a = la_[size_t(n)];
-    const bf16* p = which == 0 ? a.q : which == 1 ? a.q2 : which == 2 ? a.o1 : a.o2;
+    const bf16* p = which == 0 ? a.q : which == 1 ? a.q2 : which == 2 ? a.o1 : which == 3 ? a.o2 : a.k;
     std::vector<bf16> out;
     if (!p) return out;
     out.resize(size_t(c_.M()) * c_.HD());
