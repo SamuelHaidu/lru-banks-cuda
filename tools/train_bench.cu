@@ -114,7 +114,7 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
     {
         std::ofstream f(dir + "/config.txt");
         f << "V " << c.V << "\nE0 " << c.E0 << "\nD " << c.D << "\nL " << c.L << "\nN " << c.N << "\nH " << c.H
-          << "\nF " << c.F << "\nB " << c.B << "\nT " << c.T << "\nDH " << DH << "\nSLOTS " << SLOTS << "\nldPV "
+          << "\nF " << c.F << "\nB " << c.B << "\nT " << c.T << "\nDH " << c.dh << "\nSLOTS " << SLOTS << "\nldPV "
           << c.ldPV() << "\nldG " << c.ldG() << "\nldG2 " << c.ldG2() << "\ntau " << c.tau << "\nslot_hl_min "
           << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max << "\nbudget " << c.budget << "\nbudget_target "
           << c.budget_target << "\nfactorized " << int(c.factorized) << "\ntied " << int(c.tied) << "\nhops ";
@@ -163,7 +163,10 @@ int main(int argc, char** argv) {
     rc.training.warmup_steps = 0;
     rc.runtime.ce_chunk = a.ce_chunk;
     rc.runtime.bank_chunk = a.bank_chunk;
-    if (a.tiny) {  // small widths for the gradient check (DH and SLOTS are fixed by the kernels)
+    // the benchmark protocol's model: 16 heads x 32 (the config default is 8 x 64)
+    rc.arch.num_heads = 16;
+    rc.arch.head_dim = 32;
+    if (a.tiny) {  // small widths for the gradient check (SLOTS is fixed by the kernels)
         rc.arch.embed_dim = 32;
         rc.arch.dim = 64;
         rc.arch.lru_dim = 32;
@@ -203,7 +206,7 @@ int main(int argc, char** argv) {
     std::printf("model: %zu params, %d layers (hops", model.num_params(), c.L);
     for (int l = 0; l < c.L; ++l) std::printf("%s%d", l ? "," : " ", c.hops_of(l));
     std::printf("), D %d, LRU %d complex, %d heads x %d, %d slots, FFN %d, vocab %d x %d (%s, %s)\n", c.D, c.N, c.H,
-                DH, SLOTS, c.F, c.V, c.E0, c.factorized ? "factorized" : "not factorized",
+                c.dh, SLOTS, c.F, c.V, c.E0, c.factorized ? "factorized" : "not factorized",
                 c.tied ? "tied" : "untied");
     std::printf("batch %d x %d = %zu tokens per step; gate biases write %.2f read %.2f; %zu tokens on disk\n", c.B,
                 c.T, ntok, c.gate_bias_w, c.gate_bias_r, file.size());
@@ -340,7 +343,7 @@ int main(int argc, char** argv) {
             std::printf(" %s %.3g", norms[i].second.c_str(), norms[i].first);
         std::printf("\n");
         // W_s's columns: [key (H*DH) | query (H*DH) | read gate (H) | write gate (H)]
-        const int HD = c.H * DH;
+        const int HD = c.H * c.dh;
         const int groups[5] = {0, HD, 2 * HD, 2 * HD + c.H, 2 * HD + 2 * c.H};
         const char* gname[4] = {"key", "query", "read gate", "write gate"};
         for (const auto& t : model.tensors()) {

@@ -60,7 +60,7 @@ __device__ __forceinline__ float reduce_scatter32(float (&u)[32], int lane) {
 }
 
 // 32 bf16 (64-byte aligned) -> floats
-__device__ __forceinline__ void load32(const bf16* p, float (&x)[DH]) {
+__device__ __forceinline__ void load32(const bf16* p, float (&x)[32]) {
     const uint4* q = reinterpret_cast<const uint4*>(p);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -75,7 +75,7 @@ __device__ __forceinline__ void load32(const bf16* p, float (&x)[DH]) {
 }
 
 // 32 floats (128-byte aligned)
-__device__ __forceinline__ void load32(const float* p, float (&x)[DH]) {
+__device__ __forceinline__ void load32(const float* p, float (&x)[32]) {
     const float4* q = reinterpret_cast<const float4*>(p);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -88,7 +88,7 @@ __device__ __forceinline__ void load32(const float* p, float (&x)[DH]) {
 }
 
 // scale * x as 32 bf16 (64-byte aligned)
-__device__ __forceinline__ void store32(bf16* p, const float (&x)[DH], float scale) {
+__device__ __forceinline__ void store32(bf16* p, const float* x, float scale) {
     uint4* q = reinterpret_cast<uint4*>(p);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -111,24 +111,71 @@ __device__ __forceinline__ Info unpack(uint2 w) {
     return Info{int(w.x & 0xffu), int((w.x >> 8) & 0xffu), int((w.x >> 16) & 0xffu), __uint_as_float(w.y)};
 }
 
+// Head sizes DH = 32 or 64 (templates): a slot's state is DH-wide per thread; per-lane vectors (loads, the
+// reduce-scatter, outputs) go in chunks of 32, lane l holding components l + 32 c, so temporaries stay 32 wide.
+template <int DH>
+constexpr int ckpt_fields_t() { return 2 * DH + 2; }
+
 // the write of token t into this thread's slot with weight r: running averages of the decayed writes
+template <int DH>
 __device__ __forceinline__ void write_slot(float (&Kb)[DH], float (&Vb)[DH], float& Zs, int& tm, float la, int t,
                                            float r, const bf16* k, const bf16* v) {
-    float kk[DH], vv[DH];
-    load32(k, kk);
-    load32(v, vv);
     const float zn = Zs * __expf(la * float(t - tm)) + r;
     const float c = r / zn;
 #pragma unroll
-    for (int d = 0; d < DH; ++d) {
-        Kb[d] += c * (kk[d] - Kb[d]);
-        Vb[d] += c * (vv[d] - Vb[d]);
+    for (int ch = 0; ch < DH / 32; ++ch) {
+        float x[32];
+        load32(k + 32 * ch, x);
+#pragma unroll
+        for (int d = 0; d < 32; ++d) Kb[32 * ch + d] += c * (x[d] - Kb[32 * ch + d]);
+        load32(v + 32 * ch, x);
+#pragma unroll
+        for (int d = 0; d < 32; ++d) Vb[32 * ch + d] += c * (x[d] - Vb[32 * ch + d]);
     }
     Zs = zn;
     tm = t;
 }
 
+// x . y over DH, x loaded from p (bf16 or float) 32 at a time
+template <int DH, class P>
+__device__ __forceinline__ float dot_load(const P* p, const float (&y)[DH]) {
+    float s = 0.f;
+#pragma unroll
+    for (int ch = 0; ch < DH / 32; ++ch) {
+        float x[32];
+        load32(p + 32 * ch, x);
+#pragma unroll
+        for (int d = 0; d < 32; ++d) s += x[d] * y[32 * ch + d];
+    }
+    return s;
+}
+
+// y += a * x over DH, x loaded from p
+template <int DH, class P>
+__device__ __forceinline__ void axpy_load(const P* p, float a, float (&y)[DH]) {
+#pragma unroll
+    for (int ch = 0; ch < DH / 32; ++ch) {
+        float x[32];
+        load32(p + 32 * ch, x);
+#pragma unroll
+        for (int d = 0; d < 32; ++d) y[32 * ch + d] += a * x[d];
+    }
+}
+
+// the warp sum of s * y (DH-wide): lane l gets components l + 32 c in out[c]
+template <int DH>
+__device__ __forceinline__ void warp_scatter(const float (&y)[DH], float s, int lane, float (&out)[DH / 32]) {
+#pragma unroll
+    for (int ch = 0; ch < DH / 32; ++ch) {
+        float u[32];
+#pragma unroll
+        for (int d = 0; d < 32; ++d) u[d] = s * y[32 * ch + d];
+        out[ch] = reduce_scatter32(u, lane);
+    }
+}
+
 // a slot state <-> a checkpoint record (field-major: consecutive slots are consecutive floats)
+template <int DH>
 __device__ __forceinline__ void ckpt_store(float* base, int m, const float (&A)[DH], const float (&Bv)[DH], float z,
                                            float extra) {
 #pragma unroll
@@ -140,6 +187,7 @@ __device__ __forceinline__ void ckpt_store(float* base, int m, const float (&A)[
     base[(2 * DH + 1) * SLOTS + m] = extra;
 }
 
+template <int DH>
 __device__ __forceinline__ void ckpt_load(const float* base, int m, float (&A)[DH], float (&Bv)[DH], float& z,
                                           float& extra) {
 #pragma unroll
@@ -151,11 +199,13 @@ __device__ __forceinline__ void ckpt_load(const float* base, int m, float (&A)[D
     extra = base[(2 * DH + 1) * SLOTS + m];
 }
 
+template <int DH>
 __device__ __forceinline__ size_t ckpt_offset(int b, int h, int c, int H, int nc) {
-    return ((size_t(b) * H + h) * nc + c) * CKPT_FIELDS * SLOTS;
+    return ((size_t(b) * H + h) * nc + c) * ckpt_fields_t<DH>() * SLOTS;
 }
 
 // the state update of token t (reset, then the write when this thread's slot is routed and the write gate open)
+template <int DH>
 __device__ __forceinline__ void step_state(float (&Kb)[DH], float (&Vb)[DH], float& Zs, int& tm, float la, int t,
                                            int m, const Info& si, const BankWrites& w, size_t r, int h) {
     if (si.flags & 4) Zs = 0.f;
@@ -165,6 +215,7 @@ __device__ __forceinline__ void step_state(float (&Kb)[DH], float (&Vb)[DH], flo
 }
 
 // the state at the start of chunk c (zero for the first chunk)
+template <int DH>
 __device__ __forceinline__ void chunk_start(const BankWrites& w, int b, int h, int c, int m, float (&Kb)[DH],
                                             float (&Vb)[DH], float& Zs, int& tm) {
     if (c == 0) {
@@ -174,7 +225,7 @@ __device__ __forceinline__ void chunk_start(const BankWrites& w, int b, int h, i
         tm = 0;
     } else {
         float tmf;
-        ckpt_load(w.ckpt + ckpt_offset(b, h, c, w.H, bank_chunks(w)), m, Kb, Vb, Zs, tmf);
+        ckpt_load(w.ckpt + ckpt_offset<DH>(b, h, c, w.H, bank_chunks(w)), m, Kb, Vb, Zs, tmf);
         tm = __float_as_int(tmf);
     }
 }
@@ -183,6 +234,7 @@ __device__ __forceinline__ void chunk_start(const BankWrites& w, int b, int h, i
 // with a flag when a reset occurs in it. Merge: per slot, from the first chunk on, state(c + 1) = merge(state(c),
 // local(c)); mass-weighted averages compose exactly: the earlier mass decayed to the later last write time, then the
 // mass-weighted mean of the averages; a reset in chunk c discards state(c).
+template <int DH>
 __global__ void __launch_bounds__(SLOTS) k_bank_ckpt_local(BankWrites w, float* local, int* rflags) {
     const int b = blockIdx.x, h = blockIdx.y, c = blockIdx.z, m = threadIdx.x;
     const int T = w.T, H = w.H, nc = bank_chunks(w), t0 = c * w.chunk, t1 = min(T, t0 + w.chunk);
@@ -201,10 +253,11 @@ __global__ void __launch_bounds__(SLOTS) k_bank_ckpt_local(BankWrites w, float* 
         reset |= (si.flags & 4) != 0;
         step_state(Kb, Vb, Zs, tm, la, t, m, si, w, base + t, h);
     }
-    ckpt_store(local + ckpt_offset(b, h, c, H, nc), m, Kb, Vb, Zs, __int_as_float(tm));
+    ckpt_store(local + ckpt_offset<DH>(b, h, c, H, nc), m, Kb, Vb, Zs, __int_as_float(tm));
     if (m == 0) rflags[(size_t(b) * H + h) * nc + c] = reset;
 }
 
+template <int DH>
 __global__ void __launch_bounds__(SLOTS) k_bank_ckpt_merge(BankWrites w, const float* local, const int* rflags,
                                                           float* ckpt) {
     const int b = blockIdx.x, h = blockIdx.y, m = threadIdx.x;
@@ -216,7 +269,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_ckpt_merge(BankWrites w, const f
     for (int d = 0; d < DH; ++d) Kb[d] = Vb[d] = 0.f;
     for (int c = 0; c + 1 < nc; ++c) {
         float LK[DH], LV[DH], LZ, ltmf;
-        ckpt_load(local + ckpt_offset(b, h, c, H, nc), m, LK, LV, LZ, ltmf);
+        ckpt_load(local + ckpt_offset<DH>(b, h, c, H, nc), m, LK, LV, LZ, ltmf);
         const int ltm = __float_as_int(ltmf);
         if (rflags[(size_t(b) * H + h) * nc + c]) {  // state(c + 1) = local(c)
 #pragma unroll
@@ -238,10 +291,11 @@ __global__ void __launch_bounds__(SLOTS) k_bank_ckpt_merge(BankWrites w, const f
             Zs = zn;
             tm = ltm;
         }
-        ckpt_store(ckpt + ckpt_offset(b, h, c + 1, H, nc), m, Kb, Vb, Zs, __int_as_float(tm));
+        ckpt_store(ckpt + ckpt_offset<DH>(b, h, c + 1, H, nc), m, Kb, Vb, Zs, __int_as_float(tm));
     }
 }
 
+template <int DH>
 __global__ void __launch_bounds__(SLOTS) k_bank_fwd(BankWrites w, BankRead rd) {
     const int b = blockIdx.x, h = blockIdx.y, m = threadIdx.x, lane = m & 31, warp = m >> 5;
     const int T = w.T, H = w.H, t0 = blockIdx.z * w.chunk, t1 = min(T, t0 + w.chunk);
@@ -264,51 +318,50 @@ __global__ void __launch_bounds__(SLOTS) k_bank_fwd(BankWrites w, BankRead rd) {
         if (si.flags & rd.gate_bit) {
             const bool valid = Zs * __expf(la * float(t - tm)) > BANK_EPS;
             float sc = -INFINITY;
-            if (valid) {
-                float q[DH];
-                load32(rd.q + rh * DH, q);
-                float dot = 0.f;
-#pragma unroll
-                for (int d = 0; d < DH; ++d) dot += q[d] * Kb[d];
-                sc = tau * dot;
-            }
+            if (valid) sc = tau * dot_load<DH>(rd.q + rh * DH, Kb);
             const float wmax = warp_max(sc);
             const float e = valid ? __expf(sc - wmax) : 0.f;
             const float wsum = warp_sum(e);
-            float u[DH];
-#pragma unroll
-            for (int d = 0; d < DH; ++d) u[d] = e * Vb[d];
-            const float od = reduce_scatter32(u, lane);
+            float od[DH / 32];
+            warp_scatter<DH>(Vb, e, lane, od);
             const int buf = nopen++ & 1;
             if (lane == 0) {
                 s_wm[buf][warp] = wmax;
                 s_ws[buf][warp] = wsum;
             }
-            s_wo[buf][warp][lane] = od;
+#pragma unroll
+            for (int c = 0; c < DH / 32; ++c) s_wo[buf][warp][lane + 32 * c] = od[c];
             __syncthreads();
             if (warp == 0) {
                 float M = -INFINITY;
 #pragma unroll
                 for (int i = 0; i < NWARP; ++i) M = fmaxf(M, s_wm[buf][i]);
-                float o = 0.f;
+                float o[DH / 32];
+#pragma unroll
+                for (int c = 0; c < DH / 32; ++c) o[c] = 0.f;
                 if (M > -INFINITY) {
-                    float S = 0.f, acc = 0.f;
+                    float S = 0.f;
 #pragma unroll
                     for (int i = 0; i < NWARP; ++i) {
                         const float f = s_wm[buf][i] > -INFINITY ? __expf(s_wm[buf][i] - M) : 0.f;
                         S += s_ws[buf][i] * f;
-                        acc += s_wo[buf][i][lane] * f;
+#pragma unroll
+                        for (int c = 0; c < DH / 32; ++c) o[c] += s_wo[buf][i][lane + 32 * c] * f;
                     }
-                    o = acc / S;
+#pragma unroll
+                    for (int c = 0; c < DH / 32; ++c) o[c] /= S;
                 }
-                out[lane] = __float2bfloat16(o);
+#pragma unroll
+                for (int c = 0; c < DH / 32; ++c) out[lane + 32 * c] = __float2bfloat16(o[c]);
             }
         } else if (warp == 0) {
-            out[lane] = __float2bfloat16(0.f);
+#pragma unroll
+            for (int c = 0; c < DH / 32; ++c) out[lane + 32 * c] = __float2bfloat16(0.f);
         }
     }
 }
 
+template <int DH>
 __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd) {
     const int b = blockIdx.x, h = blockIdx.y, m = threadIdx.x, lane = m & 31, warp = m >> 5;
     const int T = w.T, H = w.H, t0 = blockIdx.z * w.chunk, t1 = min(T, t0 + w.chunk);
@@ -327,10 +380,13 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
     int pending_buf = -1;
     auto flush_dq = [&]() {
         if (warp == 0 && pending_buf >= 0) {
-            float dq = 0.f;
 #pragma unroll
-            for (int i = 0; i < NWARP; ++i) dq += s_dq[pending_buf][i][lane];
-            rd.dq[pending_rh * DH + lane] = dq;
+            for (int c = 0; c < DH / 32; ++c) {
+                float dq = 0.f;
+#pragma unroll
+                for (int i = 0; i < NWARP; ++i) dq += s_dq[pending_buf][i][lane + 32 * c];
+                rd.dq[pending_rh * DH + lane + 32 * c] = dq;
+            }
         }
         pending_buf = -1;
     };
@@ -346,17 +402,8 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
             const bool valid = Zt > BANK_EPS;
             float sc = -INFINITY, dp = 0.f;
             if (valid) {
-                float x[DH];
-                load32(rd.q + rh * DH, x);
-                float dot = 0.f;
-#pragma unroll
-                for (int d = 0; d < DH; ++d) dot += x[d] * Kb[d];
-                sc = tau * dot;
-                load32(rd.dy + r * H * DH + h * DH, x);
-                float dyv = 0.f;
-#pragma unroll
-                for (int d = 0; d < DH; ++d) dyv += x[d] * Vb[d];
-                dp = dyv;  // dy . (the read's value on slot m) = dy . Vb_m
+                sc = tau * dot_load<DH>(rd.q + rh * DH, Kb);
+                dp = dot_load<DH>(rd.dy + r * H * DH + h * DH, Vb);  // dy . (the read's value on slot m) = dy . Vb_m
             }
             const float wmax = warp_max(sc);
             const float e = valid ? __expf(sc - wmax) : 0.f;
@@ -392,10 +439,10 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
                 gamma = -(ds * sc + p * dp) / Zt;
                 dtau += ds * sc / tau;
             }
-            float u[DH];
+            float dqw[DH / 32];
+            warp_scatter<DH>(Kb, tds, lane, dqw);  // dq = tau sum_m ds_m Kb_m
 #pragma unroll
-            for (int d = 0; d < DH; ++d) u[d] = tds * Kb[d];
-            s_dq[buf][warp][lane] = reduce_scatter32(u, lane);  // dq = tau sum_m ds_m Kb_m
+            for (int c = 0; c < DH / 32; ++c) s_dq[buf][warp][lane + 32 * c] = dqw[c];
             pending_rh = rh;
             pending_buf = buf;
             rd.coef[rh * SLOTS + m] = __float2bfloat16(alpha);
@@ -403,7 +450,9 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
             rd.coef[2 * plane + rh * SLOTS + m] = __float2bfloat16(gamma);
             if (m == 0) rd.dg[rh] = sdp;
         } else {
-            if (warp == 0) rd.dq[rh * DH + lane] = 0.f;
+            if (warp == 0)
+#pragma unroll
+                for (int c = 0; c < DH / 32; ++c) rd.dq[rh * DH + lane + 32 * c] = 0.f;
             if (m == 0) rd.dg[rh] = 0.f;
         }
     }
@@ -422,7 +471,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
 // LOCAL: the chunk's own contribution, from a zero adjoint at its end; stores the adjoint at the chunk start (after
 // that token's local terms) in a.carry and whether a reset lies inside the chunk in a.flags. Otherwise: the full
 // walk of the chunk from the incoming adjoint (a.carry, written by the combine), writing the write gradients.
-template <bool LOCAL>
+template <int DH, bool LOCAL>
 __global__ void __launch_bounds__(SLOTS) k_bank_adjoint(BankWrites w, BankAdjoint a) {
     const int b = blockIdx.x, h = blockIdx.y, c = blockIdx.z, m = threadIdx.x;
     const int T = w.T, H = w.H, nc = bank_chunks(w), t0 = c * w.chunk, t1 = min(T, t0 + w.chunk);
@@ -435,7 +484,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint(BankWrites w, BankAdjoin
     const size_t base = size_t(b) * T;
     if (!LOCAL && t1 < T && !(w.info[(base + t1) * H + h].x & (4u << 16))) {
         float unused;  // the adjoint of the state at t1 (the next chunk's start); t1 - 1 gets a times it
-        ckpt_load(a.carry + ckpt_offset(b, h, c, H, nc), m, LK, LV, LZ, unused);
+        ckpt_load(a.carry + ckpt_offset<DH>(b, h, c, H, nc), m, LK, LV, LZ, unused);
         tl = t1;
     }
     bool reset_inside = false;
@@ -464,30 +513,21 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint(BankWrites w, BankAdjoin
                 const float alpha = __bfloat162float(cf[rh * SLOTS + m]),
                             beta = __bfloat162float(cf[plane + rh * SLOTS + m]),
                             gamma = __bfloat162float(cf[2 * plane + rh * SLOTS + m]);
-                float x[DH];
-                load32(a.q[hop] + rh * DH, x);
-#pragma unroll
-                for (int d = 0; d < DH; ++d) LK[d] += alpha * x[d];
-                load32(a.dy[hop] + r * H * DH + h * DH, x);
-#pragma unroll
-                for (int d = 0; d < DH; ++d) LV[d] += beta * x[d];
+                axpy_load<DH>(a.q[hop] + rh * DH, alpha, LK);
+                axpy_load<DH>(a.dy[hop] + r * H * DH + h * DH, beta, LV);
                 LZ += gamma;
             }
             if (!LOCAL && routed) {  // K_m += r_m k, V_m += r_m v, Z_m += r_m
                 const int slot = m == si.m1 ? 0 : 1;
-                float x[DH];
-                load32(w.k + rh * DH, x);
-                float dr = LZ;
-#pragma unroll
-                for (int d = 0; d < DH; ++d) dr += x[d] * LK[d];
-                load32(w.v + r * w.ldv + h * DH, x);
-#pragma unroll
-                for (int d = 0; d < DH; ++d) dr += x[d] * LV[d];
+                const float dr = LZ + dot_load<DH>(w.k + rh * DH, LK) + dot_load<DH>(w.v + r * w.ldv + h * DH, LV);
                 a.dr2[rh * 2 + slot] = dr;
                 if (si.flags & 1) {
                     const float rw = slot == 0 ? si.p1 : 1.f - si.p1;
-                    store32(a.dk2 + (rh * 2 + slot) * DH, LK, rw);
-                    store32(a.dv2 + (rh * 2 + slot) * DH, LV, rw);
+#pragma unroll
+                    for (int c = 0; c < DH / 32; ++c) {
+                        store32(a.dk2 + (rh * 2 + slot) * DH + 32 * c, LK + 32 * c, rw);
+                        store32(a.dv2 + (rh * 2 + slot) * DH + 32 * c, LV + 32 * c, rw);
+                    }
                 }
             }
         }
@@ -508,13 +548,14 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint(BankWrites w, BankAdjoin
             }
             LZ *= f;
         }
-        ckpt_store(a.carry + ckpt_offset(b, h, c, H, nc), m, LK, LV, LZ, 0.f);
+        ckpt_store(a.carry + ckpt_offset<DH>(b, h, c, H, nc), m, LK, LV, LZ, 0.f);
         if (m == 0) a.flags[(size_t(b) * H + h) * nc + c] = reset_inside;
     }
 }
 
 // Per slot, from the last chunk back: E_c (the adjoint at chunk c's start) = L_c + a^(t1 - t0) E_{c+1} unless a reset
 // lies in (t0, t1]; the chunk's final pass needs E_{c+1}, written over L_c.
+template <int DH>
 __global__ void __launch_bounds__(SLOTS) k_bank_adjoint_combine(BankWrites w, BankAdjoint a) {
     const int b = blockIdx.x, h = blockIdx.y, m = threadIdx.x;
     const int T = w.T, H = w.H, nc = bank_chunks(w);
@@ -524,7 +565,7 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint_combine(BankWrites w, Ba
     for (int d = 0; d < DH; ++d) EK[d] = EV[d] = 0.f;
     for (int c = nc - 1; c >= 0; --c) {
         const int t0 = c * w.chunk, t1 = min(T, t0 + w.chunk);
-        float* rec = a.carry + ckpt_offset(b, h, c, H, nc);
+        float* rec = a.carry + ckpt_offset<DH>(b, h, c, H, nc);
         float LK[DH], LV[DH], LZ, unused;
         ckpt_load(rec, m, LK, LV, LZ, unused);
         ckpt_store(rec, m, EK, EV, EZ, 0.f);
@@ -542,33 +583,61 @@ __global__ void __launch_bounds__(SLOTS) k_bank_adjoint_combine(BankWrites w, Ba
 
 }  // namespace
 
-void bank_checkpoint(const BankWrites& w, float* ckpt, float* local, int* rflags, cudaStream_t s) {
-    k_bank_ckpt_local<<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, local, rflags);
+namespace {
+
+template <int DH>
+void checkpoint_t(const BankWrites& w, float* ckpt, float* local, int* rflags, cudaStream_t s) {
+    k_bank_ckpt_local<DH><<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, local, rflags);
     LBC_CUDA(cudaGetLastError());
-    k_bank_ckpt_merge<<<dim3(w.B, w.H), SLOTS, 0, s>>>(w, local, rflags, ckpt);
+    k_bank_ckpt_merge<DH><<<dim3(w.B, w.H), SLOTS, 0, s>>>(w, local, rflags, ckpt);
     LBC_CUDA(cudaGetLastError());
 }
 
+template <int DH>
+void adjoint_t(const BankWrites& w, const BankAdjoint& a, cudaStream_t s) {
+    const dim3 grid(w.B, w.H, bank_chunks(w));
+    if (bank_chunks(w) > 1) {
+        k_bank_adjoint<DH, true><<<grid, SLOTS, 0, s>>>(w, a);
+        LBC_CUDA(cudaGetLastError());
+        k_bank_adjoint_combine<DH><<<dim3(w.B, w.H), SLOTS, 0, s>>>(w, a);
+        LBC_CUDA(cudaGetLastError());
+    }
+    k_bank_adjoint<DH, false><<<grid, SLOTS, 0, s>>>(w, a);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void check_dh(int dh) {
+    if (dh != 32 && dh != 64) fail("bank", "head size must be 32 or 64", __FILE__, __LINE__);
+}
+
+}  // namespace
+
+void bank_checkpoint(const BankWrites& w, float* ckpt, float* local, int* rflags, cudaStream_t s) {
+    check_dh(w.dh);
+    w.dh == 64 ? checkpoint_t<64>(w, ckpt, local, rflags, s) : checkpoint_t<32>(w, ckpt, local, rflags, s);
+}
+
 void bank_fwd(const BankWrites& w, const BankRead& r, cudaStream_t s) {
-    k_bank_fwd<<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
+    check_dh(w.dh);
+    if (w.dh == 64)
+        k_bank_fwd<64><<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
+    else
+        k_bank_fwd<32><<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
     LBC_CUDA(cudaGetLastError());
 }
 
 void bank_rewalk(const BankWrites& w, const BankRead& r, cudaStream_t s) {
-    k_bank_rewalk<<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
+    check_dh(w.dh);
+    if (w.dh == 64)
+        k_bank_rewalk<64><<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
+    else
+        k_bank_rewalk<32><<<dim3(w.B, w.H, bank_chunks(w)), SLOTS, 0, s>>>(w, r);
     LBC_CUDA(cudaGetLastError());
 }
 
 void bank_adjoint(const BankWrites& w, const BankAdjoint& a, cudaStream_t s) {
-    const dim3 grid(w.B, w.H, bank_chunks(w));
-    if (bank_chunks(w) > 1) {
-        k_bank_adjoint<true><<<grid, SLOTS, 0, s>>>(w, a);
-        LBC_CUDA(cudaGetLastError());
-        k_bank_adjoint_combine<<<dim3(w.B, w.H), SLOTS, 0, s>>>(w, a);
-        LBC_CUDA(cudaGetLastError());
-    }
-    k_bank_adjoint<false><<<grid, SLOTS, 0, s>>>(w, a);
-    LBC_CUDA(cudaGetLastError());
+    check_dh(w.dh);
+    w.dh == 64 ? adjoint_t<64>(w, a, s) : adjoint_t<32>(w, a, s);
 }
 
 }  // namespace lbc

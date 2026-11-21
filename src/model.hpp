@@ -34,6 +34,7 @@ namespace lbc {
 
 struct Config {
     int V = 32768, E0 = 128, D = 512, L = 4, N = 256, H = 16, F = 2048;
+    int dh = 32;             // bank head size (keys and values): 32 or 64
     bool factorized = true;  // false: E is V x D (E0 = D), no W_in / W_out
     bool tied = true;        // false: the readout has its own table E_out (V x E0)
     std::vector<int> hops;   // per layer, 1 or 2 (empty: 2 everywhere)
@@ -51,12 +52,12 @@ struct Config {
     int M() const { return B * T; }
     int hops_of(int n) const { return hops.empty() ? 2 : hops[size_t(n)]; }
     int slots_of(int n) const { return slots.empty() ? SLOTS : slots[size_t(n)]; }
-    int HD() const { return H * DH; }
+    int HD() const { return H * dh; }
     int S2() const { return 2 * N; }
-    int ldPV() const { return 2 * N + H * DH; }
+    int ldPV() const { return 2 * N + H * dh; }
     // GEMM output strides rounded up to 8 columns (16-byte rows in bf16); the padding columns stay 0
-    int ldG() const { return (2 * H * DH + 2 * H + 7) / 8 * 8; }
-    int ldG2() const { return (H * DH + H + 7) / 8 * 8; }
+    int ldG() const { return (2 * H * dh + 2 * H + 7) / 8 * 8; }
+    int ldG2() const { return (H * dh + H + 7) / 8 * 8; }
 };
 
 struct Tensor {

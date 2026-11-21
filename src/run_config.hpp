@@ -25,7 +25,7 @@ struct ArchCfg {
     int num_layers = 4;
     std::vector<int> hops = {2, 2, 2, 2};  // per layer: 1 (read, FFN) or 2 (read, FFN, second read)
     int lru_dim = 256;           // complex channels (state 2 x lru_dim)
-    int num_heads = 16;
+    int num_heads = 8;           // bank heads of head_dim (keys and values): 8 x 64 = 512 wide
     double ffn_mult = 4.0;       // FFN width = ffn_mult x dim
     std::vector<double> lru_half_life = {1.0, 16.0};     // LRU decays at init, log-spaced
     std::vector<double> slot_half_life = {1.0, 1024.0};  // fixed slot decays, log-spaced
@@ -39,7 +39,8 @@ struct ArchCfg {
     int window_size = 512;
     std::vector<int> bank_slots;  // per layer bank size, 2..128 (the kernels' maximum); [] = 128 everywhere. Fewer
                                   // slots change the model, not the step time (the walks still run 128 threads)
-    int head_dim = DH, topk = 2;  // fixed by the kernels (any other value is rejected)
+    int head_dim = 64;            // 32 or 64 (the kernels are compiled for both)
+    int topk = 2;                 // fixed by the kernels (any other value is rejected)
 };
 
 struct DataCfg {

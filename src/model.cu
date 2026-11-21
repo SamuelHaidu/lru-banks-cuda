@@ -28,6 +28,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     const int D = c.D, HD = c.HD(), S2 = c.S2(), H = c.H, F = c.F, E0 = c.E0, V = c.V, M = c.M();
     if (int(c.hops.size()) != 0 && int(c.hops.size()) != c.L) fail("Model", "hops needs one entry per layer", __FILE__, __LINE__);
     if (!c.slots.empty() && int(c.slots.size()) != c.L) fail("Model", "slots needs one entry per layer", __FILE__, __LINE__);
+    if (c.dh != 32 && c.dh != 64) fail("Model", "the head size must be 32 or 64", __FILE__, __LINE__);
     if (!c.factorized && E0 != D) fail("Model", "an unfactorized embedding is D wide (E0 = D)", __FILE__, __LINE__);
     E_ = add("E", V, E0, true);
     if (!c.tied) E_out_ = add("E_out", V, E0, true);
@@ -46,7 +47,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         x.bk = add(l + "bk", 1, HD, false);
         x.brg = add(l + "brg", 1, H, false);
         x.bwg = add(l + "bwg", 1, H, false);
-        x.R = add(l + "R", H, DH * SLOTS, false);
+        x.R = add(l + "R", H, c.dh * SLOTS, false);
         x.ltau = add(l + "log_tau", 1, H, false);
         if (two) x.ltau2 = add(l + "log_tau2", 1, H, false);
         x.Wo = add(l + "Wo", HD, D, true);
@@ -79,7 +80,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     }
     loga_ = alloc<float>(size_t(c.L) * H * SLOTS);  // per layer: its bank size sets the half-life spacing
     const int nchunks = (c.T + c.bank_chunk - 1) / c.bank_chunk;
-    const size_t ckpt_floats = size_t(c.B) * H * nchunks * CKPT_FIELDS * SLOTS;
+    const size_t ckpt_floats = size_t(c.B) * H * nchunks * ckpt_fields(c.dh) * SLOTS;
     bool any_two = false;
     for (int n = 0; n < c.L; ++n) {
         const bool two = c.hops_of(n) == 2;
@@ -224,7 +225,7 @@ void Model::init(uint64_t seed) {
         fill(x.bk, 0.f);
         fill(x.brg, c_.gate_bias_r);
         fill(x.bwg, c_.gate_bias_w);
-        normal(x.R, 1.f / std::sqrt(float(DH)));
+        normal(x.R, 1.f / std::sqrt(float(c_.dh)));
         const bool two = c_.hops_of(n) == 2;  // (the draws keep the order of the all-2-hop model)
         fill(x.ltau, std::log(c_.tau));
         if (two) fill(x.ltau2, std::log(c_.tau));
@@ -327,7 +328,7 @@ BankWrites Model::writes(int n, const Batch& b) {
     const LayerA& a = la_[n];
     (void)b;
     return BankWrites{a.k,  a.PV + c_.S2(), c_.ldPV(), a.info, loga_ + size_t(n) * c_.H * SLOTS, c_.B, c_.T, c_.H,
-                      c_.bank_chunk, a.ckpt};
+                      c_.bank_chunk, a.ckpt, c_.dh};
 }
 
 void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
@@ -347,7 +348,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::BF16);
     tic(s, "addr_fwd");
     addr_fwd(AddrFwd{Gt_, c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q, a.kn, a.qn, a.ridx, a.rp1,
-                     a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H, c_.slots_of(n)},
+                     a.gw, a.gr, a.aw, a.ar, st, a.info, M, c_.T, H, c_.dh, c_.slots_of(n)},
              s);
     toc(s);
     const BankWrites bw = writes(n, b);
@@ -373,7 +374,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     mm(s, false, false, M, c_.ldG2(), D, a.xh3, D, w.Wq2, c_.ldG2(), G2t_, c_.ldG2(), Out::BF16);
     tic(s, "addr_q2");
-    q2_fwd(Q2Fwd{G2t_, c_.ldG2(), p(x.brg2), a.q2, a.q2n, a.ar2, a.gr2, st + 4, a.info, M, H}, s);
+    q2_fwd(Q2Fwd{G2t_, c_.ldG2(), p(x.brg2), a.q2, a.q2n, a.ar2, a.gr2, st + 4, a.info, M, H, c_.dh}, s);
     toc(s);
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, a.o2, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
@@ -402,7 +403,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
         toc(s);
         tic(s, "addr_q2");
         q2_bwd(Q2Bwd{dq2_, dgr2_, a.q2, a.q2n, a.ar2, g(x.brg2), st + 4, c_.budget, c_.budget_target, count, dG2_,
-                     c_.ldG2(), M, H},
+                     c_.ldG2(), M, H, c_.dh},
                s);
         toc(s);
         mm(s, false, true, M, D, c_.ldG2(), dG2_, c_.ldG2(), w.Wq2, c_.ldG2(), dxh_, D, Out::F32);
@@ -444,7 +445,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     addr_bwd(AddrBwd{dk2_, dv2_, dr2_, dq1_, dgr1_, a.gw, dPV_ + S2, c_.ldPV(), a.k, a.q, a.kn, a.qn, a.rp1, a.aw,
                      a.ar, a.ridx, b.reset, p(x.R),
                      g(x.R), g(x.bk), g(x.brg), g(x.bwg), st, c_.budget, c_.budget_target, count, dG_, c_.ldG(), M,
-                     c_.T, H, a.zpre},
+                     c_.T, H, a.zpre, c_.dh},
              s);
     toc(s);
     mm(s, false, true, M, S2, c_.ldG(), dG_, c_.ldG(), w.Ws, c_.ldG(), dS_, S2, Out::F32);

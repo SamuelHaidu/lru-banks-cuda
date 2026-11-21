@@ -202,7 +202,7 @@ void RunConfig::validate() const {
     check(a.tau > 0, "arch_params.tau", "must be positive");
     check(a.gate_budget >= 0, "arch_params.gate_budget", "must be >= 0");
     check(a.window_size >= 8 && a.window_size % 8 == 0, "arch_params.window_size", "must be a positive multiple of 8");
-    check(a.head_dim == DH, "arch_params.head_dim", "is fixed at " + std::to_string(DH) + " by the kernels");
+    check(a.head_dim == 32 || a.head_dim == 64, "arch_params.head_dim", "must be 32 or 64 (the kernels' sizes)");
     check(a.bank_slots.empty() || int(a.bank_slots.size()) == a.num_layers, "arch_params.bank_slots",
           "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (128 everywhere)");
     for (int n : a.bank_slots)
@@ -238,6 +238,7 @@ Config RunConfig::model_config() const {
     c.L = arch.num_layers;
     c.hops = arch.hops.empty() ? std::vector<int>(size_t(arch.num_layers), 2) : arch.hops;
     c.slots = arch.bank_slots;
+    c.dh = arch.head_dim;
     c.N = arch.lru_dim;
     c.H = arch.num_heads;
     c.F = ffn_dim();

@@ -100,6 +100,7 @@ struct AddrFwd {
     uint2* info;                  // [M][H] packed for the bank walks: x = m1 | m2 << 8 | flags << 16 (flags: 1 write
                                   // gate, 2 read gate, 4 reset, 8 hop-2 read gate, set by q2_fwd), y = bits of p1
     int M, T, H;
+    int dh = 32;                  // head size (32 or 64)
     int slots = SLOTS;            // the layer's bank size (2..SLOTS): routing picks among slots [0, slots); the
                                   // others are never written, so the reads never see them
 };
@@ -129,6 +130,7 @@ struct AddrBwd {
     // [M][H][2] each routed slot's mass just before the write (BankRead::zpre): a closed write gate's gradient is
     // the secant to the open state (see addr_bwd); null: the tangent at weight 0
     const float* zpre = nullptr;
+    int dh = 32;
 };
 void addr_bwd(const AddrBwd& a, cudaStream_t s);
 
@@ -143,6 +145,7 @@ struct Q2Fwd {
     float* stats;  // [2]: sum sigmoid(ar), open reads
     uint2* info;   // the layer's packed step words: the hop-2 read gate is OR-ed in (flag 8)
     int M, H;
+    int dh = 32;
 };
 void q2_fwd(const Q2Fwd& a, cudaStream_t s);
 struct Q2Bwd {
@@ -154,6 +157,7 @@ struct Q2Bwd {
     float budget, target, count;
     bf16* dG2;
     int ldG2, M, H;
+    int dh = 32;
 };
 void q2_bwd(const Q2Bwd& a, cudaStream_t s);
 
@@ -173,9 +177,10 @@ struct BankWrites {
     // forward and the re-walk start from per-chunk checkpoints of the slot states (bank_checkpoint), and the adjoint
     // runs in two passes around a sequential combine (exact: the adjoint is linear).
     int chunk;
-    const float* ckpt;   // [B][H][chunks][CKPT_FIELDS][SLOTS], or null with one chunk per row
+    const float* ckpt;   // [B][H][chunks][ckpt_fields(dh)][SLOTS], or null with one chunk per row
+    int dh = 32;         // head size (32 or 64)
 };
-constexpr int CKPT_FIELDS = 2 * DH + 2;  // Kb, Vb, Zs, tm (forward); LK, LV, LZ (adjoint)
+inline int ckpt_fields(int dh) { return 2 * dh + 2; }  // Kb, Vb, Zs, tm (forward); LK, LV, LZ (adjoint)
 __host__ __device__ inline int bank_chunks(const BankWrites& w) { return (w.T + w.chunk - 1) / w.chunk; }
 // The slot states at every chunk start but the first: local chunk states in parallel (writes only), then a per-slot
 // merge (local, rflags: scratch of the checkpoint's size and [B][H][chunks]).
