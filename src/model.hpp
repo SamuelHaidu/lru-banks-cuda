@@ -122,6 +122,9 @@ class Model {
     void keep_row_loss();
     std::vector<float> row_loss(cudaStream_t s);
     std::vector<bf16> download_read(int n, int which, cudaStream_t s);
+    // the readout input of token row r after a forward (E0 floats): logits = this . (E or E_out)^T
+    std::vector<float> readout_input(int r, cudaStream_t s);
+    const float* readout_table_params() { return p(c_.tied ? E_ : E_out_); }  // device, V x E0 (fp32)
     std::vector<std::pair<std::string, float>> profile_ms();
 
     // discrete decisions of layer n (tests replay them): ridx [M][H][2], gw, gr, gr2 [M][H]

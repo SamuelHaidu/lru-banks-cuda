@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -57,7 +58,8 @@ void usage() {
                  "  lbc eval   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--steps N] [--rows N]\n"
                  "             [--silence L:H,...]\n"
                  "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n"
-                 "             [--silence L:H,...]\n");
+                 "             [--silence L:H,...]\n"
+                 "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed S]\n");
     std::exit(2);
 }
 
@@ -616,6 +618,106 @@ int cmd_dump(int argc, char** argv) {
     return 0;
 }
 
+// Sampling from a checkpoint: prompts as token ids (one prompt per line, space-separated; tokenize outside), each
+// continued by --tokens tokens (temperature, top-k), written one line of ids per prompt. Every step reruns the forward
+// over the window so far (the model is causal: positions after the cursor do not matter).
+int cmd_generate(int argc, char** argv) {
+    if (argc < 1) usage();
+    const std::string run = argv[0];
+    std::string which = "latest", in, out;
+    int tokens = 100, topk = 50;
+    double temp = 0.8;
+    uint64_t seed = 1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
+        else if (a == "--ids" && i + 1 < argc) in = argv[++i];
+        else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--tokens" && i + 1 < argc) tokens = std::atoi(argv[++i]);
+        else if (a == "--temperature" && i + 1 < argc) temp = std::atof(argv[++i]);
+        else if (a == "--top-k" && i + 1 < argc) topk = std::atoi(argv[++i]);
+        else if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
+        else usage();
+    }
+    if (in.empty() || out.empty()) die("generate needs --ids FILE and --out FILE");
+    const std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
+    const CheckpointInfo info = read_checkpoint_info(path);
+    const RunConfig rc = RunConfig::from_json(info.config);
+    const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
+    Config c = rc.model_config();
+    c.B = 1;
+    cudaStream_t s;
+    LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    Model model(c, uint64_t(rc.data.seed));
+    load_checkpoint(path, model, s);
+    std::vector<float> table(static_cast<size_t>(c.V) * c.E0);  // the readout table on the host
+    LBC_CUDA(cudaMemcpy(table.data(), model.readout_table_params(), table.size() * 4, cudaMemcpyDeviceToHost));
+    const int T = c.T, marker = meta.doc_token_id;
+    int *d_ids, *d_y;
+    uint8_t* d_reset;
+    float* d_inv_n;
+    LBC_CUDA(cudaMalloc(&d_ids, T * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_y, T * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_reset, T));
+    LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
+    const std::vector<int> no_target(static_cast<size_t>(T), -1);
+    const float one = 1.f;
+    LBC_CUDA(cudaMemcpy(d_y, no_target.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_inv_n, &one, sizeof(float), cudaMemcpyHostToDevice));
+    std::mt19937_64 rng(seed);
+    std::ifstream fin(in);
+    std::ofstream fout(out);
+    std::string line;
+    int prompts = 0;
+    while (std::getline(fin, line)) {
+        std::vector<int> ids;
+        std::stringstream ls(line);
+        for (int x; ls >> x;) ids.push_back(x);
+        if (ids.empty()) continue;
+        std::vector<int> gen;
+        for (int k = 0; k < tokens; ++k) {
+            const int len = std::min<int>(int(ids.size()), T);
+            std::vector<int> row(static_cast<size_t>(T), marker);
+            std::copy(ids.end() - len, ids.end(), row.begin());
+            std::vector<uint8_t> rst(static_cast<size_t>(T));
+            for (int t = 0; t < T; ++t) rst[size_t(t)] = row[size_t(t)] == marker;
+            LBC_CUDA(cudaMemcpyAsync(d_ids, row.data(), T * sizeof(int), cudaMemcpyHostToDevice, s));
+            LBC_CUDA(cudaMemcpyAsync(d_reset, rst.data(), T, cudaMemcpyHostToDevice, s));
+            model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
+            const std::vector<float> h = model.readout_input(len - 1, s);
+            std::vector<std::pair<float, int>> logit(static_cast<size_t>(c.V));
+            for (int v = 0; v < c.V; ++v) {
+                const float* e = table.data() + size_t(v) * c.E0;
+                float acc = 0.f;
+                for (int j = 0; j < c.E0; ++j) acc += h[size_t(j)] * e[j];
+                logit[size_t(v)] = {acc, v};
+            }
+            const int K = std::min<int>(topk > 0 ? topk : c.V, c.V);
+            std::partial_sort(logit.begin(), logit.begin() + K, logit.end(), std::greater<>());
+            std::vector<double> pr(static_cast<size_t>(K));
+            double sum = 0;
+            for (int i = 0; i < K; ++i) sum += pr[size_t(i)] = std::exp((logit[size_t(i)].first - logit[0].first) / temp);
+            std::uniform_real_distribution<double> u(0.0, sum);
+            double r = u(rng);
+            int pick = logit[size_t(K - 1)].second;
+            for (int i = 0; i < K; ++i)
+                if ((r -= pr[size_t(i)]) <= 0) {
+                    pick = logit[size_t(i)].second;
+                    break;
+                }
+            ids.push_back(pick);
+            gen.push_back(pick);
+            if (pick == marker || pick == 1) break;  // <bos> or <eos>: the document ends
+        }
+        for (size_t i = 0; i < gen.size(); ++i) fout << (i ? " " : "") << gen[i];
+        fout << "\n";
+        ++prompts;
+    }
+    std::printf("generated for %d prompts with %s (epoch %d), temperature %.2f, top-k %d\n", prompts, path.c_str(),
+                info.epoch, temp, topk);
+    return 0;
+}
+
 // loss and accuracy of a checkpoint on `steps` fixed batches of a token file (the validation split by default; same
 // rows and scoring as the trainer's validation)
 int cmd_eval(int argc, char** argv) {
@@ -691,6 +793,7 @@ int main(int argc, char** argv) {
         if (cmd == "train") return cmd_train(argc - 2, argv + 2);
         if (cmd == "eval") return cmd_eval(argc - 2, argv + 2);
         if (cmd == "dump") return cmd_dump(argc - 2, argv + 2);
+        if (cmd == "generate") return cmd_generate(argc - 2, argv + 2);
     } catch (const std::exception& e) {
         die(e.what());
     }

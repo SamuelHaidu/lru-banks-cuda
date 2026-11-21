@@ -557,6 +557,15 @@ std::vector<bf16> Model::download_read(int n, int which, cudaStream_t s) {
     return out;
 }
 
+std::vector<float> Model::readout_input(int r, cudaStream_t s) {
+    std::vector<bf16> hb(size_t(c_.E0));
+    LBC_CUDA(cudaMemcpyAsync(hb.data(), hr_ + size_t(r) * c_.E0, hb.size() * sizeof(bf16), cudaMemcpyDeviceToHost, s));
+    LBC_CUDA(cudaStreamSynchronize(s));
+    std::vector<float> out(hb.size());
+    for (size_t i = 0; i < hb.size(); ++i) out[i] = __bfloat162float(hb[i]);
+    return out;
+}
+
 void Model::forward_loss(const Batch& b, cudaStream_t s) {
     LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));
     embed_fwd(b, s);
