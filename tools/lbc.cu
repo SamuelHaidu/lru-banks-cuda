@@ -59,7 +59,8 @@ void usage() {
                  "             [--silence L:H,...]\n"
                  "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n"
                  "             [--silence L:H,...]\n"
-                 "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed S]\n");
+                 "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed S]\n"
+                 "  lbc score  RUN_DIR --pairs FILE --out FILE [--checkpoint best|latest|PATH] [--rows N]\n");
     std::exit(2);
 }
 
@@ -718,6 +719,95 @@ int cmd_generate(int argc, char** argv) {
     return 0;
 }
 
+// Log-likelihood scoring for benchmarks (lm-eval style): each input line is "context ids | continuation ids"; the output
+// line is the continuation's summed log-probability and its token count. Rows are scored in batches; a row longer than
+// the window keeps its last window_size tokens (the continuation always fits).
+int cmd_score(int argc, char** argv) {
+    if (argc < 1) usage();
+    const std::string run = argv[0];
+    std::string which = "latest", in, out;
+    int rows = 64;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
+        else if (a == "--pairs" && i + 1 < argc) in = argv[++i];
+        else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else usage();
+    }
+    if (in.empty() || out.empty()) die("score needs --pairs FILE and --out FILE");
+    const std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
+    const CheckpointInfo info = read_checkpoint_info(path);
+    const RunConfig rc = RunConfig::from_json(info.config);
+    const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
+    Config c = rc.model_config();
+    c.B = rows;
+    cudaStream_t s;
+    LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    Model model(c, uint64_t(rc.data.seed));
+    load_checkpoint(path, model, s);
+    model.keep_row_loss();
+    const int T = c.T, marker = meta.doc_token_id;
+    const size_t ntok = static_cast<size_t>(rows) * T;
+    int *d_ids, *d_y;
+    uint8_t* d_reset;
+    float* d_inv_n;
+    LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_reset, ntok));
+    LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
+    const float one = 1.f;
+    LBC_CUDA(cudaMemcpy(d_inv_n, &one, sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<std::pair<std::vector<int>, std::vector<int>>> pairs;
+    {
+        std::ifstream f(in);
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t bar = line.find('|');
+            if (bar == std::string::npos) continue;
+            std::vector<int> a, b;
+            std::stringstream sa(line.substr(0, bar)), sb(line.substr(bar + 1));
+            for (int x; sa >> x;) a.push_back(x);
+            for (int x; sb >> x;) b.push_back(x);
+            pairs.emplace_back(std::move(a), std::move(b));
+        }
+    }
+    std::ofstream fo(out);
+    std::vector<int> ids(ntok), y(ntok);
+    std::vector<uint8_t> rst(ntok);
+    for (size_t p0 = 0; p0 < pairs.size(); p0 += size_t(rows)) {
+        const size_t n = std::min(pairs.size() - p0, size_t(rows));
+        std::fill(ids.begin(), ids.end(), marker);
+        std::fill(y.begin(), y.end(), -1);
+        std::vector<std::pair<int, int>> span(n);  // per row: first target position, count
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<int> seq = pairs[p0 + r].first;
+            const std::vector<int>& cont = pairs[p0 + r].second;
+            seq.insert(seq.end(), cont.begin(), cont.end());
+            const int len = std::min<int>(int(seq.size()), T + 1), off = int(seq.size()) - len;
+            // input positions 0..len-2 predict seq[off + 1 .. off + len - 1]; the continuation is the last cont.size()
+            for (int t = 0; t + 1 < len; ++t) {
+                ids[r * T + size_t(t)] = seq[size_t(off + t)];
+                if (t + 1 >= len - int(cont.size())) y[r * T + size_t(t)] = seq[size_t(off + t + 1)];
+            }
+            span[r] = {len - 1 - int(cont.size()), int(cont.size())};
+        }
+        for (size_t i = 0; i < ntok; ++i) rst[i] = ids[i] == marker;
+        LBC_CUDA(cudaMemcpyAsync(d_ids, ids.data(), ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_y, y.data(), ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_reset, rst.data(), ntok, cudaMemcpyHostToDevice, s));
+        model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
+        const std::vector<float> rl = model.row_loss(s);
+        for (size_t r = 0; r < n; ++r) {
+            double ll = 0;
+            for (int k = 0; k < span[r].second; ++k) ll -= rl[r * T + size_t(span[r].first + k)];
+            fo << ll << " " << span[r].second << "\n";
+        }
+    }
+    std::printf("scored %zu pairs with %s (epoch %d)\n", pairs.size(), path.c_str(), info.epoch);
+    return 0;
+}
+
 // loss and accuracy of a checkpoint on `steps` fixed batches of a token file (the validation split by default; same
 // rows and scoring as the trainer's validation)
 int cmd_eval(int argc, char** argv) {
@@ -794,6 +884,7 @@ int main(int argc, char** argv) {
         if (cmd == "eval") return cmd_eval(argc - 2, argv + 2);
         if (cmd == "dump") return cmd_dump(argc - 2, argv + 2);
         if (cmd == "generate") return cmd_generate(argc - 2, argv + 2);
+        if (cmd == "score") return cmd_score(argc - 2, argv + 2);
     } catch (const std::exception& e) {
         die(e.what());
     }
