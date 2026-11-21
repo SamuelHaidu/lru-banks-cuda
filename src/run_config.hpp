@@ -94,6 +94,7 @@ struct DatasetMeta {
     int vocabulary_size = 0, doc_token_id = 0;
     std::string train_file, validation_file;     // full paths
     double train_chars_per_token = 0.0, validation_chars_per_token = 0.0;  // 0: unknown (no bpc)
+    int score_after_token = -1;  // >= 0: only targets after this token in a document are scored (synthetic tasks)
     static DatasetMeta load(const std::string& dir);
 };
 

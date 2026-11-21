@@ -45,8 +45,44 @@ TokenFile::~TokenFile() {
     if (map_) munmap(map_, map_bytes_);
 }
 
-Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int slots)
-    : file_(file), B_(B), T_(T), marker_(marker), seed_(seed), next_batch_(start_batch),
+namespace {
+
+// whether a row starting at `start` begins inside the scored part of its document: `score_after` seen since the
+// document's marker (scanning back at most a million tokens)
+bool scored_at(const uint16_t* tok, size_t start, int marker, int score_after) {
+    if (score_after < 0) return true;
+    for (size_t p = start, k = 0; p > 0 && k < (1u << 20); --p, ++k) {
+        const int x = tok[p - 1];
+        if (x == score_after) return true;
+        if (x == marker) return false;
+    }
+    return false;
+}
+
+// one row of T tokens from `start` (positions past n read as the marker); returns the scored targets
+int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int score_after, int* ids, int* y,
+             uint8_t* reset) {
+    bool on = scored_at(tok, start, marker, score_after);
+    int targets = 0;
+    for (int t = 0; t < T; ++t) {
+        const size_t p = start + size_t(t);
+        const int x = p < n ? tok[p] : marker, nx = p + 1 < n ? tok[p + 1] : marker;
+        if (x == marker) on = score_after < 0;
+        if (x == score_after) on = true;
+        const bool scored = nx != marker && on;
+        ids[t] = x;
+        y[t] = scored ? nx : -1;
+        reset[t] = x == marker;
+        targets += scored;
+    }
+    return targets;
+}
+
+}  // namespace
+
+Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int score_after,
+               int slots)
+    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), seed_(seed), next_batch_(start_batch),
       steps_per_pass_(steps_per_pass(file.size(), B, T)), slots_(size_t(slots)) {
     if (steps_per_pass_ == 0)
         throw std::runtime_error("Loader: the token file holds less than one batch of " + std::to_string(B) +
@@ -94,13 +130,7 @@ void Loader::fill(HostBatch& hb) {
     for (int b = 0; b < B_; ++b) {
         const size_t start = offset_ + size_t(order_[j * B_ + b]) * T_;
         const size_t o = size_t(b) * T_;
-        for (int t = 0; t < T_; ++t) {
-            const int x = tok[start + t], y = tok[start + t + 1];
-            hb.ids[o + t] = x;
-            hb.y[o + t] = y == marker_ ? -1 : y;
-            hb.reset[o + t] = x == marker_;
-            targets += y != marker_;
-        }
+        targets += fill_row(tok, n, start, T_, marker_, score_after_, hb.ids + o, hb.y + o, hb.reset + o);
     }
     hb.n_targets = targets;
     *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
@@ -152,7 +182,8 @@ void Loader::release(HostBatch* hb, cudaStream_t stream) {
     cv_.notify_all();
 }
 
-ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker) {
+ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker,
+                             int score_after) {
     const size_t n = file.size();
     const uint16_t* tok = file.data();
     std::vector<size_t> starts;
@@ -171,15 +202,8 @@ ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uin
         int targets = 0;
         for (int b = 0; b < B; ++b) {
             const size_t start = starts[rng() % starts.size()];
-            for (int t = 0; t < T; ++t) {
-                const size_t p = start + size_t(t);
-                const int x = p < n ? tok[p] : marker, y = p + 1 < n ? tok[p + 1] : marker;
-                const size_t o = size_t(b) * T + t;
-                hb.ids[o] = x;
-                hb.y[o] = y == marker ? -1 : y;
-                hb.reset[o] = x == marker;
-                targets += y != marker;
-            }
+            const size_t o = size_t(b) * T;
+            targets += fill_row(tok, n, start, T, marker, score_after, hb.ids + o, hb.y + o, hb.reset + o);
         }
         hb.n_targets = targets;
         *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);

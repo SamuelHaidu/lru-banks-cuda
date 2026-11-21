@@ -318,6 +318,8 @@ DatasetMeta DatasetMeta::load(const std::string& dir) {
     };
     d.vocabulary_size = integer("vocabulary_size");
     d.doc_token_id = integer("doc_token_id");
+    if (const json::Value* sa = m.find("score_after_token"); sa && sa->type == json::Value::Number)
+        d.score_after_token = int(sa->num);
     double avg = 0.0;
     if (const json::Value* a = m.find("avg_chars_per_token"); a && a->type == json::Value::Number) avg = a->num;
     auto split = [&](const char* s, std::string& file, double& cpt) {

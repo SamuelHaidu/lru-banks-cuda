@@ -43,7 +43,10 @@ struct HostBatch {
 
 class Loader {
   public:
-    Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, uint64_t start_batch = 0, int slots = 3);
+    // score_after >= 0: only the targets after that token (within its document) are scored (e.g. a copy task's
+    // separator: the copied half); -1: every target
+    Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, uint64_t start_batch = 0,
+           int score_after = -1, int slots = 3);
     // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
     static size_t steps_per_pass(size_t tokens, int B, int T) { return tokens > size_t(T) ? (tokens - T) / T / B : 0; }
     ~Loader();
@@ -60,7 +63,7 @@ class Loader {
     void fill(HostBatch& hb);
 
     const TokenFile& file_;
-    int B_, T_, marker_;
+    int B_, T_, marker_, score_after_;
     uint64_t seed_;
     uint64_t next_batch_, pass_ = ~uint64_t(0), steps_per_pass_;
     size_t offset_ = 0;
@@ -85,7 +88,7 @@ class Loader {
 // are padded with the marker (no target). Built once into pinned memory.
 class ValidationSet {
   public:
-    ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker = 0);
+    ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker = 0, int score_after = -1);
     ~ValidationSet();
     ValidationSet(const ValidationSet&) = delete;
     ValidationSet& operator=(const ValidationSet&) = delete;
