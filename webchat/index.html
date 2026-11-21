@@ -138,7 +138,7 @@
               max-height:200px; overflow:auto; margin:8px 0 0; }
 
   /* inspect */
-  .ins { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0, 1fr) 360px; }
+  .ins { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0, 1fr) 380px; grid-template-rows:minmax(0, 1fr); }
   .ins-main { min-width:0; display:flex; flex-direction:column; padding:16px 22px 16px; gap:10px; }
   .ins-source { display:flex; gap:8px; align-items:flex-start; }
   .ins-source textarea { flex:1; border:1px solid var(--line); border-radius:10px; padding:8px 12px; resize:vertical;
@@ -175,6 +175,8 @@
   .lens td { padding:5px 0; vertical-align:top; border-top:1px solid var(--page); }
   .lens td:first-child { color:var(--muted); width:74px; white-space:nowrap; padding-right:8px; }
   .lens tr.final td { font-weight:500; }
+  .lens tr.rd { cursor:pointer; } .lens tr.rd:hover td { background:var(--page); } .lens tr.rd.on td { background:var(--accent-soft); }
+  .says { font-size:12px; color:var(--muted); margin-top:2px; }
   .cand { display:flex; align-items:center; gap:8px; }
   .cand .pill { margin:0; min-width:0; overflow:hidden; text-overflow:ellipsis; max-width:150px; }
   .cand .bar { flex:1; height:4px; background:var(--page); border-radius:2px; position:relative; }
@@ -188,10 +190,10 @@
   .acell:hover { border-color:var(--accent); }
   .acell.on { border-color:var(--accent); background:var(--accent-soft); }
   .acell .tt { display:block; white-space:pre; overflow:hidden; text-overflow:ellipsis; }
-  .acell .pc { color:var(--muted); font-size:10.5px; }
+  .acell .pc { color:var(--muted); font-size:10.5px; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .asplit { display:flex; height:3px; border-radius:2px; overflow:hidden; margin-top:2px; background:var(--page); }
   .asplit i:nth-child(1) { background:#0E7068; } .asplit i:nth-child(2) { background:#7FBFB8; } .asplit i:nth-child(3) { background:#C9CDD3; }
-  @media (max-width: 1100px) { .ins { grid-template-columns:1fr; } .side { border-left:0; border-top:1px solid var(--line); max-height:45vh; } }
+  @media (max-width: 1100px) { .ins { grid-template-columns:1fr; grid-template-rows:minmax(0, 1fr) auto; } .side { border-left:0; border-top:1px solid var(--line); max-height:45vh; } }
   @media (max-width: 900px) { .drawer { position:fixed; right:0; top:52px; bottom:0; z-index:4; box-shadow:-8px 0 24px rgba(28,32,38,.1); }
                               .model-btn span { display:none; } }
 </style>
@@ -258,10 +260,11 @@
         </div>
         <div class="ins-controls">
           <nav class="seg" id="insMode">
-            <button data-mode="loss" class="on">Loss</button><button data-mode="stored">Stored</button><button data-mode="recall">Recall</button><button data-mode="attention" hidden>Attention</button>
+            <button data-mode="loss" class="on">Loss</button><button data-mode="stored">Stored</button><button data-mode="recall">Recall</button><button data-mode="attention" hidden>Attention</button><button data-mode="gate" hidden>Gate</button>
           </nav>
           <label hidden>Layer <select id="insLayer"></select></label>
           <label id="headWrap" hidden>Head <select id="insHead"></select></label>
+          <label id="hopWrap" hidden>Read <select id="insHop"><option value="0">hop 1</option><option value="1">hop 2</option><option value="all">both</option></select></label>
           <label id="measureWrap" hidden>Show <select id="insMeasure"><option value="share">share of the read</option><option value="c">weight on the value</option></select></label>
           <label id="hideWrap" hidden>Ignore the last <input id="insHide" type="number" min="0" value="8"> tokens</label>
           <span id="legend" class="legend"></span>
@@ -703,6 +706,7 @@ const colour = {
   wrong: a => `rgba(214, 48, 49, ${(0.22 + 0.58 * a).toFixed(3)})`,
   stored: a => `rgba(14, 112, 104, ${0.07 + 0.5 * a})`,
   recall: a => `rgba(109, 62, 214, ${0.05 + 0.4 * a})`,
+  gate: a => `rgba(200, 120, 20, ${(0.04 + 0.5 * a).toFixed(3)})`,
   // Attention (gated-deltanet): positive weights teal, negative (a later write took more than this token wrote) orange
   attnPos: a => `rgba(14, 112, 104, ${(0.06 + 0.55 * a).toFixed(3)})`,
   attnNeg: a => `rgba(214, 110, 20, ${(0.06 + 0.55 * a).toFixed(3)})`,
@@ -730,18 +734,25 @@ async function runInspect() {
   const out = await api("/api/inspect", {run:current.run, checkpoint:$("ckpt").value, text});
   if (out.error) { $("insSummary").textContent = "Inspection failed: " + out.error; return; }
   out.layers.forEach(L => { L.z = f32(L.update_gate); L.c = f32(L.candidate); if (L.mem_w) { L.mw = f32(L.mem_w); L.mg = f32(L.mem_gate); } });
-  const gdn = out.kind === "gdn"; out.att = {};
+  const gdn = out.kind === "gdn", banks = out.kind === "banks"; out.att = {}; out.bk = {};
   out.rawToKept = new Int32Array(out.raw.length).fill(-1); out.kept.forEach((r, k) => out.rawToKept[r] = k);
   out.rawToEntry = new Int32Array(out.raw.length).fill(-1);
   if (out.memory) { out.memory.entry_pos.forEach((r, j) => out.rawToEntry[r] = j); out.readRow = {};
     out.memory.read_pos.forEach((t, r) => out.readRow[t] = r); }
   ins = out;
   $("insLayer").innerHTML = gdn ? out.heads.map((_, i) => `<option value="${i}">${i + 1}</option>`).join("")
-    : '<option value="all">All</option>' + out.layers.map((_, i) => `<option value="${i}">${i + 1}</option>`).join("");
+    : '<option value="all">All</option>' + range(banks ? out.num_layers : out.layers.length).map(i => `<option value="${i}">${i + 1}</option>`).join("");
   if (gdn) $("insHead").innerHTML = '<option value="all">All</option>' + out.heads[0].half_life.map((_, h) => `<option value="${h}">${h + 1}</option>`).join("");
+  if (banks) {
+    $("insHead").innerHTML = '<option value="all">All</option>' + range(out.num_heads).map(h => `<option value="${h}">${h + 1}</option>`).join("");
+    $("insHop").querySelectorAll("option").forEach(o => o.hidden = out.hops < 2 && o.value !== "0");
+    if (out.hops < 2) $("insHop").value = "0";
+  }
   ["stored", "recall"].forEach(m => $("insMode").querySelector(`[data-mode="${m}"]`).hidden = gdn);
   $("insMode").querySelector('[data-mode="attention"]').hidden = !gdn;
+  $("insMode").querySelector('[data-mode="gate"]').hidden = !banks;
   if (gdn ? ["stored", "recall"].includes(insMode) : insMode === "attention") insMode = "loss";
+  if (!banks && insMode === "gate") insMode = "loss";
   const box = $("insTokens");
   box.innerHTML = out.raw.map((t, r) => {
     const k = out.rawToKept[r], tag = /^<\/?[a-z]+>$/.test(t) ? " tag" : "";
@@ -753,8 +764,8 @@ async function runInspect() {
     if (el.dataset.k !== undefined) { ins.elK[+el.dataset.k] = el; el.onclick = () => insSelect(+el.dataset.k); }
     else if (+el.dataset.e >= 0) ins.elE[+el.dataset.e] = el;
   });
-  $("insMode").querySelector('[data-mode="recall"]').disabled = !out.memory;
-  if (!out.memory && insMode === "recall") insMode = "loss";
+  $("insMode").querySelector('[data-mode="recall"]').disabled = !out.memory && !banks;
+  if (!out.memory && !banks && insMode === "recall") insMode = "loss";
   setMode(insMode);
   insSelect(firstScored());
 }
@@ -765,7 +776,11 @@ function setMode(m) {
   $("insMode").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.mode === m));
   $("hideWrap").hidden = m !== "stored";
   $("insLayer").parentElement.hidden = m === "loss";  // the loss is the final prediction's
-  $("headWrap").hidden = $("measureWrap").hidden = m !== "attention";
+  $("measureWrap").hidden = m !== "attention";
+  const banks = ins && ins.kind === "banks";
+  $("headWrap").hidden = !(m === "attention" || banks && m !== "loss");
+  $("headWrap").hidden = $("headWrap").hidden || m === "gate";
+  $("hopWrap").hidden = !(banks && m === "recall" && ins.hops > 1);
   if (ins) insSelect(insT);
 }
 $("insMode").querySelectorAll("button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
@@ -832,6 +847,97 @@ function fetchAttend(t) {
   });
 }
 
+// Banks (lru-banks): position t's reads and bank contents unrolled exactly over the document's positions, fetched
+// per position (server: banks_at). Slot m holds the average of its writes, position j weighted r_jm a_m^(t-j) / z_tm;
+// a read takes sum_m p_tm of those averages: c_j, >= 0, summing to 1, and the read is sum_j c_j v_j. In layer 1 v_j is
+// the token's own embedding; above, it is position j's stream (the token plus what earlier layers read and the FFNs
+// added): the value lens ("what the read retrieves") shows what such a read carries in token space.
+const range = n => [...Array(n).keys()];
+function banksSel() {
+  const pick = (id, n) => $(id).value === "all" ? range(n) : [+$(id).value];
+  return {ls: pick("insLayer", ins.num_layers), hs: pick("insHead", ins.num_heads), os: pick("insHop", ins.hops)};
+}
+function bankVals(B, kind, ls, hs, os) {  // mean weight of each position start..t over the chosen layers / heads / hops
+  const n = B.n, H = ins.num_heads, out = new Float32Array(n);
+  if (kind === "read") {
+    const pairs = ls.flatMap(l => os.filter(o => o < ins.layer_hops[l]).map(o => [l, o])), k = pairs.length * hs.length;
+    if (!k) return out;
+    for (const [l, o] of pairs) for (const h of hs) { const base = ((l * ins.hops + o) * H + h) * n;
+      for (let i = 0; i < n; i++) out[i] += B.read[base + i] / k; }
+  } else {
+    const k = ls.length * hs.length;
+    for (const l of ls) for (const h of hs) { const base = (l * H + h) * n;
+      for (let i = 0; i < n; i++) out[i] += B.stored[base + i] / k; }
+  }
+  return out;
+}
+function fetchBanks(t) {
+  if (ins.bkPending === t) return;
+  ins.bkPending = t; const asked = ins;
+  api("/api/banks", {banks_id: ins.banks_id, t}).then(r => {
+    if (asked !== ins) return;
+    ins.bkPending = null;
+    if (r.error) { $("insSummary").textContent = "Unrolling failed: " + r.error; return; }
+    ins.bk[t] = {...r, read: f32(r.read), stored: f32(r.stored)};
+    if (insT === t && ["stored", "recall"].includes(insMode)) insSelect(t);
+  });
+}
+const gatedLayers = ls => ls.filter(l => ins.gate[l]);
+function banksView(el, T) {
+  const {ls, hs, os} = banksSel();
+  ins.storedVals = null;
+  if (insMode === "gate") {
+    const gl = gatedLayers(ls);
+    if (!gl.length) return ["Layer 1 has no input gate: its LRU takes every token in full (g = 1).", ""];
+    const g = new Float32Array(T); let mx = 1e-6;
+    for (let j = 0; j < T; j++) { for (const l of gl) g[j] += ins.gate[l][j] / gl.length; mx = Math.max(mx, 1 - g[j]); }
+    for (let j = 0; j < T; j++) { el[j].style.background = colour.gate((1 - g[j]) / mx);
+      el[j].title = gl.map(l => `layer ${l + 1}: ${ins.gate[l][j].toFixed(3)}`).join(", "); }
+    const means = gl.map(l => ins.gate[l].reduce((a, b) => a + b, 0) / T);
+    let lo = 0; for (let j = 1; j < T; j++) if (g[j] < g[lo]) lo = j;
+    return [`LRU input gate g (1: the state takes the token in full, 0: skips it; its decay is lambda^g). Mean over the text:
+      ${gl.map((l, i) => `layer ${l + 1} <b>${means[i].toFixed(3)}</b>`).join(", ")}. Lowest ${gl.length > 1 ? "mean " : ""}gate
+      <b>${g[lo].toFixed(3)}</b> at "${esc(showTok(ins.tokens[lo]))}" (position ${lo}).`,
+      `takes the token <i style="background:linear-gradient(90deg, ${colour.gate(0)}, ${colour.gate(1)})"></i> skips it most (${(1 - mx).toFixed(3)})`];
+  }
+  for (let j = insT + 1; j < T; j++) el[j].classList.add("after");
+  const B = ins.bk[insT];
+  if (!B) { fetchBanks(insT); return ["Unrolling the banks at this token", ""]; }
+  for (let j = 0; j < B.start; j++) el[j].classList.add("off");
+  const what = ls.length === 1 && ls[0] === 0 ? "tokens" : "positions";
+  const mixed = ls.some(l => l > 0) ? ` Above layer 1 a position's value is its stream (the token plus what earlier layers
+    read and the FFNs added), so this shows where the read lands; "What the read retrieves" shows what it carries.` : "";
+  const who = `${ls.length === 1 ? "layer " + (ls[0] + 1) : "all layers"}, ${hs.length === 1 ? "head " + (hs[0] + 1) : "mean of the heads"}`;
+  if (insMode === "recall") {
+    if (!ls.some(l => os.some(o => o < ins.layer_hops[l])))
+      return [`Layer ${ls[0] + 1} reads its banks once: choose read 1.`, ""];
+    const v = bankVals(B, "read", ls, hs, os);
+    let mx = 1e-12; for (let i = 0; i < B.n; i++) mx = Math.max(mx, v[i]);
+    for (let i = 0; i < B.n; i++) { const j = B.start + i;
+      el[j].style.background = colour.recall(Math.sqrt(v[i] / mx)); el[j].title = `${(100 * v[i]).toFixed(2)}% of the read`; }
+    let self = 0, near = 0, far = 0;
+    for (let i = 0; i < B.n; i++) { const d = B.n - 1 - i; if (d === 0) self += v[i]; else if (d <= 8) near += v[i]; else far += v[i]; }
+    const hop = os.length > 1 ? "both reads" : `read ${os[0] + 1}`;
+    ins.readVals = v;
+    return [`<b>${who}, ${hop}</b>: <b>${(100 * self).toFixed(0)}%</b> from the selected position itself,
+      <b>${(100 * near).toFixed(0)}%</b> from the 8 ${what} before, <b>${(100 * far).toFixed(0)}%</b> from older ones.
+      Exact weights on the values (they rebuild the read to ${B.err.toExponential(1)}).${mixed}`,
+      `less <i style="background:linear-gradient(90deg, ${colour.recall(0)}, ${colour.recall(1)})"></i> more`];
+  }
+  const hide = Math.max(0, +$("insHide").value || 0), oldest = insT - hide, v = bankVals(B, "stored", ls, hs, os);
+  const vals = new Float32Array(insT + 1); let mx = 1e-12, old = 0;
+  for (let i = 0; i < B.n; i++) { const j = B.start + i; vals[j] = v[i]; if (j <= oldest) { mx = Math.max(mx, v[i]); old += v[i]; } }
+  for (let i = 0; i < B.n; i++) { const j = B.start + i;
+    if (j > oldest) { el[j].classList.add("off"); continue; }
+    el[j].style.background = colour.stored(Math.sqrt(vals[j] / mx)); el[j].title = `${(100 * vals[j]).toFixed(2)}% of the banks`; }
+  ins.storedVals = vals; ins.storedOldest = oldest;
+  const filled = ls.map(l => hs.reduce((a, h) => a + B.filled[l][h], 0) / hs.length);
+  return [oldest < B.start ? `Nothing older than the last ${hide} ${what} in this document yet.`
+    : `<b>${who}</b>: ${what} older than the last ${hide} hold <b>${(100 * old).toFixed(1)}%</b> of the banks (each slot's
+      average counted equally). Slots in use: ${filled.map(f => f.toFixed(0)).join(", ")} of ${ins.slots}.${mixed}`,
+    `less <i style="background:linear-gradient(90deg, ${colour.stored(0)}, ${colour.stored(1)})"></i> more`];
+}
+
 function insSelect(t) {
   if (!ins) return;
   insT = Math.max(0, Math.min(ins.T - 1, t));
@@ -839,7 +945,9 @@ function insSelect(t) {
   el.forEach(e => { e.style.background = ""; e.classList.remove("after", "sel", "off"); e.title = ""; });
   ins.elE.forEach(e => { if (e) { e.style.background = ""; e.title = ""; } });
   let summary = "", legend = "";
-  if (insMode === "loss") {
+  if (ins.kind === "banks" && insMode !== "loss") {
+    [summary, legend] = banksView(el, T);
+  } else if (insMode === "loss") {
     let n = 0, sum = 0, sumH = 0, top1 = 0;
     for (let j = 1; j < T; j++) {
       if (!ins.scored[j - 1]) { el[j].classList.add("off"); continue; }
@@ -914,6 +1022,48 @@ function insSelect(t) {
   renderSide();
 }
 
+const posPill = (j, v) => `<button class="pill" data-j="${j}" title="position ${j}">${esc(showTok(ins.tokens[j]))} ${(100 * v).toFixed(0)}%</button>`;
+const topPos = (B, v, k) => range(B.n).sort((a, b) => v[b] - v[a]).slice(0, k).filter(i => v[i] > 0.005);
+function banksSide(t) {
+  let h = `<h3>LRU input gate at this token</h3><table class="lens">` + range(ins.num_layers).map(l => { const g = ins.gate[l];
+    return `<tr><td>Layer ${l + 1}</td><td>${g ? `<div class="cand"><span class="bar"><i style="width:${(100 * g[t]).toFixed(0)}%"></i></span>
+      <span class="p" style="width:46px">${g[t].toFixed(3)}</span></div>` : `<span class="note">no gate: takes every token</span>`}</td></tr>`; }).join("") + `</table>`;
+  if (insMode !== "recall") return h;
+  const B = ins.bk[t]; if (!B) return h;
+  const {ls, hs, os} = banksSel(), one = ls.length === 1, H = ins.num_heads;
+  h += `<h3>What each read retrieved</h3><p class="note" style="margin:-4px 0 6px">Per layer and read (${hs.length === 1 ? "head " + (hs[0] + 1) : "all heads"}):
+    the positions the query took most, then the tokens the read's addition to the stream raises most (o W_o through the readout).
+    Click a row to show it.</p><table class="lens">`;
+  for (const l of range(ins.num_layers)) for (const o of range(ins.layer_hops[l])) {
+    const v = bankVals(B, "read", [l], hs, [o]), says = hs.length === 1 ? B.says[l][o][hs[0]] : B.says_all[l][o];
+    const on = one && ls[0] === l && os.length === 1 && os[0] === o;
+    h += `<tr class="rd${on ? " on" : ""}" data-l="${l}" data-o="${o}"><td>L${l + 1}${ins.layer_hops[l] > 1 ? " read " + (o + 1) : ""}</td>
+      <td>${topPos(B, v, 3).map(i => posPill(B.start + i, v[i])).join("")}<div class="says">${says.length ? "raises " + says.map(s => `<span class="pill">${esc(showTok(s))}</span>`).join("") : "adds nothing to the stream (output projection 0)"}</div></td></tr>`;
+  }
+  h += `</table>`;
+  if (!one) return h + `<p class="note">Select a layer (a row above) to see its heads and slots.</p>`;
+  const l = ls[0], lo = range(ins.layer_hops[l]);
+  h += `<h3>Layer ${l + 1}: every head</h3><p class="note" style="margin:-4px 0 8px">The position each head's read takes most and its share. Click to select the head.</p>`
+    + `<div class="agrid" style="grid-template-columns:28px repeat(${lo.length}, minmax(0, 1fr))"><span></span>`
+    + lo.map(o => `<span class="hd">read ${o + 1}</span>`).join("")
+    + range(H).map(k => `<span class="ln">H${k + 1}</span>` + lo.map(o => {
+        const v = bankVals(B, "read", [l], [k], [o]), i = topPos(B, v, 1)[0] ?? B.n - 1;
+        const on = hs.length === 1 && hs[0] === k && os.includes(o);
+        return `<button class="acell${on ? " on" : ""}" data-h="${k}" data-o="${o}" title="${esc(B.says[l][o][k].map(showTok).join(" "))}">
+          <span class="tt">${esc(showTok(ins.tokens[B.start + i]))}</span><span class="pc">${(100 * v[i]).toFixed(0)}% &middot; ${B.says[l][o][k].length ? "raises " + esc(showTok(B.says[l][o][k][0])) : "adds nothing"}</span></button>`; }).join("")).join("")
+    + `</div>`;
+  if (hs.length !== 1) return h;
+  const k = hs[0];
+  for (const o of os.filter(o => o < ins.layer_hops[l])) {
+    h += `<h3>Layer ${l + 1}, head ${k + 1}${ins.layer_hops[l] > 1 ? ", read " + (o + 1) : ""}: slots read</h3>`;
+    const sl = B.slots[l][o][k];
+    h += sl.length ? sl.map(([m, p, items]) => `<div class="facts" style="margin:6px 0 2px"><b>Slot ${m + 1}</b> ${(100 * p).toFixed(0)}% of the read,
+        half-life ${ins.slot_half_life[m]} tokens; holds:</div>` + items.map(([j, s]) => posPill(j, s)).join("")).join("")
+      : `<p class="note">The banks are empty here.</p>`;
+  }
+  return h;
+}
+
 function cands(rows, actual) {
   const mx = rows.length ? rows[0][1] : 1;
   return rows.map(([i, p]) => `<div class="cand"><span class="pill${i === actual ? " hit" : ""}">${esc(showTok(ins.vocab[i]))}</span>
@@ -929,6 +1079,7 @@ function renderSide() {
     const rank = ins.rank[t - 1];
     h += `<div class="facts">${rank === 0 ? `<b style="color:#1E9650">Top-1</b>` : `<b style="color:#D63031">Rank ${rank + 1}</b>`}: predicted with <b>${(100 * Math.exp(-loss)).toFixed(1)}%</b>, loss <b>${loss.toFixed(3)}</b> nats, entropy ${(ins.entropy[t - 1] / Math.LN2).toFixed(2)} bits</div>`;
   } else if (t > 0) h += `<div class="facts">Not scored: the training only scores the assistant's tokens.</div>`;
+  if (ins.kind === "banks") h += banksSide(t);
   if (insMode === "stored" && ins.storedVals) {
     const top = []; for (let j = 0; j <= ins.storedOldest; j++) top.push([ins.storedVals[j], j]);
     top.sort((a, b) => b[0] - a[0]);
@@ -973,13 +1124,19 @@ function renderSide() {
   $("insSide").innerHTML = h;
   $("insSide").querySelectorAll("[data-j]").forEach(b => b.onclick = () => ins.elK[+b.dataset.j].scrollIntoView({block:"center"}));
   $("insSide").querySelectorAll(".acell").forEach(b => b.onclick = () => {
-    $("insLayer").value = b.dataset.l; $("insHead").value = b.dataset.h; insSelect(insT); });
+    if (b.dataset.l !== undefined) $("insLayer").value = b.dataset.l;
+    if (b.dataset.o !== undefined) $("insHop").value = b.dataset.o;
+    $("insHead").value = b.dataset.h; insSelect(insT); });
+  $("insSide").querySelectorAll("tr.rd").forEach(r => r.onclick = e => {
+    if (e.target.closest("[data-j]")) return;
+    $("insLayer").value = r.dataset.l; $("insHop").value = r.dataset.o; insSelect(insT); });
 }
 
 $("insRun").onclick = runInspect;
 $("insLayer").onchange = () => insSelect(insT);
 $("insHead").onchange = () => insSelect(insT);
 $("insMeasure").onchange = () => insSelect(insT);
+$("insHop").onchange = () => insSelect(insT);
 $("insHide").oninput = () => insSelect(insT);
 document.addEventListener("keydown", e => {
   if ($("inspectView").hidden || !ins || ["TEXTAREA", "INPUT", "SELECT"].includes(e.target.tagName)) return;

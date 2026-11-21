@@ -380,13 +380,15 @@ class Models:
                 cfg = cfg_mod.load(run.name)
             except Exception:  # noqa: BLE001 (a run with an old or broken config: skip it)
                 continue
-            try:  # chat: the dataset scores assistant spans; completion: plain text (pretraining)
-                chat = bool(cfg_mod.load_dataset_metadata(cfg["data"]["dataset"]).get("loss_spans"))
+            try:  # chat: the dataset scores assistant spans or says it is chat-format ("chat": the Calc-X mix, which
+                # scores every token); completion: plain text (pretraining)
+                meta = cfg_mod.load_dataset_metadata(cfg["data"]["dataset"])
+                chat = bool(meta.get("loss_spans") or meta.get("chat"))
             except Exception:  # noqa: BLE001 (the dataset is not here)
                 chat = True
             out.append({"run": run.name, "arch": cfg["arch"], "dataset": cfg["data"]["dataset"], "checkpoints": ckpts,
                         "mode": "chat" if chat else "completion",
-                        "inspect": cfg["arch"].startswith("min-gru") or cfg["arch"] == "gated-deltanet"})
+                        "inspect": cfg["arch"].startswith("min-gru") or cfg["arch"] in ("gated-deltanet", "lru-banks")})
         return out
 
     def load(self, run: str, checkpoint: str):
@@ -439,9 +441,13 @@ def inspect_text(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
 
     from model.archs.gated_deltanet import GatedDeltaNetLM
 
+    from model.archs.lru_banks import LRUBanksLM
+
     model, tok = models.load(body["run"], str(body.get("checkpoint", "latest")))
     if isinstance(model, GatedDeltaNetLM):
         return inspect_gdn(models, body, model, tok)
+    if isinstance(model, LRUBanksLM):
+        return inspect_banks(models, body, model, tok)
     if not isinstance(model, MinGRULM):
         raise ValueError(f"inspection is for min-gru and gated-deltanet runs ({type(model).__name__} loaded)")
     ids = tok.encode(body["text"]).ids
@@ -592,6 +598,156 @@ def attend(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
             "o_norm": np.round(np.linalg.norm(o, axis=-1), 4).tolist()}
 
 
+def inspect_banks(models: "Models", body: Dict[str, Any], model: Any, tok: Any) -> Dict[str, Any]:
+    """The Inspect tab for an `lru-banks` run: tokens, the final prediction's loss / rank / entropy, the logit lens
+    (after the embedding and each layer) and each layer's LRU input gate at every position. The torch path runs with
+    every layer's routing weights r, values v, read probabilities p over the slots (per hop) and reads o recorded
+    (`models.banks`) for `/api/banks`, which unrolls one position's reads and bank contents over the past tokens."""
+    import uuid
+
+    import torch
+
+    import model.archs.lru_banks as lb
+
+    ids = tok.encode(body["text"]).ids
+    if not ids or ids[0] != model.reset_token:
+        ids = [model.reset_token] + ids
+    truncated = len(ids) > MAX_INSPECT_TOKENS
+    ids = ids[:MAX_INSPECT_TOKENS]
+    writes: List[List[np.ndarray]] = []  # per layer: r, v
+    reads: List[List[np.ndarray]] = []  # per read (layer-major, then hop): p, o
+    gates: List[Optional[np.ndarray]] = []
+    streams: List[torch.Tensor] = []
+    np_ = lambda x: x[0].detach().float().cpu().numpy()
+    orig = (lb.bank_write_chunk, lb.bank_read, lb.lru_states, lb.FUSED)
+
+    def write(k, v, r, *args, **kw):
+        writes.append([np_(r), np_(v)])
+        return orig[0](k, v, r, *args, **kw)
+
+    def read(mem, q, tau, record=None):
+        rec: List[torch.Tensor] = []
+        o = orig[1](mem, q, tau, rec)
+        reads.append([np_(rec[0]), np_(o)])
+        return o
+
+    def lru(proj, nu, theta, gate, *args, **kw):
+        gates.append(None if gate is None else np_(gate)[:, 0])
+        return orig[2](proj, nu, theta, gate, *args, **kw)
+
+    def layer(*args):
+        out = type(model)._layer(model, *args)
+        streams.append(out[0][0].detach().float())
+        return out
+
+    with models.lock, torch.no_grad():
+        lb.bank_write_chunk, lb.bank_read, lb.lru_states, lb.FUSED = write, read, lru, False
+        model._layer = layer
+        try:
+            model.dense_hidden(np.asarray([ids], np.int32))
+        finally:
+            lb.bank_write_chunk, lb.bank_read, lb.lru_states, lb.FUSED = orig
+            del model._layer
+        E = model.token_embedding.embeddings.value
+        emb = (E[torch.as_tensor(ids, device=E.device)] @ model.w_in.value).float()
+        logits = [torch.as_tensor(model.readout(model.readout_input(s))).float().cpu().numpy() for s in [emb] + streams]
+        loga = [p["loga"].value.detach().double().cpu().numpy() for p in model._params]
+        cpu = lambda w: w.value.detach().float().cpu().numpy()
+        lh = model.layer_hops
+        hops = max(lh)  # a layer with fewer reads: its missing ones are zeros (p, o, W_o), shown as absent
+        w_o = [np.stack([cpu(p["w_o"])] + ([cpu(p["w_o2"]) if "w_o2" in p else np.zeros_like(cpu(p["w_o"]))]
+                                            if hops > 1 else [])) for p in model._params]
+        lens_w = (cpu(model.final_norm)[:, None] * cpu(model.w_out), cpu(model.token_embedding.embeddings))
+    nl = model.num_layers
+    by_layer, i = [], 0
+    for h in lh:  # the reads were recorded layer after layer, then hop after hop
+        rs = reads[i:i + h]
+        i += h
+        by_layer.append(rs + [[np.zeros_like(x) for x in rs[0]]] * (hops - h))
+    reads = [r for rs in by_layer for r in rs]
+    reset = np.asarray(ids) == model.reset_token
+    models.banks = {"id": uuid.uuid4().hex, "reset": reset, "loga": np.stack(loga),  # (L, H, M)
+                    "r": np.stack([w[0] for w in writes]), "v": np.stack([w[1] for w in writes]),  # (L, T, H, .)
+                    "p": np.stack([r[0] for r in reads]).reshape(nl, hops, *reads[0][0].shape),  # (L, hops, T, H, M)
+                    "o": np.stack([r[1] for r in reads]).reshape(nl, hops, *reads[0][1].shape), "ids": ids,
+                    "w_o": np.stack(w_o), "lens_w": lens_w, "tok": tok, "layer_hops": lh}  # w_o (L, hops, H * D, dim)
+    stats = _prediction_stats(logits[-1], ids, body["run"], model.reset_token)
+    lens = [_top5(x) for x in logits]
+    used = set(ids) | {i for rows in lens for row in rows for i, _ in row}
+    vocab = {i: tok.decode([i], skip_special_tokens=False) for i in sorted(used)}
+    slot_hl = np.log(0.5) / models.banks["loga"][0, 0]
+    T = len(ids)
+    return {**stats, "kind": "banks", "banks_id": models.banks["id"], "num_layers": nl, "hops": hops, "layer_hops": lh,
+            "num_heads": model.num_heads, "slots": model.slots, "slot_half_life": np.round(slot_hl, 1).tolist(),
+            "gate": [None if g is None else np.round(g, 3).tolist() for g in gates],
+            "tokens": [vocab[i] for i in ids], "raw": [vocab[i] for i in ids], "kept": list(range(T)), "ids": ids,
+            "reset": reset.astype(int).tolist(), "T": T, "truncated": truncated, "layers": [], "memory": None,
+            "static_memory": False, "raw_tokens": T, "lens": lens, "vocab": vocab}
+
+
+def banks_at(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
+    """Position t of the last `inspect_banks` text, unrolled exactly over its document's tokens start..t. Slot m of a
+    head holds the average of the values written to it, token j weighted by r_jm a_m^(t - j) / z_tm (z the written
+    mass), and a read takes sum_m p_tm of those averages, so:
+    - `read` `(layers, hops, heads, n)`: token j's weight in the read, c_j = sum_m p_tm r_jm a_m^(t - j) / z_tm
+      (c >= 0, summing to 1; the read is sum_j c_j v_j: `err` is the largest difference with the model's read,
+      relative to its size);
+    - `stored` `(layers, heads, n)`: token j's share of the banks, the mean over the non-empty slots of its share of
+      each slot's average;
+    - `slots` [layer][hop][head]: the 3 slots the read takes most, as [slot, p, [[position, share of the slot], ...]];
+    - `filled` [layer][head]: non-empty slots;
+    - `says` [layer][hop][head] and `says_all` [layer][hop]: the value lens, the 5 tokens a read's addition to the
+      stream (o W_o, per head and all heads) raises most through the final norm's gain and the readout (its direct
+      logit effect: what was retrieved, in token space, also where the read position's value is a mixed summary)."""
+    from model.archs.bank_memory import EPS
+
+    b = getattr(models, "banks", None)
+    if b is None or b["id"] != body.get("banks_id"):
+        raise ValueError("inspect the text again (another text or model was inspected since)")
+    t = int(body["t"])
+    resets = np.flatnonzero(b["reset"][:t + 1])
+    start = int(resets[-1]) if len(resets) else 0
+    n = t + 1 - start
+    age = (t - np.arange(start, t + 1)).astype(np.float64)
+    W = b["r"][:, start:t + 1].astype(np.float64) * np.exp(b["loga"][:, None] * age[None, :, None, None])  # (L, n, H, M)
+    z = W.sum(1)  # (L, H, M)
+    valid = z > EPS
+    share = np.where(valid[:, None], W / np.maximum(z, EPS)[:, None], 0.0)  # (L, n, H, M): j's share of slot m
+    p = b["p"][:, :, t].astype(np.float64) * valid[:, None]  # (L, hops, H, M)
+    c = np.einsum("lohm,ljhm->lohj", p, share)
+    rebuilt = np.einsum("lohj,ljhe->lohe", c, b["v"][:, start:t + 1].astype(np.float64))
+    o = b["o"][:, :, t]
+    err = float(np.abs(rebuilt - o).max() / max(1e-12, float(np.abs(o).max())))
+    stored = share.sum(-1).transpose(0, 2, 1) / np.maximum(valid.sum(-1), 1)[..., None]  # (L, H, n)
+    slots = []
+    for li in range(p.shape[0]):
+        per_hop = []
+        for hop in range(p.shape[1]):
+            per_head = []
+            for h in range(p.shape[2]):
+                top = np.argsort(-p[li, hop, h])[:3]
+                per_head.append([[int(m), round(float(p[li, hop, h, m]), 4),
+                                  [[start + int(j), round(float(share[li, j, h, m]), 4)]
+                                   for j in np.argsort(-share[li, :, h, m])[:5] if share[li, j, h, m] > 0.005]]
+                                 for m in top if p[li, hop, h, m] > 0.005])
+            per_hop.append(per_head)
+        slots.append(per_hop)
+    L, hops, H, D = o.shape
+    add = np.einsum("lohd,lohdk->lohk", o, b["w_o"].reshape(L, hops, H, D, -1))  # (L, hops, H, dim) per head
+    g_out, E = b["lens_w"]
+    logit = np.concatenate([add, add.sum(2, keepdims=True)], 2) @ g_out @ E.T  # (L, hops, H + 1, V)
+    top = np.argsort(-logit, -1)[..., :5]
+    dec = lambda i: b["tok"].decode([int(i)], skip_special_tokens=False)
+    lh = b["layer_hops"]
+    full = np.concatenate([add, add.sum(2, keepdims=True)], 2)
+    adds = np.abs(full).max(-1) > 1e-12  # a silent layer (W_o = 0, `silent_from`) adds nothing: no tokens
+    says = [[[[dec(i) for i in top[li, hop, h]] if hop < lh[li] and adds[li, hop, h] else [] for h in range(H + 1)]
+             for hop in range(hops)] for li in range(L)]
+    return {"t": t, "start": start, "n": n, "read": _b64(c), "stored": _b64(stored), "err": err, "slots": slots,
+            "filled": valid.sum(-1).tolist(), "says": [[s[:H] for s in sl] for sl in says],
+            "says_all": [[s[H] for s in sl] for sl in says]}
+
+
 def _prediction_stats(logits: np.ndarray, ids: List[int], run: str, reset_token: int) -> Dict[str, Any]:
     """The prediction at every position (target: the next token): its entropy, the loss and rank of the actual next
     token (rank 0: the top-1 choice), and which targets the training scores (inside the dataset's loss_spans, the
@@ -729,6 +885,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/attend":
             try:
                 self._json(attend(self.models, body))
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"{type(e).__name__}: {e}"})
+        elif self.path == "/api/banks":
+            try:
+                self._json(banks_at(self.models, body))
             except Exception as e:  # noqa: BLE001
                 self._json({"error": f"{type(e).__name__}: {e}"})
         else:
