@@ -4,6 +4,8 @@
 #
 #   ./pod.sh up [gpu-id]            create the pod (default "NVIDIA RTX A5000": community cloud, else secure), wait for
 #                                   ssh; its id goes to .pod (a running pod is reused)
+#   ./pod.sh gpus [--all]           table of the GPUs in stock now (cheapest first): the id to pass to `up`, VRAM, $/hr
+#                                   community / secure, stock, the best data centers; --all: unavailable ones too
 #   ./pod.sh push [dataset]         rsync the code + datasets/<dataset> + tokenizers/<dataset> (default
 #                                   agent-mix-v2-bpe1024) to /root/rnn-research (container disk, fast; wiped when the
 #                                   pod stops: push again), runs/ -> /workspace/runs (kept), build the venv if missing
@@ -70,6 +72,35 @@ cmd_up() {
         echo "  $(tail -c 300 <<<"$out")"
     done
     die "no pod created"
+}
+
+cmd_gpus() {
+    local all=0; [[ ${1:-} == --all ]] && all=1
+    runpodctl gpu list 2>&1 | ALL=$all python3 -c '
+import json, os, sys
+try:
+    gpus = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit("runpodctl gpu list failed (network, or no api key)")
+rank = {"High": 0, "Medium": 1, "Low": 2}
+price = lambda g: min(p for p in (g.get("communityPricePerHr"), g.get("securePricePerHr")) if p) if (g.get("communityPricePerHr") or g.get("securePricePerHr")) else 1e9
+shown = [g for g in gpus if g["available"] or os.environ["ALL"] == "1"]
+shown.sort(key=lambda g: (not g["available"], price(g)))
+rows = [("gpu id (for up)", "VRAM", "community", "secure", "stock", "data centers in stock (best 3)")]
+for g in shown:
+    dcs = sorted((d for d in g.get("dataCenterAvailability") or [] if d["stockStatus"] != "none"),
+                 key=lambda d: rank.get(d["stockStatus"], 3))
+    money = lambda v: f"${v:.2f}" if v else "-"
+    rows.append((g["gpuId"], str(g["memoryInGb"]) + " GB", money(g.get("communityPricePerHr")), money(g.get("securePricePerHr")),
+                 g["stockStatus"] if g["available"] else "none",
+                 " ".join(d["dataCenterId"] + "(" + d["stockStatus"][0] + ")" for d in dcs[:3]) + (" +%d" % (len(dcs) - 3) if len(dcs) > 3 else "")))
+w = [max(len(r[i]) for r in rows) for i in range(6)]
+for n, r in enumerate(rows):
+    print("  ".join(c.rjust(w[i]) if i in (1, 2, 3) else c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
+    if n == 0:
+        print("  ".join("-" * x for x in w))
+print("\n$/hr; stock H(igh) / M(edium) / L(ow); create one with: ./pod.sh up <gpu id>")
+'
 }
 
 cmd_push() {
@@ -142,6 +173,6 @@ cmd_start() { runpodctl pod start "$(pod_id)"; }
 cmd_rm() { runpodctl pod delete "$(pod_id)" && rm -f "$STATE"; }
 
 case "${1:-}" in
-    up|push|sh|train|log|pull|status|stop|start|rm|_setup) c="$1"; shift; "cmd_$c" "$@" ;;
-    *) sed -n '2,20p' "$0"; exit 1 ;;
+    up|gpus|push|sh|train|log|pull|status|stop|start|rm|_setup) c="$1"; shift; "cmd_$c" "$@" ;;
+    *) sed -n '2,22p' "$0"; exit 1 ;;
 esac
