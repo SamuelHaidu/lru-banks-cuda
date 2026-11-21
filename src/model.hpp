@@ -45,6 +45,7 @@ struct Config {
     float lr = 2e-3f, wd = 0.1f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-7f, clip = 1.f;
     int warmup = 0, decay_start = 0, decay_steps = 0;  // the schedule (kernels.hpp: schedule_lr)
     float min_ratio = 0.1f;
+    bool cosine = false;  // the decay's shape: half a cosine (else linear)
     float tau = 8.f, lru_hl_min = 1.f, lru_hl_max = 16.f, slot_hl_min = 1.f, slot_hl_max = 1024.f;
     float gate_bias_w = 2.f, gate_bias_r = 2.f;  // initial gate logit biases (how many gates start open)
     float budget = 0.f, budget_target = 0.5f;
@@ -165,7 +166,9 @@ class Model {
     void embed_fwd(const Batch& b, cudaStream_t s);
     void readout_loss(const Batch& b, bool backward, cudaStream_t s);
     float* b2_colsum(int n);  // layer n's b2 gradient when it is a 1-hop layer (else null)
-    Schedule schedule() const { return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio}; }
+    Schedule schedule() const {
+        return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0};
+    }
     float* loga_;
 
     // forward buffers

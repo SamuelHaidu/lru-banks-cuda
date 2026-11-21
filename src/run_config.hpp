@@ -55,6 +55,7 @@ struct TrainCfg {
     int warmup_steps = 100;      // linear warmup over the first updates
     int lr_decay_start = 0, lr_decay_steps = 0;  // warmup-stable-decay: linear to lr_min_ratio x (0 steps: none)
     double lr_min_ratio = 0.1;
+    std::string lr_decay_shape = "linear";  // "linear" or "cosine"
     double weight_decay = 0.1, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-7;
     double global_clipnorm = 1.0;  // 0 or null: off
     int epochs = 100;

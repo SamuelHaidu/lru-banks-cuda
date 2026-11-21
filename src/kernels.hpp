@@ -38,12 +38,13 @@ void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 
 // The learning rate of update `step` (0-based: updates done before it), as the Python pipeline's LinearWarmup:
-// linear warmup to lr over `warmup` updates, then constant; with decay_steps > 0, from update decay_start a linear
-// fall to min_ratio x lr over decay_steps updates.
+// linear warmup to lr over `warmup` updates, then constant; with decay_steps > 0, from update decay_start a fall to
+// min_ratio x lr over decay_steps updates, linear or (cosine) half a cosine, then min_ratio x lr.
 struct Schedule {
     float lr;
     int warmup, decay_start, decay_steps;
     float min_ratio;
+    int cosine = 0;
 };
 __host__ __device__ inline float schedule_lr(const Schedule& s, int step) {
     float frac = float(step + 1) / float(s.warmup > 1 ? s.warmup : 1);
@@ -51,7 +52,8 @@ __host__ __device__ inline float schedule_lr(const Schedule& s, int step) {
     if (s.decay_steps > 0) {
         float done = float(step - s.decay_start) / float(s.decay_steps);
         done = done < 0.f ? 0.f : (done > 1.f ? 1.f : done);
-        frac *= 1.f - (1.f - s.min_ratio) * done;
+        const float shape = s.cosine ? 0.5f * (1.f + cosf(3.14159265358979f * done)) : 1.f - done;  // 1 -> 0
+        frac *= s.min_ratio + (1.f - s.min_ratio) * shape;
     }
     return s.lr * frac;
 }

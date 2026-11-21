@@ -138,6 +138,7 @@ void visit(V& v, RC& c) {
     v("lr_decay_start", c.training.lr_decay_start);
     v("lr_decay_steps", c.training.lr_decay_steps);
     v("lr_min_ratio", c.training.lr_min_ratio);
+    v("lr_decay_shape", c.training.lr_decay_shape);
     v("weight_decay", c.training.weight_decay);
     v("beta_1", c.training.beta_1);
     v("beta_2", c.training.beta_2);
@@ -215,6 +216,8 @@ void RunConfig::validate() const {
     check(t.warmup_steps >= 0 && t.lr_decay_start >= 0 && t.lr_decay_steps >= 0, "training.warmup_steps / lr_decay_*",
           "must be >= 0");
     check(t.lr_min_ratio >= 0 && t.lr_min_ratio <= 1, "training.lr_min_ratio", "must be in [0, 1]");
+    check(t.lr_decay_shape == "linear" || t.lr_decay_shape == "cosine", "training.lr_decay_shape",
+          "must be \"linear\" or \"cosine\"");
     check(t.weight_decay >= 0, "training.weight_decay", "must be >= 0");
     check(t.beta_1 >= 0 && t.beta_1 < 1 && t.beta_2 >= 0 && t.beta_2 < 1, "training.beta_1 / beta_2",
           "must be in [0, 1)");
@@ -251,6 +254,7 @@ Config RunConfig::model_config() const {
     c.decay_start = training.lr_decay_start;
     c.decay_steps = training.lr_decay_steps;
     c.min_ratio = float(training.lr_min_ratio);
+    c.cosine = training.lr_decay_shape == "cosine";
     c.wd = float(training.weight_decay);
     c.beta1 = float(training.beta_1);
     c.beta2 = float(training.beta_2);
