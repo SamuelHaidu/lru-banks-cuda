@@ -52,7 +52,7 @@ class TestRowsVsGeneration(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = self.tf32
 
     def test_dense_row_equals_position_by_position(self):
-        for hops in (1, 2):
+        for hops in (1, 2, [2, 1, 1]):  # one value for every layer, or one per layer
             m = small_model(hops=hops)
             x = ids_with_resets()
             with torch.no_grad():
@@ -84,6 +84,87 @@ class TestRowsVsGeneration(unittest.TestCase):
             a, b = m.dense_hidden(x), m.dense_hidden(x2)
         self.assertGreater(float((a[0, 5:9] - b[0, 5:9]).abs().max()), 1e-6)
         self.assertLess(float((a[0, 9:] - b[0, 9:]).abs().max()), 1e-5)
+
+
+class TestGrowth(unittest.TestCase):
+    """A deeper model grown from a trained one (`silent_from` + `init_weights_from` its layers) starts with exactly its
+    outputs, and its new layers learn."""
+
+    def setUp(self):
+        from model.archs import lru_banks
+
+        self.saved, lru_banks.FUSED = lru_banks.FUSED, False
+
+    def tearDown(self):
+        from model.archs import lru_banks
+
+        lru_banks.FUSED = self.saved
+
+    def grown(self):
+        from unittest import mock
+
+        import model.evaluate
+        from model.train import _init_weights_from_run
+
+        src = small_model()  # 3 layers x 2 hops
+        rng = np.random.default_rng(2)
+        for v in src.weights:  # away from the init (w_o etc. start small): a "trained" model
+            v.assign(np.asarray(v.value.detach().cpu()) + rng.normal(0, 0.05, v.shape).astype("float32"))
+        big = small_model(num_layers=5, hops=[2, 2, 2, 1, 1], silent_from=3)
+        spec = {"run": "src", "weights": ["token_embedding", "w_in", "w_out", "final_norm", "l0_*", "l1_*", "l2_*"]}
+        with mock.patch.object(model.evaluate, "load_checkpoint", lambda run, ckpt: src):
+            _init_weights_from_run(big, spec, verbose=0)
+        return src, big
+
+    def test_grown_model_starts_with_the_same_outputs(self):
+        src, big = self.grown()
+        self.assertNotIn("l3_w_o2", [v.path.split("/")[-1] for v in big.weights])  # one read: no hop-2 weights
+        x = ids_with_resets()
+        with torch.no_grad():
+            a = src.readout(src.readout_input(src.dense_hidden(x)))
+            b = big.readout(big.readout_input(big.dense_hidden(x)))
+        self.assertLess(float((a - b).abs().max()), 1e-6 * float(a.abs().max()))
+
+    def test_like_init_and_freeze(self):
+        """`like`: new layers start as permutations of a trained layer's weights (same values), fixed decays keep their
+        init; `freeze_except` the new layers: only they get gradients."""
+        from unittest import mock
+
+        import model.evaluate
+        from model.train import _apply_freeze, _init_weights_from_run
+
+        src = small_model()
+        rng = np.random.default_rng(2)
+        for v in src.trainable_variables:  # "trained": no constant weights (norms start at 1)
+            v.assign(np.asarray(v.value.detach().cpu()) + rng.normal(0, 0.05, v.shape).astype("float32"))
+        big = small_model(num_layers=5, hops=[2, 2, 2, 1, 1])
+        spec = {"run": "src", "weights": ["token_embedding", "w_in", "w_out", "final_norm", "l0_*", "l1_*", "l2_*"],
+                "like": {"l3": "l2", "l4": "l2"}}
+        with mock.patch.object(model.evaluate, "load_checkpoint", lambda run, ckpt: src):
+            _init_weights_from_run(big, spec, verbose=0)
+        W = {v.path.split("/")[-1]: v.value.detach().cpu().numpy() for v in big.weights}
+        S = {v.path.split("/")[-1]: v.value.detach().cpu().numpy() for v in src.weights}
+        for k in ("w_o", "w1", "router", "nu", "norm1"):
+            np.testing.assert_array_equal(np.sort(W[f"l4_{k}"].ravel()), np.sort(S[f"l2_{k}"].ravel()))
+            self.assertFalse(np.array_equal(W[f"l4_{k}"], S[f"l2_{k}"]), k)  # permuted, not copied
+        np.testing.assert_array_equal(W["l4_loga"], S["l2_loga"])  # fixed decays: their own (identical) init
+        _apply_freeze(big, [v.name for v in big.weights if v.name.startswith(("l3_", "l4_"))], verbose=0)
+        x = ids_with_resets()
+        loss = (big.readout(big.readout_input(big.dense_hidden(x))) ** 2).mean()
+        train = big.trainable_variables
+        self.assertTrue(train and all(v.name.startswith(("l3_", "l4_")) for v in train))
+        grads = torch.autograd.grad(loss, [v.value for v in train])
+        self.assertTrue(all(float(g.abs().max()) > 0 for g in grads))
+
+    def test_new_layers_get_gradients(self):
+        _, big = self.grown()
+        x = ids_with_resets()
+        loss = (big.readout(big.readout_input(big.dense_hidden(x))) ** 2).mean()
+        names = [v.path.split("/")[-1] for v in big.trainable_variables]
+        grads = dict(zip(names, torch.autograd.grad(loss, [v.value for v in big.trainable_variables],
+                                                    allow_unused=True)))
+        for n in ("l3_w_o", "l3_w2", "l4_w_o", "l4_w2", "l4_b2_bias"):  # the zeros move first
+            self.assertGreater(float(grads[n].abs().max()), 0, n)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA only")

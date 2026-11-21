@@ -146,7 +146,8 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         num_heads, head_dim: Bank heads; keys and values head_dim each.
         slots: Bank slots per head and layer.
         topk: Slots written per token and head.
-        hops: Reads per layer (1 or 2).
+        hops: Reads per layer (1 or 2), one value for every layer or a list with one per layer (e.g. [2, 2, 2, 2, 1, 1]:
+            the hop-2 weights exist only in the layers with 2).
         ffn_mult: FFN hidden width / dim (GELU).
         gate_from: First layer with the LRU input gate (layers below it: no gate).
         lru_half_life, slot_half_life: (min, max) half-lives in tokens at init, log-spaced.
@@ -155,9 +156,14 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         window_size: Training row length (packed documents). The states have no window.
         reset_token: Document marker id (every state restarts there).
         chunk: Chunk length of the torch recurrences.
+        silent_from: Layers from this index on (0-based) start with their output projections (W_o, W_o2, the FFN's
+            second matrix) at 0: both reads and both FFN passes add exactly 0 to the stream, so a deeper model grown
+            from a trained one (`init_weights_from` its layers) starts with exactly its outputs. The zeros still get
+            gradients (the reads and FFN hidden units are not 0), and the layer's other weights follow once they move.
     """
 
-    no_weight_decay_names = ("norm", "bias", "nu", "theta", "tau", "loga")
+    # the router's scale is how sharply a key picks its slots: weight decay shrank it below its init in every layer
+    no_weight_decay_names = ("norm", "bias", "nu", "theta", "tau", "loga", "router")
     config_defaults = {
         "training": {"learning_rate": 0.002, "warmup_steps": 500, "dense_supervision": True,
                      "dense_validation": True, "weight_decay": 0.1, "global_clipnorm": 1.0},
@@ -168,21 +174,25 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
 
     def __init__(self, vocabulary_size: int = 32768, embed_dim: int = 128, dim: int = 512, num_layers: int = 4,
                  lru_dim: int = 256, num_heads: int = 16, head_dim: int = 32, slots: int = 128, topk: int = 2,
-                 hops: int = 2, ffn_mult: int = 4, gate_from: int = 1,
+                 hops: Any = 2, ffn_mult: int = 4, gate_from: int = 1,
                  lru_half_life: Sequence[float] = (1.0, 16.0), slot_half_life: Sequence[float] = (1.0, 1024.0),
                  tau: float = 8.0, gate_bias: float = 3.0, window_size: int = 512, reset_token: int = 0,
-                 chunk: int = 16, **kwargs: Any):
+                 chunk: int = 16, silent_from: Optional[int] = None, **kwargs: Any):
         super().__init__(**kwargs)
         self._vocabulary_size = int(vocabulary_size)
         self.embed_dim, self.dim, self.num_layers = int(embed_dim), int(dim), int(num_layers)
         self.lru_dim, self.num_heads, self.head_dim = int(lru_dim), int(num_heads), int(head_dim)
-        self.slots, self.topk, self.hops, self.ffn_mult = int(slots), int(topk), int(hops), int(ffn_mult)
-        assert self.hops in (1, 2), "hops: 1 or 2"
+        self.slots, self.topk, self.ffn_mult = int(slots), int(topk), int(ffn_mult)
+        self.hops = [int(h) for h in hops] if isinstance(hops, (list, tuple)) else int(hops)  # as configured
+        self.layer_hops = list(self.hops) if isinstance(self.hops, list) else [self.hops] * int(num_layers)
+        assert len(self.layer_hops) == int(num_layers), "hops: one value, or one per layer"
+        assert all(h in (1, 2) for h in self.layer_hops), "hops: 1 or 2"
         self.gate_from = int(gate_from)
         self.lru_half_life = [float(v) for v in lru_half_life]
         self.slot_half_life = [float(v) for v in slot_half_life]
         self.tau, self.gate_bias = float(tau), float(gate_bias)
         self.window_size, self.reset_token, self.chunk = int(window_size), int(reset_token), int(chunk)
+        self.silent_from = None if silent_from is None else int(silent_from)
         self.token_embedding = layers.Embedding(
             self._vocabulary_size, self.embed_dim, name="token_embedding",
             embeddings_initializer=keras.initializers.RandomNormal(stddev=0.02))
@@ -204,7 +214,7 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         HD, Fh = H * Dh, self.ffn_mult * self.dim
         self.token_embedding.build((None,))
         normal = keras.initializers.RandomNormal(stddev=0.02)
-        out_init = keras.initializers.RandomNormal(stddev=0.02 / math.sqrt(2 * self.num_layers * self.hops))
+        out_init = keras.initializers.RandomNormal(stddev=0.02 / math.sqrt(2 * sum(self.layer_hops)))
         self.w_in = self.add_weight(name="w_in", shape=(E0, D), initializer=normal)
         self.final_norm = self.add_weight(name="final_norm", shape=(D,), initializer="ones")
         self.w_out = self.add_weight(name="w_out", shape=(D, E0), initializer=normal)
@@ -213,6 +223,8 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         rng = np.random.default_rng(0)
         self._params: List[Dict[str, Any]] = []
         for n in range(self.num_layers):
+            silent = self.silent_from is not None and n >= self.silent_from
+            o_init = "zeros" if silent else out_init
             w = lambda name, shape, init, trainable=True: self.add_weight(
                 name=f"l{n}_{name}", shape=shape, initializer=init, trainable=trainable)
             p = {
@@ -227,20 +239,20 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
                 "router": w("router", (H, Dh, M), keras.initializers.RandomNormal(stddev=1 / math.sqrt(Dh))),
                 "loga": w("loga", (H, M), _const(np.tile(math.log(0.5) / shl, (H, 1))), trainable=False),
                 "log_tau": w("log_tau", (H,), _const(np.full(H, math.log(self.tau)))),
-                "w_o": w("w_o", (HD, D), out_init),
+                "w_o": w("w_o", (HD, D), o_init),
                 "ffn_norm1": w("ffn_norm1", (D,), "ones"),
                 "w1": w("w1", (D, Fh), normal),
                 "b1_bias": w("b1_bias", (Fh,), "zeros"),
-                "w2": w("w2", (Fh, D), out_init),
+                "w2": w("w2", (Fh, D), o_init),
                 "b2_bias": w("b2_bias", (D,), "zeros"),
             }
             if n >= self.gate_from:
                 p["w_gate"] = w("w_gate", (D, 1), "zeros")
                 p["gate_bias"] = w("gate_bias", (1,), _const([self.gate_bias]))
-            if self.hops > 1:
+            if self.layer_hops[n] > 1:
                 p |= {"q2_norm": w("q2_norm", (D,), "ones"), "w_q2": w("w_q2", (D, HD), normal),
                       "log_tau2": w("log_tau2", (H,), _const(np.full(H, math.log(self.tau)))),
-                      "w_o2": w("w_o2", (HD, D), out_init), "ffn_norm2": w("ffn_norm2", (D,), "ones")}
+                      "w_o2": w("w_o2", (HD, D), o_init), "ffn_norm2": w("ffn_norm2", (D,), "ones")}
             self._params.append(p)
         self.built = True
 
@@ -266,7 +278,7 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         mem = bank_kernels.BankWrite(k, v, r, p["loga"].float(), reset, bctx)
         h = _f_post(h, mem.read(q, p["log_tau"].float().exp()), p["w_o"], p["ffn_norm1"], p["w1"], p["b1_bias"],
                     p["w2"], p["b2_bias"])
-        if self.hops > 1:
+        if self.layer_hops[n] > 1:
             q2 = _f_q2(h, p["q2_norm"], p["w_q2"], H, D)
             h = _f_post(h, mem.read(q2, p["log_tau2"].float().exp()), p["w_o2"], p["ffn_norm2"], p["w1"],
                         p["b1_bias"], p["w2"], p["b2_bias"])
@@ -304,7 +316,7 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
         o = read(q, p["log_tau"].float().exp())
         h = h + (o.reshape(B, T, -1) @ p["w_o"]).float()
         h = h + self._ffn(p, h, "ffn_norm1")
-        if self.hops > 1:
+        if self.layer_hops[n] > 1:
             q2 = self._heads(_rms(h, p["q2_norm"]) @ p["w_q2"])
             o2 = read(q2, p["log_tau2"].float().exp())
             h = h + (o2.reshape(B, T, -1) @ p["w_o2"]).float()
@@ -380,4 +392,5 @@ class LRUBanksLM(DenseSupervisionMixin, BaseLM):
                 "head_dim": self.head_dim, "slots": self.slots, "topk": self.topk, "hops": self.hops,
                 "ffn_mult": self.ffn_mult, "gate_from": self.gate_from, "lru_half_life": self.lru_half_life,
                 "slot_half_life": self.slot_half_life, "tau": self.tau, "gate_bias": self.gate_bias,
-                "window_size": self.window_size, "reset_token": self.reset_token, "chunk": self.chunk}
+                "window_size": self.window_size, "reset_token": self.reset_token, "chunk": self.chunk,
+                "silent_from": self.silent_from}

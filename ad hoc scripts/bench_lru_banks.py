@@ -25,10 +25,9 @@ def forward_macs(m: LRUBanksLM, chunk: int = 64) -> float:
                                 m.vocabulary_size, m.embed_dim)
     HD = H * Dh
     proj = D * 2 * N + 2 * (2 * N * HD) + D * HD + HD * D  # LRU in, W_k, W_q, W_v, W_o
-    hop2 = D * HD + HD * D if m.hops > 1 else 0
-    ffn = m.hops * 2 * D * F
     read = H * (chunk * Dh + Dh * M + chunk * M + M * Dh) * 2  # scores pass + values pass (chunk + state terms)
-    return m.num_layers * (proj + hop2 + ffn + m.hops * read) + E0 * D + D * E0 + E0 * V
+    per_hop = 2 * D * F + read  # every hop: a read and an FFN pass; hop 2 also its query and output projections
+    return sum(proj + h * per_hop + (h - 1) * 2 * D * HD for h in m.layer_hops) + E0 * D + D * E0 + E0 * V
 
 
 def main():
