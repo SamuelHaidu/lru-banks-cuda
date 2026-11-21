@@ -95,6 +95,7 @@ struct DatasetMeta {
     std::string train_file, validation_file;     // full paths
     double train_chars_per_token = 0.0, validation_chars_per_token = 0.0;  // 0: unknown (no bpc)
     int score_after_token = -1;  // >= 0: only targets after this token in a document are scored (synthetic tasks)
+    int score_prev_token = -1;   // >= 0: only targets whose input follows this token are scored (recall queries)
     static DatasetMeta load(const std::string& dir);
 };
 

@@ -59,9 +59,10 @@ bool scored_at(const uint16_t* tok, size_t start, int marker, int score_after) {
     return false;
 }
 
-// one row of T tokens from `start` (positions past n read as the marker); returns the scored targets
-int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int score_after, int* ids, int* y,
-             uint8_t* reset) {
+// one row of T tokens from `start` (positions past n read as the marker); returns the scored targets. score_prev >= 0:
+// only targets whose input token follows that token are scored (a recall task's query marker: `? key` -> value)
+int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int score_after, int score_prev, int* ids,
+             int* y, uint8_t* reset) {
     bool on = scored_at(tok, start, marker, score_after);
     int targets = 0;
     for (int t = 0; t < T; ++t) {
@@ -69,7 +70,7 @@ int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int
         const int x = p < n ? tok[p] : marker, nx = p + 1 < n ? tok[p + 1] : marker;
         if (x == marker) on = score_after < 0;
         if (x == score_after) on = true;
-        const bool scored = nx != marker && on;
+        const bool scored = nx != marker && on && (score_prev < 0 || (p > 0 && p - 1 < n && tok[p - 1] == score_prev));
         ids[t] = x;
         y[t] = scored ? nx : -1;
         reset[t] = x == marker;
@@ -81,8 +82,9 @@ int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int
 }  // namespace
 
 Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int score_after,
-               int slots)
-    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), seed_(seed), next_batch_(start_batch),
+               int score_prev, int slots)
+    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), score_prev_(score_prev), seed_(seed),
+      next_batch_(start_batch),
       steps_per_pass_(steps_per_pass(file.size(), B, T)), slots_(size_t(slots)) {
     if (steps_per_pass_ == 0)
         throw std::runtime_error("Loader: the token file holds less than one batch of " + std::to_string(B) +
@@ -130,7 +132,7 @@ void Loader::fill(HostBatch& hb) {
     for (int b = 0; b < B_; ++b) {
         const size_t start = offset_ + size_t(order_[j * B_ + b]) * T_;
         const size_t o = size_t(b) * T_;
-        targets += fill_row(tok, n, start, T_, marker_, score_after_, hb.ids + o, hb.y + o, hb.reset + o);
+        targets += fill_row(tok, n, start, T_, marker_, score_after_, score_prev_, hb.ids + o, hb.y + o, hb.reset + o);
     }
     hb.n_targets = targets;
     *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
@@ -183,7 +185,7 @@ void Loader::release(HostBatch* hb, cudaStream_t stream) {
 }
 
 ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker,
-                             int score_after) {
+                             int score_after, int score_prev) {
     const size_t n = file.size();
     const uint16_t* tok = file.data();
     std::vector<size_t> starts;
@@ -203,7 +205,7 @@ ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uin
         for (int b = 0; b < B; ++b) {
             const size_t start = starts[rng() % starts.size()];
             const size_t o = size_t(b) * T;
-            targets += fill_row(tok, n, start, T, marker, score_after, hb.ids + o, hb.y + o, hb.reset + o);
+            targets += fill_row(tok, n, start, T, marker, score_after, score_prev, hb.ids + o, hb.y + o, hb.reset + o);
         }
         hb.n_targets = targets;
         *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);

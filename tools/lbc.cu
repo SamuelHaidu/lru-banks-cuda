@@ -278,10 +278,10 @@ int cmd_train(int argc, char** argv) {
     if (rc.training.validation_steps > 0) {
         val_file = std::make_unique<TokenFile>(meta.validation_file);
         val = std::make_unique<ValidationSet>(*val_file, c.B, c.T, rc.training.validation_steps, seed,
-                                              meta.doc_token_id, meta.score_after_token);
+                                              meta.doc_token_id, meta.score_after_token, meta.score_prev_token);
     }
     Loader loader(train_file, c.B, c.T, seed, meta.doc_token_id, uint64_t(initial_epoch) * uint64_t(spe),
-                  meta.score_after_token);
+                  meta.score_after_token, meta.score_prev_token);
 
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
@@ -503,7 +503,8 @@ int cmd_eval(int argc, char** argv) {
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     TokenFile file(split);
-    ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token);
+    ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
+                     meta.score_prev_token);
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
     uint8_t* d_reset;
