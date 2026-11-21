@@ -96,6 +96,7 @@ struct DatasetMeta {
     double train_chars_per_token = 0.0, validation_chars_per_token = 0.0;  // 0: unknown (no bpc)
     int score_after_token = -1;  // >= 0: only targets after this token in a document are scored (synthetic tasks)
     int score_prev_token = -1;   // >= 0: only targets whose input follows this token are scored (recall queries)
+    int row_length = 0;          // > 0: the splits are whole packed rows of this length (window_size must match)
     static DatasetMeta load(const std::string& dir);
 };
 

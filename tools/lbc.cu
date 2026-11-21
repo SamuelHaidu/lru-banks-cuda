@@ -54,7 +54,8 @@ void usage() {
                  "  lbc create RUN_DIR --dataset DATASET_DIR [section.key=value ...]\n"
                  "  lbc config RUN_DIR [section.key value]\n"
                  "  lbc train  RUN_DIR [--epochs N]\n"
-                 "  lbc eval   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--steps N]\n");
+                 "  lbc eval   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--steps N]\n"
+                 "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n");
     std::exit(2);
 }
 
@@ -233,6 +234,9 @@ int cmd_train(int argc, char** argv) {
     if (meta.vocabulary_size != rc.arch.vocabulary_size)
         die("arch_params.vocabulary_size " + std::to_string(rc.arch.vocabulary_size) + " but the dataset has " +
             std::to_string(meta.vocabulary_size));
+    if (meta.row_length > 0 && meta.row_length != rc.arch.window_size)
+        die("the dataset is packed in rows of " + std::to_string(meta.row_length) +
+            " tokens: set arch_params.window_size to it");
     const int total_epochs = epochs_override > 0 ? epochs_override : rc.training.epochs;
     const std::string latest = run + "/model.lbc", csv_path = run + "/metrics.csv";
     const std::string run_name = fs::path(run).lexically_normal().filename().string();
@@ -278,10 +282,11 @@ int cmd_train(int argc, char** argv) {
     if (rc.training.validation_steps > 0) {
         val_file = std::make_unique<TokenFile>(meta.validation_file);
         val = std::make_unique<ValidationSet>(*val_file, c.B, c.T, rc.training.validation_steps, seed,
-                                              meta.doc_token_id, meta.score_after_token, meta.score_prev_token);
+                                              meta.doc_token_id, meta.score_after_token, meta.score_prev_token,
+                                              meta.row_length > 0);
     }
     Loader loader(train_file, c.B, c.T, seed, meta.doc_token_id, uint64_t(initial_epoch) * uint64_t(spe),
-                  meta.score_after_token, meta.score_prev_token);
+                  meta.score_after_token, meta.score_prev_token, meta.row_length > 0);
 
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
@@ -476,6 +481,94 @@ int cmd_train(int argc, char** argv) {
     return 0;
 }
 
+// One forward pass of a checkpoint on `rows` fixed rows of a token file, dumped for offline analysis
+// (scripts/analyze_copy.py): config.txt, manifest.txt, params.bin, ids / y / reset, each layer's decisions (routed slots,
+// gates) and the loss.
+int cmd_dump(int argc, char** argv) {
+    if (argc < 1) usage();
+    const std::string run = argv[0];
+    std::string which = "latest", split, out = "/tmp/lbc_inspect";
+    int rows = 2;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
+        else if (a == "--split" && i + 1 < argc) split = argv[++i];
+        else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else usage();
+    }
+    const std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
+    const CheckpointInfo info = read_checkpoint_info(path);
+    const RunConfig rc = RunConfig::from_json(info.config);
+    const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
+    if (split.empty()) split = meta.validation_file;
+    Config c = rc.model_config();
+    c.B = rows;
+    cudaStream_t s;
+    LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    Model model(c, uint64_t(rc.data.seed));
+    load_checkpoint(path, model, s);
+    TokenFile file(split);
+    ValidationSet vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
+                     meta.score_prev_token, meta.row_length > 0);
+    const HostBatch& hb = vs.batch(0);
+    const size_t ntok = size_t(c.B) * c.T;
+    int *d_ids, *d_y;
+    uint8_t* d_reset;
+    float* d_inv_n;
+    LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_reset, ntok));
+    LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
+    LBC_CUDA(cudaMemcpy(d_ids, hb.ids, ntok * sizeof(int), cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_y, hb.y, ntok * sizeof(int), cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_reset, hb.reset, ntok, cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_inv_n, hb.inv_n, sizeof(float), cudaMemcpyHostToDevice));
+    model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
+    float r[2];
+    LBC_CUDA(cudaMemcpyAsync(r, model.metrics_device(), sizeof(r), cudaMemcpyDeviceToHost, s));
+    LBC_CUDA(cudaStreamSynchronize(s));
+    fs::create_directories(out);
+    auto bin = [&](const std::string& name, const void* p, size_t bytes) {
+        std::ofstream f(out + "/" + name, std::ios::binary);
+        f.write(static_cast<const char*>(p), std::streamsize(bytes));
+    };
+    {
+        std::ofstream f(out + "/config.txt");
+        f << "V " << c.V << "\nE0 " << c.E0 << "\nD " << c.D << "\nL " << c.L << "\nN " << c.N << "\nH " << c.H
+          << "\nF " << c.F << "\nB " << c.B << "\nT " << c.T << "\nDH " << c.dh << "\nSLOTS " << SLOTS
+          << "\ntau " << c.tau << "\nslot_hl_min " << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max
+          << "\nfactorized " << int(c.factorized) << "\ntied " << int(c.tied) << "\nhops ";
+        for (int l = 0; l < c.L; ++l) f << (l ? "," : "") << c.hops_of(l);
+        f << "\nbank_slots ";
+        for (int l = 0; l < c.L; ++l) f << (l ? "," : "") << c.slots_of(l);
+        f << "\nloss " << r[0] << "\naccuracy " << r[1] << "\nn_targets " << hb.n_targets << "\nepoch " << info.epoch
+          << "\n";
+    }
+    {
+        std::ofstream f(out + "/manifest.txt");
+        for (const auto& t : model.tensors()) f << t.name << " " << t.off << " " << t.rows << " " << t.cols << "\n";
+    }
+    std::vector<float> P(model.num_params());
+    LBC_CUDA(cudaMemcpy(P.data(), model.params(), P.size() * 4, cudaMemcpyDeviceToHost));
+    bin("params.bin", P.data(), P.size() * 4);
+    bin("ids.bin", hb.ids, ntok * sizeof(int));
+    bin("y.bin", hb.y, ntok * sizeof(int));
+    bin("reset.bin", hb.reset, ntok);
+    for (int l = 0; l < c.L; ++l) {
+        std::vector<uint8_t> ridx, gw, gr, gr2;
+        model.decisions(l, ridx, gw, gr, gr2, s);
+        const std::string pfx = "l" + std::to_string(l) + "_";
+        bin(pfx + "ridx.bin", ridx.data(), ridx.size());
+        bin(pfx + "gw.bin", gw.data(), gw.size());
+        bin(pfx + "gr.bin", gr.data(), gr.size());
+        bin(pfx + "gr2.bin", gr2.data(), gr2.size());
+    }
+    std::printf("dumped %d rows of %s (epoch %d) to %s: loss %.4f accuracy %.4f over %d targets\n", rows, path.c_str(),
+                info.epoch, out.c_str(), r[0], r[1], hb.n_targets);
+    return 0;
+}
+
 // loss and accuracy of a checkpoint on `steps` fixed batches of a token file (the validation split by default; same
 // rows and scoring as the trainer's validation)
 int cmd_eval(int argc, char** argv) {
@@ -504,7 +597,7 @@ int cmd_eval(int argc, char** argv) {
     load_checkpoint(path, model, s);
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token);
+                     meta.score_prev_token, meta.row_length > 0);
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
     uint8_t* d_reset;
@@ -546,6 +639,7 @@ int main(int argc, char** argv) {
         if (cmd == "config") return cmd_config(argc - 2, argv + 2);
         if (cmd == "train") return cmd_train(argc - 2, argv + 2);
         if (cmd == "eval") return cmd_eval(argc - 2, argv + 2);
+        if (cmd == "dump") return cmd_dump(argc - 2, argv + 2);
     } catch (const std::exception& e) {
         die(e.what());
     }

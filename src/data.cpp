@@ -82,9 +82,9 @@ int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int
 }  // namespace
 
 Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int score_after,
-               int score_prev, int slots)
-    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), score_prev_(score_prev), seed_(seed),
-      next_batch_(start_batch),
+               int score_prev, bool aligned, int slots)
+    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), score_prev_(score_prev),
+      aligned_(aligned), seed_(seed), next_batch_(start_batch),
       steps_per_pass_(steps_per_pass(file.size(), B, T)), slots_(size_t(slots)) {
     if (steps_per_pass_ == 0)
         throw std::runtime_error("Loader: the token file holds less than one batch of " + std::to_string(B) +
@@ -121,7 +121,7 @@ void Loader::fill(HostBatch& hb) {
     const uint64_t g = next_batch_++, pass = g / steps_per_pass_, j = g % steps_per_pass_;
     if (pass != pass_) {  // a pass: random offset, shuffled windows (a pure function of the seed and the pass)
         std::mt19937_64 rng(seed_ * 1000003u + pass);
-        offset_ = rng() % size_t(T_);
+        offset_ = aligned_ ? 0 : rng() % size_t(T_);
         order_.resize((n - offset_ - 1) / size_t(T_));
         std::iota(order_.begin(), order_.end(), 0u);
         std::shuffle(order_.begin(), order_.end(), rng);
@@ -185,12 +185,15 @@ void Loader::release(HostBatch* hb, cudaStream_t stream) {
 }
 
 ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker,
-                             int score_after, int score_prev) {
+                             int score_after, int score_prev, bool aligned) {
     const size_t n = file.size();
     const uint16_t* tok = file.data();
     std::vector<size_t> starts;
-    for (size_t i = 0; i < n; ++i)
-        if (tok[i] == marker) starts.push_back(i);
+    if (aligned)
+        for (size_t i = 0; i + size_t(T) <= n; i += size_t(T)) starts.push_back(i);
+    else
+        for (size_t i = 0; i < n; ++i)
+            if (tok[i] == marker) starts.push_back(i);
     if (starts.empty()) starts.push_back(0);
     const size_t rows = size_t(B) * T;
     batches_.resize(size_t(steps));

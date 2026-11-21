@@ -7,6 +7,9 @@ after <sep> are scored (metadata `score_after_token`), so the trainer's accuracy
 copied tokens (and the closing <eos>) predicted exactly. Documents are packed one after another, as the pretraining
 data; a row may start anywhere in a document (state reset at <bos>).
 
+--row-length N packs whole documents into rows of N tokens (padded with <bos>: a reset, never scored), so no
+document is ever split by a row boundary; train with arch_params.window_size = N (metadata `row_length`).
+
 Writes DIR/train.npy, DIR/validation.npy (lengths as in training) and DIR/validation_L{n}.npy for every --sweep length
 (fixed L; lengths past --max-len test length generalization), plus DIR/metadata.json. No dependency beyond Python.
 
@@ -36,15 +39,25 @@ def write_npy(path, tokens):
         tokens.tofile(f)
 
 
-def documents(n_tokens, vocab, lo, hi, seed):
+def documents(n_tokens, vocab, lo, hi, seed, row=0):
     rng = random.Random(seed)
     out = array.array("H")
-    docs = 0
+    docs = used = 0  # used: tokens in the current row (row > 0)
     while len(out) < n_tokens:
         n = rng.randint(lo, hi)
         x = [rng.randrange(3, vocab) for _ in range(n)]
-        out.extend([BOS] + x + [SEP] + x + [EOS])
+        doc = [BOS] + x + [SEP] + x + [EOS]
+        if row:
+            if len(doc) > row:
+                raise SystemExit(f"a document of {len(doc)} tokens does not fit --row-length {row}")
+            if used + len(doc) > row:  # close the row: pad with <bos>
+                out.extend([BOS] * (row - used))
+                used = 0
+            used += len(doc)
+        out.extend(doc)
         docs += 1
+    if row and used:
+        out.extend([BOS] * (row - used))
     return out, docs
 
 
@@ -58,6 +71,7 @@ def main():
     p.add_argument("--validation-tokens", type=int, default=400_000)
     p.add_argument("--sweep", default="16,32,64,128,200")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--row-length", type=int, default=0)
     a = p.parse_args()
     if a.vocab % 8 or a.vocab < 8 or a.vocab > 65536:
         p.error("--vocab must be a multiple of 8 in [8, 65536]")
@@ -69,15 +83,19 @@ def main():
         "vocabulary_size": a.vocab, "doc_token_id": BOS, "bos_token_id": BOS, "eos_token_id": EOS,
         "score_after_token": SEP,
     }
-    train, docs = documents(a.train_tokens, a.vocab, a.min_len, a.max_len, a.seed)
+    if a.row_length:
+        if a.row_length % 8:
+            p.error("--row-length must be a multiple of 8 (the trainer's window)")
+        meta["row_length"] = a.row_length
+    train, docs = documents(a.train_tokens, a.vocab, a.min_len, a.max_len, a.seed, a.row_length)
     write_npy(f"{a.out}/train.npy", train)
     meta["train"] = {"file": "train.npy", "tokens": len(train), "documents": docs}
-    val, docs = documents(a.validation_tokens, a.vocab, a.min_len, a.max_len, a.seed + 1)
+    val, docs = documents(a.validation_tokens, a.vocab, a.min_len, a.max_len, a.seed + 1, a.row_length)
     write_npy(f"{a.out}/validation.npy", val)
     meta["validation"] = {"file": "validation.npy", "tokens": len(val), "documents": docs}
     meta["sweep"] = {}
     for i, n in enumerate(int(x) for x in a.sweep.split(",") if x):
-        toks, docs = documents(a.validation_tokens, a.vocab, n, n, a.seed + 100 + i)
+        toks, docs = documents(a.validation_tokens, a.vocab, n, n, a.seed + 100 + i, a.row_length)
         write_npy(f"{a.out}/validation_L{n}.npy", toks)
         meta["sweep"][str(n)] = {"file": f"validation_L{n}.npy", "tokens": len(toks), "documents": docs}
     with open(f"{a.out}/metadata.json", "w") as f:
