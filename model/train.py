@@ -21,6 +21,7 @@ anyway. Nothing else records progress, so nothing else can disagree with it.
 """
 
 import csv
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -115,10 +116,15 @@ def build_or_load(run_name: str, config: Dict[str, Any], verbose: int = 1) -> Tu
         saved = model.optimizer._learning_rate
         saved_lr = getattr(saved, "learning_rate", None)
         saved_lr = float(saved_lr if saved_lr is not None else keras.ops.convert_to_numpy(saved))
-        if saved_lr != float(config["training"]["learning_rate"]):
+        want = learning_rate_from(config)
+        # the schedule too (warmup, decay start / length), not only the peak rate
+        changed = (saved.get_config() != want.get_config() if hasattr(saved, "get_config")
+                   and hasattr(want, "get_config") else saved_lr != float(config["training"]["learning_rate"]))
+        if changed:
             if verbose:
-                print(f"Learning rate {saved_lr:g} -> {config['training']['learning_rate']:g} (config.json).")
-            model.optimizer.learning_rate = learning_rate_from(config)
+                print(f"Learning rate {saved_lr:g} -> {config['training']['learning_rate']:g} (config.json"
+                      + (f", schedule {want.get_config()}" if hasattr(want, "get_config") else "") + ").")
+            model.optimizer.learning_rate = want
         _apply_freeze(model, freeze_except, verbose)
         _exclude_from_weight_decay(model, model.optimizer)
         if verbose:
@@ -160,17 +166,42 @@ class _StepLossProgbar(keras.callbacks.ProgbarLogger):
 
     Dense train steps report their batch loss as `loss`; Keras would print the epoch
     average on the final line. metrics.csv still records the average.
+
+    `chars_per_token` (`{"train": .., "validation": ..}`, from the dataset metadata): also shows bits per character,
+    `bpc` = loss / ln 2 / the train split's characters per token and `val_bpc` from `val_loss` with the validation
+    split's (display only: metrics.csv keeps its columns, so resumed runs append rows that match their header).
     """
+
+    def __init__(self, chars_per_token: Optional[Dict[str, float]] = None):
+        super().__init__()
+        self._cpt = {k: v for k, v in (chars_per_token or {}).items() if v}
+
+    def _with_bpc(self, logs):
+        logs = dict(logs or {})
+        for key, out, split in (("loss", "bpc", "train"), ("val_loss", "val_bpc", "validation")):
+            if split in self._cpt and logs.get(key) is not None:
+                logs[out] = float(logs[key]) / math.log(2) / self._cpt[split]
+        return logs
 
     def on_train_batch_end(self, batch, logs=None):
         self._last_loss = None if logs is None else logs.get("loss")
-        super().on_train_batch_end(batch, logs)
+        super().on_train_batch_end(batch, self._with_bpc(logs))
 
     def on_epoch_end(self, epoch, logs=None):
         shown = dict(logs or {})
         if getattr(self, "_last_loss", None) is not None:
             shown["loss"] = self._last_loss
-        super().on_epoch_end(epoch, shown)
+        super().on_epoch_end(epoch, self._with_bpc(shown))
+
+
+def _chars_per_token(config: Dict[str, Any]) -> Dict[str, float]:
+    """Characters per token of the train and validation splits (the dataset metadata; None where it has none)."""
+    try:
+        meta = cfg_mod.load_dataset_metadata(config["data"]["dataset"])
+    except Exception:  # noqa: BLE001 (no metadata: no bpc)
+        return {}
+    avg = meta.get("avg_chars_per_token")
+    return {split: (meta.get(split) or {}).get("chars_per_token", avg) for split in ("train", "validation")}
 
 
 # Config keys allowed to differ between a fine-tuning run and its source.
@@ -208,7 +239,11 @@ def _init_weights_from_run(model: keras.Model, spec: Dict[str, Any], verbose: in
     """Copies the weights of the layers named in `spec["weights"]` (e.g. `token_embedding`, `readout`; shell-style
     wildcards work, e.g. `l0_*`) from `spec["run"]`'s checkpoint into the freshly built `model`. Variables are matched
     by their path inside the model (the model's own name stripped) and must have the same shape; the architecture
-    config may differ."""
+    config may differ.
+
+    `spec["like"]` (e.g. `{"l4": "l3", "l5": "l3"}`): each trainable weight `l4_X` starts as a random permutation of the
+    source's `l3_X` (the same values, so the same distribution, with no structure; `like_seed`, default 0): new layers
+    at the scale of a trained one. Non-trainable weights (e.g. fixed decays) keep their own init."""
     import fnmatch
 
     from model.evaluate import load_checkpoint
@@ -234,8 +269,27 @@ def _init_weights_from_run(model: keras.Model, spec: Dict[str, Any], verbose: in
     missing = [n for n in names if not any(fnmatch.fnmatchcase(k.split("/", 1)[0], n) for k in copied)]
     if missing:
         raise ValueError(f"init_weights_from: no weights named {missing} in this model")
+    like = spec.get("like") or {}
+    rng = np.random.default_rng(int(spec.get("like_seed", 0)))
+    liked = []
+    for v in model.weights:
+        key = inner(v)
+        top = key.split("/", 1)[0]
+        prefix, _, rest = top.partition("_")
+        if prefix not in like or not v.trainable:
+            continue
+        skey = f"{like[prefix]}_{rest}{key[len(top):]}"
+        if skey not in src:
+            raise ValueError(f"init_weights_from: like {prefix} -> {like[prefix]}: run {spec['run']!r} has no {skey!r}")
+        vals = np.asarray(keras.ops.convert_to_numpy(src[skey].value)).ravel()
+        if vals.size != int(np.prod(v.shape)):
+            raise ValueError(f"init_weights_from: {skey!r} has {vals.size} values, {key!r} needs {tuple(v.shape)}")
+        v.assign(rng.permutation(vals).reshape(tuple(v.shape)))
+        liked.append(f"{key}<-{skey}")
     if verbose:
         print(f"Initialized {', '.join(copied)} from run '{spec['run']}' (checkpoint {spec.get('checkpoint', 'latest')}).")
+        if liked:
+            print(f"Initialized as permutations: {', '.join(liked)}.")
 
 
 def _apply_freeze(model: keras.Model, freeze_except: Optional[list], verbose: int) -> None:
@@ -353,7 +407,7 @@ def train(run_name: str, epochs: Optional[int] = None, verbose: int = 1) -> kera
 
     if verbose and config["training"].get("dense_supervision"):
         # Last in the list, so it runs after CSVLogger / History have recorded the epoch average.
-        callbacks.append(_StepLossProgbar())
+        callbacks.append(_StepLossProgbar(_chars_per_token(config)))
 
     return model.fit(
         train_ds,
