@@ -85,6 +85,8 @@ RunConfig load_run_config(const std::string& run_dir);
 void save_run_config(const std::string& run_dir, const RunConfig& rc);
 // `dotted` = `raw` (parsed as JSON; a plain string when it is not JSON). The key must exist; the result is validated.
 RunConfig with_key(const RunConfig& rc, const std::string& dotted, const std::string& raw);
+// several keys at once, validated together (e.g. num_layers with its per-layer hops)
+RunConfig with_keys(const RunConfig& rc, const std::vector<std::pair<std::string, std::string>>& kv);
 
 // datasets/<name>/metadata.json, as written by the research repository's dataset builders
 struct DatasetMeta {

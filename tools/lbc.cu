@@ -84,7 +84,7 @@ int cmd_create(int argc, char** argv) {
     RunConfig rc;
     rc.data.dataset = fs::absolute(dataset).lexically_normal().string();
     rc.arch.vocabulary_size = meta.vocabulary_size;
-    for (const auto& [k, v] : sets) rc = with_key(rc, k, v);
+    rc = with_keys(rc, sets);  // validated together (e.g. num_layers with its hops)
     save_run_config(run, rc);
     std::printf("%s\ncreated %s/config.json\n", json::dump(rc.to_json()).c_str(), run.c_str());
     return 0;

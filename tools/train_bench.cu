@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
     }
     try {
         rc.validate();
-        for (const auto& [k, v] : a.sets) rc = with_key(rc, k, v);
+        rc = with_keys(rc, a.sets);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 2;

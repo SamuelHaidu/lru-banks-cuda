@@ -286,17 +286,23 @@ void save_run_config(const std::string& run_dir, const RunConfig& rc) {
     json::write_file(run_dir + "/config.json", rc.to_json());
 }
 
-RunConfig with_key(const RunConfig& rc, const std::string& dotted, const std::string& raw) {
+RunConfig with_keys(const RunConfig& rc, const std::vector<std::pair<std::string, std::string>>& kv) {
     json::Value v = rc.to_json();
-    if (!json::get(v, dotted)) throw std::runtime_error("config: no key " + dotted);
-    json::Value x;
-    try {
-        x = json::parse(raw);
-    } catch (const std::exception&) {
-        x = json::Value(raw);  // not JSON: a plain string (e.g. a dataset path)
+    for (const auto& [dotted, raw] : kv) {
+        if (!json::get(v, dotted)) throw std::runtime_error("config: no key " + dotted);
+        json::Value x;
+        try {
+            x = json::parse(raw);
+        } catch (const std::exception&) {
+            x = json::Value(raw);  // not JSON: a plain string (e.g. a dataset path)
+        }
+        json::set(v, dotted, std::move(x));
     }
-    json::set(v, dotted, std::move(x));
     return RunConfig::from_json(v);
+}
+
+RunConfig with_key(const RunConfig& rc, const std::string& dotted, const std::string& raw) {
+    return with_keys(rc, {{dotted, raw}});
 }
 
 DatasetMeta DatasetMeta::load(const std::string& dir) {
