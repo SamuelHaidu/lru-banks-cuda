@@ -168,7 +168,7 @@ __global__ void __launch_bounds__(256) k_scale_cols_bwd(const bf16* __restrict__
 __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logits, const int* __restrict__ y,
                                                  bf16* __restrict__ dlogits, float* __restrict__ loss_sum,
                                                  float* __restrict__ correct_sum, int V,
-                                                 const float* __restrict__ inv_n_ptr) {
+                                                 const float* __restrict__ inv_n_ptr, float* __restrict__ row_loss) {
     const float inv_n = *inv_n_ptr;
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
@@ -176,6 +176,7 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     bf16* d = dlogits ? dlogits + row * V : nullptr;
     const int target = y[row];
     if (target < 0) {
+        if (row_loss && threadIdx.x == 0) row_loss[row] = 0.f;
         if (d)
             for (int j = threadIdx.x; j < V; j += blockDim.x) d[j] = __float2bfloat16(0.f);
         return;
@@ -203,6 +204,7 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
         }
     if (threadIdx.x == 0) {
         atomicAdd(loss_sum, (logf(s) + m - l[target]) * inv_n);
+        if (row_loss) row_loss[row] = logf(s) + m - l[target];
         if (l[target] >= m) atomicAdd(correct_sum, inv_n);  // the target is the row's (first) maximum
     }
 }
@@ -324,8 +326,8 @@ void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cu
 }
 
 void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
-             const float* inv_n, cudaStream_t s) {
-    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n);
+             const float* inv_n, cudaStream_t s, float* row_loss) {
+    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n, row_loss);
     LBC_CUDA(cudaGetLastError());
 }
 

@@ -114,6 +114,14 @@ class Model {
 
     // per-category GPU time of one step (events around every launch); off by default
     void set_profile(bool on) { profile_ = on; }
+
+    // analysis: silence[n] bit 1 / 2 / 4 drops layer n's hop-1 read / hop-2 read / FFN from the stream; per-token loss (rows with a
+    // target: lse - logit[y], else 0); the queries (0: hop 1, 1: hop 2) and read outputs (2: hop 1, 3: hop 2) of
+    // layer n after a forward, [M][H*dh] bf16 (empty if the layer has no such read)
+    void set_silence(std::vector<int> mask) { silence_ = std::move(mask); }
+    void keep_row_loss();
+    std::vector<float> row_loss(cudaStream_t s);
+    std::vector<bf16> download_read(int n, int which, cudaStream_t s);
     std::vector<std::pair<std::string, float>> profile_ms();
 
     // discrete decisions of layer n (tests replay them): ridx [M][H][2], gw, gr, gr2 [M][H]
@@ -187,6 +195,8 @@ class Model {
 
     std::vector<void*> allocations_;
     bool profile_ = false;
+    std::vector<int> silence_;
+    float* row_loss_ = nullptr;
     struct Mark {
         std::string cat;
         cudaEvent_t a, b;

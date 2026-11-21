@@ -33,7 +33,7 @@ void scale_cols_bwd(const bf16* dy, const bf16* x, const float* g, float* dx, fl
 // inv_n (the accuracy); dlogits = (softmax - onehot) * inv_n, with inv_n = 1 / targets read from the device (the
 // step can be a CUDA graph). Rows with y < 0 add nothing. dlogits may be null (validation: no gradient).
 void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
-             const float* inv_n, cudaStream_t s);
+             const float* inv_n, cudaStream_t s, float* row_loss = nullptr);  // row_loss: per row (0 without target)
 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 

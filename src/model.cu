@@ -360,14 +360,16 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr, a.zpre}, s);
     toc(s);
-    mm(s, false, false, M, D, HD, a.o1, HD, w.Wo, D, h_, D, Out::F32, 1.f);
+    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 1)))  // analysis: a silenced read adds nothing
+        mm(s, false, false, M, D, HD, a.o1, HD, w.Wo, D, h_, D, Out::F32, 1.f);
     tic(s, "norm+elementwise");
     rmsnorm_fwd(h_, a.xh2, a.rstd2, M, D, s);
     toc(s);
     // U = gelu(xh2 W1' + b1) with the pre-activation Z kept (aux), then h += U W2 + b2: both in GEMM epilogues
     mm(s, false, false, M, F, D, a.xh2, D, w.W1, F, a.U, F, Out::BF16, 0.f,
        Epilogue{Epilogue::GeluAuxBias, w.b1, nullptr, a.Z, F});
-    mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2)});
+    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 4)))  // analysis: a silenced FFN adds nothing
+        mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2)});
     if (c_.hops_of(n) == 1) return;
     tic(s, "norm+elementwise");
     rmsnorm_fwd(h_, a.xh3, a.rstd3, M, D, s);
@@ -379,7 +381,8 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, a.o2, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
     toc(s);
-    mm(s, false, false, M, D, HD, a.o2, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
+    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 2)))
+        mm(s, false, false, M, D, HD, a.o2, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
 }
 
 void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
@@ -491,7 +494,8 @@ void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
         const int rows = std::min(Mc, M - r0);
         mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eo, E0, logits_, V, Out::F32);
         tic(s, "ce_softmax");
-        ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s);
+        ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s,
+                row_loss_ ? row_loss_ + r0 : nullptr);
         toc(s);
         if (!backward) continue;
         mm(s, false, false, rows, E0, V, dlog_, V, Eo, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
@@ -527,6 +531,30 @@ void Model::forward_backward(const Batch& b, cudaStream_t s) {
     tic(s, "embed");
     embed_scatter(b.ids, c_.factorized ? dx0_ : dh_, g(E_), M, E0, s);
     toc(s);
+}
+
+void Model::keep_row_loss() {
+    if (!row_loss_) row_loss_ = alloc<float>(size_t(c_.M()));
+}
+
+std::vector<float> Model::row_loss(cudaStream_t s) {
+    std::vector<float> out(size_t(c_.M()), 0.f);
+    if (row_loss_) {
+        LBC_CUDA(cudaMemcpyAsync(out.data(), row_loss_, out.size() * 4, cudaMemcpyDeviceToHost, s));
+        LBC_CUDA(cudaStreamSynchronize(s));
+    }
+    return out;
+}
+
+std::vector<bf16> Model::download_read(int n, int which, cudaStream_t s) {
+    const LayerA& a = la_[size_t(n)];
+    const bf16* p = which == 0 ? a.q : which == 1 ? a.q2 : which == 2 ? a.o1 : a.o2;
+    std::vector<bf16> out;
+    if (!p) return out;
+    out.resize(size_t(c_.M()) * c_.HD());
+    LBC_CUDA(cudaMemcpyAsync(out.data(), p, out.size() * sizeof(bf16), cudaMemcpyDeviceToHost, s));
+    LBC_CUDA(cudaStreamSynchronize(s));
+    return out;
 }
 
 void Model::forward_loss(const Batch& b, cudaStream_t s) {

@@ -54,8 +54,10 @@ void usage() {
                  "  lbc create RUN_DIR --dataset DATASET_DIR [section.key=value ...]\n"
                  "  lbc config RUN_DIR [section.key value]\n"
                  "  lbc train  RUN_DIR [--epochs N]\n"
-                 "  lbc eval   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--steps N]\n"
-                 "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n");
+                 "  lbc eval   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--steps N] [--rows N]\n"
+                 "             [--silence L:H,...]\n"
+                 "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n"
+                 "             [--silence L:H,...]\n");
     std::exit(2);
 }
 
@@ -63,6 +65,23 @@ std::string with_commas(unsigned long long n) {
     std::string s = std::to_string(n);
     for (int i = int(s.size()) - 3; i > 0; i -= 3) s.insert(size_t(i), ",");
     return s;
+}
+
+// "--silence 0:2,3:1,1:ffn,2:all" (layer:1|2|ffn|all) -> per-layer bit masks (bit 1: hop 1, 2: hop 2, 4: the FFN)
+std::vector<int> parse_silence(const std::string& spec, int L) {
+    std::vector<int> mask(size_t(L), 0);
+    std::stringstream ss(spec);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        const size_t c = item.find(':');
+        if (c == std::string::npos) die("--silence takes layer:hop pairs, e.g. 0:2,3:1");
+        const int l = std::atoi(item.substr(0, c).c_str());
+        const std::string w = item.substr(c + 1);
+        const int bits = w == "1" ? 1 : w == "2" ? 2 : w == "ffn" ? 4 : w == "all" ? 7 : 0;
+        if (l < 0 || l >= L || !bits) die("--silence: no part " + item + " (layer:1|2|ffn|all)");
+        mask[size_t(l)] |= bits;
+    }
+    return mask;
 }
 
 // -- create / config ----------------------------------------------------------------------------------------------
@@ -487,7 +506,7 @@ int cmd_train(int argc, char** argv) {
 int cmd_dump(int argc, char** argv) {
     if (argc < 1) usage();
     const std::string run = argv[0];
-    std::string which = "latest", split, out = "/tmp/lbc_inspect";
+    std::string which = "latest", split, out = "/tmp/lbc_inspect", silence;
     int rows = 2;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -495,6 +514,7 @@ int cmd_dump(int argc, char** argv) {
         else if (a == "--split" && i + 1 < argc) split = argv[++i];
         else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--silence" && i + 1 < argc) silence = argv[++i];
         else usage();
     }
     const std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
@@ -508,6 +528,8 @@ int cmd_dump(int argc, char** argv) {
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
+    if (!silence.empty()) model.set_silence(parse_silence(silence, c.L));
+    model.keep_row_loss();
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
                      meta.score_prev_token, meta.row_length > 0);
@@ -555,6 +577,8 @@ int cmd_dump(int argc, char** argv) {
     bin("ids.bin", hb.ids, ntok * sizeof(int));
     bin("y.bin", hb.y, ntok * sizeof(int));
     bin("reset.bin", hb.reset, ntok);
+    const std::vector<float> rl = model.row_loss(s);
+    bin("row_loss.bin", rl.data(), rl.size() * 4);
     for (int l = 0; l < c.L; ++l) {
         std::vector<uint8_t> ridx, gw, gr, gr2;
         model.decisions(l, ridx, gw, gr, gr2, s);
@@ -563,6 +587,11 @@ int cmd_dump(int argc, char** argv) {
         bin(pfx + "gw.bin", gw.data(), gw.size());
         bin(pfx + "gr.bin", gr.data(), gr.size());
         bin(pfx + "gr2.bin", gr2.data(), gr2.size());
+        const char* names[4] = {"q1", "q2", "o1", "o2"};
+        for (int w = 0; w < 4; ++w) {
+            const std::vector<bf16> x = model.download_read(l, w, s);
+            if (!x.empty()) bin(pfx + names[w] + ".bf16", x.data(), x.size() * sizeof(bf16));
+        }
     }
     std::printf("dumped %d rows of %s (epoch %d) to %s: loss %.4f accuracy %.4f over %d targets\n", rows, path.c_str(),
                 info.epoch, out.c_str(), r[0], r[1], hb.n_targets);
@@ -574,13 +603,15 @@ int cmd_dump(int argc, char** argv) {
 int cmd_eval(int argc, char** argv) {
     if (argc < 1) usage();
     const std::string run = argv[0];
-    std::string which = "best", split;
-    int steps = 0;
+    std::string which = "best", split, silence;
+    int steps = 0, rows = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
         else if (a == "--split" && i + 1 < argc) split = argv[++i];
         else if (a == "--steps" && i + 1 < argc) steps = std::atoi(argv[++i]);
+        else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else if (a == "--silence" && i + 1 < argc) silence = argv[++i];
         else usage();
     }
     std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
@@ -591,10 +622,12 @@ int cmd_eval(int argc, char** argv) {
     if (split.empty()) split = meta.validation_file;
     if (steps <= 0) steps = std::max(1, rc.training.validation_steps);
     Config c = rc.model_config();
+    if (rows > 0) c.B = rows;  // fewer rows per batch (e.g. beside a training run)
     cudaStream_t s;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
+    if (!silence.empty()) model.set_silence(parse_silence(silence, c.L));
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
                      meta.score_prev_token, meta.row_length > 0);
@@ -623,9 +656,9 @@ int cmd_eval(int argc, char** argv) {
         acc += double(r[1]) * hb.n_targets;
         targets += hb.n_targets;
     }
-    std::printf("checkpoint=%s (epoch %d)  split=%s  steps=%d  targets=%lld  loss=%.4f  accuracy=%.4f\n",
-                path.c_str(), info.epoch, split.c_str(), vs.steps(), targets, loss / std::max(1LL, targets),
-                acc / std::max(1LL, targets));
+    std::printf("checkpoint=%s (epoch %d)  split=%s  steps=%d  targets=%lld  silence=%s  loss=%.4f  accuracy=%.4f\n",
+                path.c_str(), info.epoch, split.c_str(), vs.steps(), targets, silence.empty() ? "-" : silence.c_str(),
+                loss / std::max(1LL, targets), acc / std::max(1LL, targets));
     return 0;
 }
 
