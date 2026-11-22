@@ -150,14 +150,15 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
     const int r0 = blockIdx.y * rows_per_block, r1 = min(a.M, r0 + rows_per_block);
     float sw = 0.f, cw = 0.f, sr = 0.f, cr = 0.f;
     for (int r = r0 + warp; r < r1; r += nw) {
-        const int t = r % a.T;
+        const int t = a.tpos ? a.tpos[r] : r % a.T;
         const bool rst = a.reset[r];
+        const bf16* gprev = a.Gprev ? a.Gprev + size_t(a.map[r]) * a.ldGprev : a.G + size_t(r - 1) * a.ldG;
         float kp[E], qp[E], ks = 0.f, qs = 0.f;
 #pragma unroll
         for (int c = 0; c < E; ++c) {
             const int d = lane + 32 * c;
             kp[c] = a.bk[h * DH + d];
-            if (t > 0 && !rst) kp[c] += __bfloat162float(a.G[size_t(r - 1) * a.ldG + h * DH + d]);
+            if (t > 0 && !rst) kp[c] += __bfloat162float(gprev[h * DH + d]);
             qp[c] = __bfloat162float(a.G[size_t(r) * a.ldG + HD + h * DH + d]);
             ks += kp[c] * kp[c];
             qs += qp[c] * qp[c];
@@ -238,6 +239,33 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
     }
     __syncthreads();
     if (threadIdx.x < 4) atomicAdd(a.stats + threadIdx.x, st_s[threadIdx.x]);
+}
+
+__global__ void k_lru_step(const bf16* __restrict__ P, int ldp, const float* __restrict__ nu,
+                           const float* __restrict__ theta, const uint8_t* __restrict__ reset,
+                           const int* __restrict__ map, float* __restrict__ state, bf16* __restrict__ sb, int R, int N) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= R * N) return;
+    const int r = idx / N, n = idx % N;
+    const LruConst c = lru_const(nu[n], theta[n]);
+    float* h = state + size_t(map[r]) * 2 * N;
+    const float keep = reset[r] ? 0.f : 1.f;
+    const float xr = __bfloat162float(P[size_t(r) * ldp + n]), xi = __bfloat162float(P[size_t(r) * ldp + N + n]);
+    const float hr = h[n], hi = h[N + n];
+    const float nr = keep * (c.lr * hr - c.li * hi) + c.gam * xr;  // as k_lru_fwd
+    const float ni = keep * (c.lr * hi + c.li * hr) + c.gam * xi;
+    h[n] = nr;
+    h[N + n] = ni;
+    sb[size_t(r) * 2 * N + n] = __float2bfloat16(nr);
+    sb[size_t(r) * 2 * N + N + n] = __float2bfloat16(ni);
+}
+
+__global__ void k_store_rows(const bf16* __restrict__ G, int ldG, int cols, const int* __restrict__ map,
+                             bf16* __restrict__ Gp, int ldp, int R) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size_t(R) * cols) return;
+    const int r = int(idx / size_t(cols)), c = int(idx % size_t(cols));
+    Gp[size_t(map[r]) * ldp + c] = G[size_t(r) * ldG + c];
 }
 
 template <int DH>
@@ -459,6 +487,16 @@ void lru_bwd(const float* ds, const float* s, const bf16* P, int ldp, const floa
 // global atomics (64 rows per block was 33.5M per layer)
 constexpr int ADDR_ROWS = 512;
 
+void lru_step(const bf16* P, int ldp, const float* nu, const float* theta, const uint8_t* reset, const int* map,
+              float* state, bf16* sb, int R, int N, cudaStream_t st) {
+    k_lru_step<<<(R * N + 127) / 128, 128, 0, st>>>(P, ldp, nu, theta, reset, map, state, sb, R, N);
+    LBC_CUDA(cudaGetLastError());
+}
+void store_rows(const bf16* G, int ldG, int cols, const int* map, bf16* Gprev, int ldGprev, int R, cudaStream_t st) {
+    const size_t n = size_t(R) * cols;
+    k_store_rows<<<unsigned((n + 255) / 256), 256, 0, st>>>(G, ldG, cols, map, Gprev, ldGprev, R);
+    LBC_CUDA(cudaGetLastError());
+}
 void addr_fwd(const AddrFwd& a, cudaStream_t s) {
     const int rows = ADDR_ROWS;
     const dim3 grid(a.H, (a.M + rows - 1) / rows);
