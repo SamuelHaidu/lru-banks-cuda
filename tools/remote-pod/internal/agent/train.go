@@ -19,13 +19,13 @@ import (
 // TrainSpec is a run the agent executes on start (REMOTE_POD_JOB, JSON, set by `remote-pod train`).
 type TrainSpec struct {
 	Run          string            `json:"run"`
-	Command      string            `json:"command"`   // e.g. "lbc train /work/runs/<run>"
-	Datasets     []string          `json:"datasets"`  // store dataset names, fetched to /data/<name>
-	Fetch        map[string]string `json:"fetch"`     // store key -> local path (e.g. the init checkpoint)
-	Files        map[string]string `json:"files"`     // local path -> contents (the run's config.json)
-	RunDir       string            `json:"run_dir"`   // uploaded to Prefix as files appear
-	Prefix       string            `json:"prefix"`    // runs/<run>/
-	DataDir      string            `json:"data_dir"`  // default /data
+	Command      string            `json:"command"`  // e.g. "lbc train /work/runs/<run>"
+	Datasets     []string          `json:"datasets"` // store dataset names, fetched to /data/<name>
+	Fetch        map[string]string `json:"fetch"`    // store key -> local path (e.g. the init checkpoint)
+	Files        map[string]string `json:"files"`    // local path -> contents (the run's config.json)
+	RunDir       string            `json:"run_dir"`  // uploaded to Prefix as files appear
+	Prefix       string            `json:"prefix"`   // runs/<run>/
+	DataDir      string            `json:"data_dir"` // default /data
 	StopWhenDone bool              `json:"stop_when_done"`
 }
 

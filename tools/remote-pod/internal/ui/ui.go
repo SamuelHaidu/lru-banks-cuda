@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	JSON  bool                                                         // --json
+	JSON  bool // --json
 	Color = term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
 )
 

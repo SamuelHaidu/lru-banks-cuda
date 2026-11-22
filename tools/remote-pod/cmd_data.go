@@ -18,6 +18,7 @@ import (
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/agent"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/client"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/config"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/store"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/ui"
 )
@@ -28,6 +29,11 @@ func openStore() (*store.Store, *config.Config, error) {
 		return nil, nil, err
 	}
 	if !cfg.HasR2() {
+		// inside a pod: the settings come in the environment (remote-pod up / train pass them)
+		if sc, ok := store.FromEnv(); ok {
+			st, err := store.New(sc)
+			return st, cfg, err
+		}
 		return nil, nil, hint(errors.New("R2 is not configured"), "remote-pod config (shows the settings to add)")
 	}
 	st, err := store.New(store.Config{Endpoint: cfg.R2.Endpoint, Bucket: cfg.R2.Bucket, AccessKey: cfg.R2.AccessKey,
@@ -51,13 +57,22 @@ func dataCommands() []*cobra.Command {
 	var name, from string
 	add := &cobra.Command{
 		Use:   "add --name NAME --from DIR",
-		Short: "Upload a dataset directory to R2 once (pods fetch it from there)",
-		Long: `Upload a local dataset directory to R2 as one tar.zst object (streamed, nothing staged on disk), with a
-manifest. Pods then download it at datacenter speed instead of from this machine.`,
+		Short: "Upload a dataset directory to R2 once (from here, or from the pod: --from :/path)",
+		Long: `Upload a dataset directory to R2 as one tar.zst object (streamed, nothing staged on disk), with a manifest.
+Pods then download it at datacenter speed. A pod path (":" first) uploads from the pod straight to R2, so data built
+on a CPU pod never passes through this machine.`,
 		Example: `  remote-pod dataset add --name pretrain-code-mix-bpe32768 --from datasets/pretrain-code-mix-bpe32768
-  remote-pod dataset add --name cx --from datasets/calc-x-bpe32768`,
+  remote-pod dataset add --name cx --from datasets/calc-x-bpe32768
+  remote-pod dataset add --name toucan-2b --from :/work/data/toucan-2b      built on a CPU pod, uploaded from it`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if podPath, onPod := isPod(from); onPod { // the pod's own copy of this tool uploads it
+				cl, _, err := agentClient()
+				if err != nil {
+					return err
+				}
+				return runExec(cl, proto.ExecStart{Command: fmt.Sprintf("remote-pod dataset add --name %q --from %q", name, podPath)})
+			}
 			st, _, err := openStore()
 			if err != nil {
 				return err

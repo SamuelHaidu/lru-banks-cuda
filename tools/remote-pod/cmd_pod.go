@@ -116,8 +116,46 @@ func waitAgent(cl *client.Client, timeout time.Duration) error {
 	return fmt.Errorf("the agent did not answer within %s (image still downloading? check: remote-pod status)", timeout)
 }
 
+// resolveCPU picks a CPU flavor by kind (compute, general, memory: the cheapest in stock) or by id (cpu5c).
+func resolveCPU(ctx context.Context, c *runpod.Client, want string, vcpus int) (runpod.CPUFlavor, error) {
+	fl, err := c.CPUFlavors(ctx, vcpus)
+	if err != nil {
+		return runpod.CPUFlavor{}, err
+	}
+	suffix := map[string]string{"compute": "c", "general": "g", "memory": "m"}[strings.ToLower(want)]
+	var best *runpod.CPUFlavor
+	for i, f := range fl {
+		ok := f.ID == want || (suffix != "" && strings.HasSuffix(f.ID, suffix))
+		if !ok || vcpus < f.MinVCPU || vcpus > f.MaxVCPU || f.Specifics == nil || f.Specifics.StockStatus == "" {
+			continue
+		}
+		if best == nil || f.Specifics.SecurePrice < best.Specifics.SecurePrice { // the cheapest of that kind in stock
+			best = &fl[i]
+		}
+	}
+	if best == nil {
+		return runpod.CPUFlavor{}, hint(fmt.Errorf("no %s CPU pod with %d vCPUs in stock", want, vcpus), "remote-pod cpus --vcpu "+fmt.Sprint(vcpus))
+	}
+	return *best, nil
+}
+
+func createCPUPod(ctx context.Context, c *runpod.Client, cfg *config.Config, instance, image string, disk int,
+	env map[string]string, name string) (string, error) {
+	if cfg.HasR2() {
+		for k, v := range (store.Config{Endpoint: cfg.R2.Endpoint, Bucket: cfg.R2.Bucket, AccessKey: cfg.R2.AccessKey,
+			SecretKey: cfg.R2.SecretKey, Region: cfg.R2.Region}).EnvVars() {
+			env[k] = v
+		}
+	}
+	ui.Note("asking for a CPU pod %s", instance)
+	return c.CreateCPU(ctx, runpod.CreateInput{Name: name, Image: image, DiskGB: disk, Env: env,
+		Ports: fmt.Sprintf("%d/http", config.AgentPort)}, instance)
+}
+
 func imageRef(cfg *config.Config, image string) string {
 	switch image {
+	case "cpu":
+		return cfg.Images.CPU
 	case "", "train":
 		return cfg.Images.Train
 	case "dev":
@@ -127,17 +165,22 @@ func imageRef(cfg *config.Config, image string) string {
 }
 
 func podCommands() []*cobra.Command {
-	var gpu, cloud, image, name string
-	var disk, volume, idle int
+	var gpu, cloud, image, name, flavor string
+	var disk, volume, idle, cpus int
 	up := &cobra.Command{
-		Use:   "up --gpu GPU",
-		Short: "Create a pod with our image and wait for its agent",
+		Use:   "up (--gpu GPU | --cpu N)",
+		Short: "Create a GPU or CPU-only pod with our image and wait for its agent",
 		Long: `Create a pod running our image (its entrypoint is the agent that sh, cp, sync and logs talk to) and wait
 until the agent answers. The pod is reached through RunPod's HTTPS proxy, so community pods without a public IP work.
-It stops itself after --idle minutes with no command and nothing running.`,
+It stops itself after --idle minutes with no command and nothing running.
+
+--cpu N makes a CPU-only pod (N vCPUs, $0.03 to $0.07 per vCPU-hour; see remote-pod cpus) with the cpu image (Python, uv, zstd, git): for
+downloading and cleaning data, training tokenizers, compressing datasets; then remote-pod dataset add from there.`,
 		Example: `  remote-pod up --gpu "RTX 4090"                    community first, then secure
   remote-pod up --gpu 5090 --cloud secure --disk 80
-  remote-pod up --gpu "RTX 4090" --image dev         nvcc, cmake, ninja, nsys / ncu: the optimization loop`,
+  remote-pod up --gpu "RTX 4090" --image dev         nvcc, cmake, ninja, nsys / ncu: the optimization loop
+  remote-pod up --cpu 16 --disk 200                  data work: 16 vCPUs, 64 GB RAM (general purpose)
+  remote-pod up --cpu 8 --flavor memory              8 vCPUs, 64 GB RAM (see remote-pod cpus)`,
 		GroupID: "pod",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, cfg, err := api()
@@ -148,16 +191,34 @@ It stops itself after --idle minutes with no command and nothing running.`,
 			if st.PodID != "" {
 				return hint(fmt.Errorf("this project already has pod %s", st.PodID), "remote-pod status (or remote-pod down to replace it)")
 			}
-			ctx := context.Background()
-			gpuID, err := resolveGPU(ctx, c, gpu)
-			if err != nil {
-				return err
+			if (gpu == "") == (cpus == 0) {
+				return hint(errors.New("give either --gpu or --cpu"), `remote-pod up --gpu "RTX 4090"  or  remote-pod up --cpu 8`)
 			}
-			token, ref := newToken(), imageRef(cfg, image)
+			ctx := context.Background()
+			token := newToken()
 			env := map[string]string{"REMOTE_POD_TOKEN": token, "REMOTE_POD_IDLE_MIN": fmt.Sprint(idle)}
-			id, err := createPod(ctx, c, cfg, gpuID, cloud, ref, disk, volume, env, name)
-			if err != nil {
-				return err
+			var id, gpuID, ref string
+			if cpus > 0 {
+				if !cmd.Flags().Changed("image") {
+					image = "cpu"
+				}
+				ref = imageRef(cfg, image)
+				f, err := resolveCPU(ctx, c, flavor, cpus)
+				if err != nil {
+					return err
+				}
+				gpuID = runpod.CPUInstanceID(f, cpus)
+				if id, err = createCPUPod(ctx, c, cfg, gpuID, ref, disk, env, name); err != nil {
+					return err
+				}
+			} else {
+				if gpuID, err = resolveGPU(ctx, c, gpu); err != nil {
+					return err
+				}
+				ref = imageRef(cfg, image)
+				if id, err = createPod(ctx, c, cfg, gpuID, cloud, ref, disk, volume, env, name); err != nil {
+					return err
+				}
 			}
 			if err := config.SaveState(&config.State{PodID: id, Token: token, Image: ref, GPU: gpuID}); err != nil {
 				return err
@@ -167,18 +228,19 @@ It stops itself after --idle minutes with no command and nothing running.`,
 			if err := waitAgent(agentCl, 15*time.Minute); err != nil {
 				return err
 			}
-			ui.Success("ready: remote-pod sh nvidia-smi")
+			ui.Success("ready: remote-pod sh %s", map[bool]string{true: "nproc", false: "nvidia-smi"}[cpus > 0])
 			return nil
 		},
 	}
 	up.Flags().StringVar(&gpu, "gpu", "", `GPU type: an id or display name ("RTX 4090", "5090"); see remote-pod gpus`)
 	up.Flags().StringVar(&cloud, "cloud", "any", "community, secure, or any (community first)")
-	up.Flags().StringVar(&image, "image", "train", "train (lbc + agent), dev (+ nvcc, cmake, ninja, Nsight), or an image reference")
+	up.Flags().IntVar(&cpus, "cpu", 0, "a CPU-only pod with this many vCPUs (2 to 32; see remote-pod cpus)")
+	up.Flags().StringVar(&flavor, "flavor", "general", "CPU pods: compute (2 GB RAM / vCPU), general (4 GB), memory (8 GB), or an id (cpu3c)")
+	up.Flags().StringVar(&image, "image", "train", "train (lbc + agent), dev (+ nvcc, cmake, ninja, Nsight), cpu (data work), or an image reference")
 	up.Flags().IntVar(&disk, "disk", 40, "container disk in GB (datasets and runs live here; checkpoints also go to R2)")
 	up.Flags().IntVar(&volume, "volume", 0, "persistent /workspace volume in GB (0: none; data lives in R2)")
 	up.Flags().IntVar(&idle, "idle", 60, "stop the pod after this many minutes with nothing running (0: never)")
 	up.Flags().StringVar(&name, "name", "remote-pod", "the pod's name in the RunPod console")
-	_ = up.MarkFlagRequired("gpu")
 
 	status := &cobra.Command{
 		Use:     "status",
@@ -332,7 +394,38 @@ It stops itself after --idle minutes with no command and nothing running.`,
 	}
 	down.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask")
 
-	return []*cobra.Command{gpus, up, status, stop, down, configCommand()}
+	var vcpu int
+	cpusCmd := &cobra.Command{
+		Use:     "cpus",
+		Short:   "CPU-only pod families, with the stock and price of a size",
+		Example: "  remote-pod cpus\n  remote-pod cpus --vcpu 16",
+		GroupID: "pod",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, _, err := api()
+			if err != nil {
+				return err
+			}
+			fl, err := c.CPUFlavors(context.Background(), vcpu)
+			if err != nil {
+				return err
+			}
+			var rows [][]string
+			for _, f := range fl {
+				stock, price := "-", "-"
+				if f.Specifics != nil {
+					stock, price = strings.ToUpper(f.Specifics.StockStatus), fmt.Sprintf("$%.3f", f.Specifics.SecurePrice)
+				}
+				rows = append(rows, []string{f.ID, f.DisplayName, fmt.Sprintf("%d GB", f.RAMPerVCPU),
+					fmt.Sprintf("%d-%d", f.MinVCPU, f.MaxVCPU), runpod.CPUInstanceID(f, vcpu), price, ui.State(stock)})
+			}
+			ui.Print(fl, func() {
+				ui.Table([]string{"Flavor", "Kind", "RAM/vCPU", "vCPUs", fmt.Sprintf("Size at %d vCPUs", vcpu), "$/hr", "Stock"}, rows)
+			})
+			return nil
+		},
+	}
+	cpusCmd.Flags().IntVar(&vcpu, "vcpu", 8, "the size to price (vCPUs)")
+	return []*cobra.Command{gpus, cpusCmd, up, status, stop, down, configCommand()}
 }
 
 func configCommand() *cobra.Command {

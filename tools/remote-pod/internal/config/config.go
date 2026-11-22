@@ -35,6 +35,7 @@ type R2 struct {
 type Images struct {
 	Train string `toml:"train"`
 	Dev   string `toml:"dev"`
+	CPU   string `toml:"cpu"`
 }
 
 // Dir is ~/.config/remote-pod (or $REMOTE_POD_CONFIG_DIR).
@@ -62,6 +63,9 @@ func Load() (*Config, error) {
 	if c.Images.Train == "" {
 		c.Images.Train = "ghcr.io/samuelhaidu/remote-pod:train"
 	}
+	if c.Images.CPU == "" {
+		c.Images.CPU = "ghcr.io/samuelhaidu/remote-pod:cpu"
+	}
 	if c.Images.Dev == "" {
 		c.Images.Dev = "ghcr.io/samuelhaidu/remote-pod:dev"
 	}
@@ -87,7 +91,9 @@ func (c *Config) RunPodKey() (string, error) {
 }
 
 // HasR2 reports whether the store is configured.
-func (c *Config) HasR2() bool { return c.R2.Endpoint != "" && c.R2.Bucket != "" && c.R2.AccessKey != "" }
+func (c *Config) HasR2() bool {
+	return c.R2.Endpoint != "" && c.R2.Bucket != "" && c.R2.AccessKey != ""
+}
 
 // State is the project's current pod: where its agent listens and the token to talk to it.
 type State struct {

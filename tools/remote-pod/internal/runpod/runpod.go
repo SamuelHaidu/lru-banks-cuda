@@ -78,12 +78,12 @@ func (c *Client) Balance(ctx context.Context) (balance, perHour float64, err err
 
 // GPU is one GPU type with its prices and stock (lowest price for one GPU).
 type GPU struct {
-	ID            string  `json:"id"`
-	DisplayName   string  `json:"displayName"`
-	MemoryInGb    int     `json:"memoryInGb"`
-	SecurePrice   float64 `json:"securePrice"`
+	ID             string  `json:"id"`
+	DisplayName    string  `json:"displayName"`
+	MemoryInGb     int     `json:"memoryInGb"`
+	SecurePrice    float64 `json:"securePrice"`
 	CommunityPrice float64 `json:"communityPrice"`
-	LowestPrice   struct {
+	LowestPrice    struct {
 		UninterruptablePrice float64 `json:"uninterruptablePrice"`
 		StockStatus          string  `json:"stockStatus"`
 	} `json:"lowestPrice"`
@@ -112,14 +112,14 @@ func (c *Client) GPUs(ctx context.Context) ([]GPU, error) {
 
 // CreateInput is a pod to create.
 type CreateInput struct {
-	Name          string
-	Image         string
-	GPUTypeID     string
-	Cloud         string // COMMUNITY, SECURE or ALL
-	DiskGB        int    // container disk
-	VolumeGB      int    // /workspace volume (0: none)
-	Env           map[string]string
-	Ports         string // "8080/http"
+	Name      string
+	Image     string
+	GPUTypeID string
+	Cloud     string // COMMUNITY, SECURE or ALL
+	DiskGB    int    // container disk
+	VolumeGB  int    // /workspace volume (0: none)
+	Env       map[string]string
+	Ports     string // "8080/http"
 }
 
 // Pod is what the API reports about a pod.
@@ -189,4 +189,78 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 func (c *Client) Terminate(ctx context.Context, id string) error {
 	return c.Do(ctx, `mutation($input: PodTerminateInput!) { podTerminate(input: $input) }`,
 		map[string]any{"input": map[string]any{"podId": id}}, nil)
+}
+
+// CPUFlavor is a CPU pod family: vCPUs from MinVCPU to MaxVCPU, RAMPerVCPU GB of memory per vCPU.
+type CPUFlavor struct {
+	ID          string `json:"id"`          // cpu3c, cpu3g, cpu3m, cpu5c, ...
+	GroupID     string `json:"groupId"`     // cpu3, cpu5 (the CPU generation)
+	DisplayName string `json:"displayName"` // Compute-Optimized, General Purpose, Memory-Optimized
+	MinVCPU     int    `json:"minVcpu"`
+	MaxVCPU     int    `json:"maxVcpu"`
+	RAMPerVCPU  int    `json:"ramMultiplier"`
+	Specifics   *struct {
+		StockStatus string  `json:"stockStatus"`
+		SecurePrice float64 `json:"securePrice"`
+	} `json:"specifics,omitempty"`
+}
+
+// CPUInstanceID names a CPU pod size: <flavor>-<vcpus>-<ram GB> (e.g. cpu5g-8-32).
+func CPUInstanceID(f CPUFlavor, vcpus int) string {
+	return fmt.Sprintf("%s-%d-%d", f.ID, vcpus, vcpus*f.RAMPerVCPU)
+}
+
+// CPUFlavors lists the CPU families with the stock and price of `vcpus` vCPUs each.
+func (c *Client) CPUFlavors(ctx context.Context, vcpus int) ([]CPUFlavor, error) {
+	var d struct {
+		Flavors []CPUFlavor `json:"cpuFlavors"`
+	}
+	q := `query { cpuFlavors { id groupId displayName minVcpu maxVcpu ramMultiplier } }`
+	if err := c.Do(ctx, q, nil, &d); err != nil {
+		return nil, err
+	}
+	for i, f := range d.Flavors {
+		if vcpus < f.MinVCPU || vcpus > f.MaxVCPU {
+			continue
+		}
+		var s struct {
+			Flavors []CPUFlavor `json:"cpuFlavors"`
+		}
+		q := `query($id: String!) { cpuFlavors { id specifics(input: {instanceId: $id}) { stockStatus securePrice } } }`
+		if err := c.Do(ctx, q, map[string]any{"id": CPUInstanceID(f, vcpus)}, &s); err != nil {
+			return nil, err
+		}
+		for _, x := range s.Flavors {
+			if x.ID == f.ID {
+				d.Flavors[i].Specifics = x.Specifics
+			}
+		}
+	}
+	return d.Flavors, nil
+}
+
+// CreateCPU deploys a CPU-only pod (secure cloud: RunPod's CPU pods) and returns its id.
+func (c *Client) CreateCPU(ctx context.Context, in CreateInput, instanceID string) (string, error) {
+	env := []map[string]string{}
+	for k, v := range in.Env {
+		env = append(env, map[string]string{"key": k, "value": v})
+	}
+	sort.Slice(env, func(i, j int) bool { return env[i]["key"] < env[j]["key"] })
+	vars := map[string]any{"input": map[string]any{
+		"instanceId": instanceID, "cloudType": "SECURE", "containerDiskInGb": in.DiskGB, "imageName": in.Image,
+		"name": in.Name, "ports": in.Ports, "env": env,
+	}}
+	var d struct {
+		Pod struct {
+			ID string `json:"id"`
+		} `json:"deployCpuPod"`
+	}
+	q := `mutation($input: deployCpuPodInput!) { deployCpuPod(input: $input) { id } }`
+	if err := c.Do(ctx, q, vars, &d); err != nil {
+		return "", err
+	}
+	if d.Pod.ID == "" {
+		return "", fmt.Errorf("runpod api: no CPU pod created (%s not available?)", instanceID)
+	}
+	return d.Pod.ID, nil
 }

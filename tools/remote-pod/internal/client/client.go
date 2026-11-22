@@ -93,7 +93,7 @@ func (c *Client) Health() (proto.Health, error) {
 
 // ExecIO is what an exec connects to locally.
 type ExecIO struct {
-	Stdin   io.Reader     // nil: none (EOF sent at once)
+	Stdin   io.Reader // nil: none (EOF sent at once)
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Signals <-chan string // "INT", "TERM", ... forwarded to the remote process group

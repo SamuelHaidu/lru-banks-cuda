@@ -64,9 +64,9 @@ func (s *Server) exec(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := s.command(start)
 	var (
-		stdin    io.WriteCloser
-		ptmx     *os.File
-		outputs  sync.WaitGroup
+		stdin   io.WriteCloser
+		ptmx    *os.File
+		outputs sync.WaitGroup
 	)
 	if start.TTY {
 		size := &pty.Winsize{Rows: start.Rows, Cols: start.Cols}

@@ -23,9 +23,9 @@ import (
 // Jobs are detached commands: they outlive the connection that started them; their output (stdout and stderr
 // together) goes to <dir>/<id>.log, which clients follow from any byte offset.
 type Jobs struct {
-	dir  string
-	mu   sync.Mutex
-	jobs map[string]*job
+	dir   string
+	mu    sync.Mutex
+	jobs  map[string]*job
 	hooks []func(proto.Job) // called when a job ends (the log upload, the train runner)
 }
 
@@ -99,7 +99,7 @@ func (j *Jobs) Get(idOrName string) (proto.Job, bool) {
 	if jb, ok := j.jobs[idOrName]; ok {
 		return j.withSize(jb.Job), true
 	}
-	var best *job  // by name: the latest
+	var best *job // by name: the latest
 	for _, jb := range j.jobs {
 		if jb.Name == idOrName && (best == nil || jb.Started.After(best.Started)) {
 			best = jb

@@ -72,13 +72,14 @@ RunPod rents, into engine/build/dist/lbc. Compiling CUDA needs no GPU. The binar
 
 	var base, tag string
 	imageBuild := &cobra.Command{
-		Use:   "build [train|dev|agent]",
-		Short: "Build the pod image (train: lbc + agent; dev: + nvcc, cmake, ninja, Nsight; agent: the agent only)",
+		Use:   "build [train|dev|cpu|agent]",
+		Short: "Build a pod image (train: lbc + agent; dev: + nvcc, cmake, ninja, Nsight; cpu: data work; agent: the agent only)",
 		Long: `Build a pod image. The agent is compiled here first (a static Linux binary), then copied in; train also needs
 engine/build/dist/lbc (remote-pod build). "agent" is the train image without lbc, for testing the agent: with
 --base ubuntu:24.04 it needs no CUDA download.`,
 		Example: `  remote-pod build && remote-pod image build train
   remote-pod image build dev
+  remote-pod image build cpu                                                       CPU-only pods (data work)
   remote-pod image build agent --base ubuntu:24.04 --tag remote-pod:agent-test     a local test image`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -109,8 +110,8 @@ engine/build/dist/lbc (remote-pod build). "agent" is the train image without lbc
 				return fmt.Errorf("building the agent: %w", err)
 			}
 			file, target := "train.Dockerfile", kind
-			if kind == "dev" {
-				file, target = "dev.Dockerfile", ""
+			if kind == "dev" || kind == "cpu" {
+				file, target = kind+".Dockerfile", ""
 			}
 			dargs := []string{"build", "--network", "host", "-f", filepath.Join(root, "docker", file), "-t", ref}
 			tagged := ref + "-" + gitSHA()
