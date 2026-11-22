@@ -129,6 +129,11 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
 
 ## RunPod (`pod.sh`)
 
+- **`remote-pod`** (`tools/remote-pod/`, Go): the replacement, built and tested locally, not yet proven on a live pod.
+  `remote-pod --help` is its manual: `up` / `sh` / `cp` / `sync` / `logs` (an agent in our image, reached through
+  RunPod's HTTPS proxy: no SSH, community pods work), `train` (datasets and checkpoints in R2; the pod stops itself),
+  `build` / `image` (lbc compiled in a local CUDA container). Until its live test, `pod.sh` below is the working way.
+
 ```bash
 ./pod.sh gpus [--all]          # GPUs in stock now, cheapest first: id for `up`, VRAM, $/hr, stock, data centers
 ./pod.sh up [gpu-id]           # create (community with a public IP, else secure); id in .pod
