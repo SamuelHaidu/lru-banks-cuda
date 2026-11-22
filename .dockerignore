@@ -1,0 +1,4 @@
+# The pod images need only the two binaries (docker/*.Dockerfile)
+*
+!tools/remote-pod/dist/remote-pod
+!engine/build/dist/lbc
