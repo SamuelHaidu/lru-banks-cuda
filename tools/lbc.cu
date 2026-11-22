@@ -34,6 +34,7 @@
 #include "../src/json.hpp"
 #include "../src/model.hpp"
 #include "../src/run_config.hpp"
+#include "lbc_rl.hpp"
 #include "lbc/check.hpp"
 
 using namespace lbc;
@@ -59,7 +60,7 @@ void usage() {
                  "             [--silence L:H,...]\n"
                  "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n"
                  "             [--silence L:H,...]\n"
-                 "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed S]\n"
+                 "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed S] [--stop ID,ID]\n"
                  "  lbc score  RUN_DIR --pairs FILE --out FILE [--checkpoint best|latest|PATH] [--rows N]\n");
     std::exit(2);
 }
@@ -189,10 +190,14 @@ class Progress {
 // -- train ----------------------------------------------------------------------------------------------------------
 
 struct EpochSums {
-    int n = 0;
+    int n = 0, skipped = 0;  // skipped: steps with a non-finite loss or gradient (the optimizer skips them)
     double loss = 0, acc = 0, grad_norm = 0, open_w = 0, open_r1 = 0, open_r2 = 0;
     StepMetrics last{};
     void add(const StepMetrics& m) {
+        if (!std::isfinite(m.loss) || !std::isfinite(m.grad_norm)) {
+            ++skipped;
+            return;
+        }
         ++n;
         loss += m.loss;
         acc += m.accuracy;
@@ -288,7 +293,8 @@ int cmd_train(int argc, char** argv) {
     cudaStream_t s;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     TokenFile train_file(meta.train_file);
-    const size_t spp = Loader::steps_per_pass(train_file.size(), c.B, c.T);
+    const int batch_rows = rc.data.batch_size, accum = batch_rows / c.B;  // c.B: rows per forward/backward
+    const size_t spp = Loader::steps_per_pass(train_file.size(), batch_rows, c.T);
     if (spp == 0) die("the train split holds less than one batch");
     const int spe = std::max(1, int(double(spp) * rc.data.epoch_passes));
     const uint64_t seed = uint64_t(rc.data.seed);
@@ -296,21 +302,72 @@ int cmd_train(int argc, char** argv) {
     if (resume) {
         load_checkpoint(latest, model, s);
         std::printf("Resuming '%s' from epoch %d (optimizer state restored).\n", run_name.c_str(), initial_epoch);
+    } else if (!rc.training.init_from.empty()) {
+        load_weights(rc.training.init_from, model, s);
+        std::printf("Initialized run '%s' from the weights of %s (fresh optimizer, step 0).\n", run_name.c_str(),
+                    rc.training.init_from.c_str());
     } else {
         std::printf("Initialized a fresh 'lru-banks-cuda' model for run '%s'.\n", run_name.c_str());
     }
-    std::unique_ptr<TokenFile> val_file;
-    std::unique_ptr<ValidationSet> val;
-    if (rc.training.validation_steps > 0) {
-        val_file = std::make_unique<TokenFile>(meta.validation_file);
-        val = std::make_unique<ValidationSet>(*val_file, c.B, c.T, rc.training.validation_steps, seed,
-                                              meta.doc_token_id, meta.score_after_token, meta.score_prev_token,
-                                              meta.row_length > 0);
+    // mixed sources: data.mix_datasets, each a fixed number of every batch's rows (data.dataset: the rest)
+    const bool mixed = !rc.data.mix_datasets.empty();
+    std::vector<DatasetMeta> mix_meta;
+    std::vector<int> src_rows = {batch_rows};
+    for (size_t i = 0; i < rc.data.mix_datasets.size(); ++i) {
+        mix_meta.push_back(DatasetMeta::load(rc.data.mix_datasets[i]));
+        const DatasetMeta& m = mix_meta.back();
+        if (m.vocabulary_size != meta.vocabulary_size || m.doc_token_id != meta.doc_token_id)
+            die(rc.data.mix_datasets[i] + ": another vocabulary or document marker than the training dataset");
+        const int r = int(std::lround(rc.data.mix_fractions[i] * batch_rows));
+        src_rows.push_back(r);
+        src_rows[0] -= r;
     }
-    Loader loader(train_file, c.B, c.T, seed, meta.doc_token_id, uint64_t(initial_epoch) * uint64_t(spe),
-                  meta.score_after_token, meta.score_prev_token, meta.row_length > 0);
+    // val_loss: data.validation_dataset's validation split when set (then the training dataset's is val_data_loss);
+    // with mixed sources: the training dataset's, and the first mix dataset's is val_mix_loss
+    const bool two_val = !rc.data.validation_dataset.empty() || mixed;
+    const std::string v2name = mixed ? "val_mix" : "val_data";
+    const DatasetMeta vmeta = rc.data.validation_dataset.empty() ? meta : DatasetMeta::load(rc.data.validation_dataset);
+    const DatasetMeta& v2meta = mixed ? mix_meta[0] : meta;
+    if (vmeta.vocabulary_size != meta.vocabulary_size || vmeta.doc_token_id != meta.doc_token_id)
+        die(rc.data.validation_dataset + ": another vocabulary or document marker than the training dataset");
+    std::unique_ptr<TokenFile> val_file, val2_file;
+    std::unique_ptr<ValidationSet> val, val2;
+    auto span_of = [](const DatasetMeta& m) { return Span{m.span_open, m.span_close}; };
+    if (rc.training.validation_steps > 0) {
+        val_file = std::make_unique<TokenFile>(vmeta.validation_file);
+        val = std::make_unique<ValidationSet>(*val_file, c.B, c.T, rc.training.validation_steps * accum, seed,
+                                              vmeta.doc_token_id, vmeta.score_after_token, vmeta.score_prev_token,
+                                              vmeta.row_length > 0, span_of(vmeta));
+        if (two_val) {
+            val2_file = std::make_unique<TokenFile>(v2meta.validation_file);
+            val2 = std::make_unique<ValidationSet>(*val2_file, c.B, c.T, rc.training.validation_steps * accum, seed,
+                                                   v2meta.doc_token_id, v2meta.score_after_token,
+                                                   v2meta.score_prev_token, v2meta.row_length > 0, span_of(v2meta));
+        }
+    }
+    const uint64_t start_batch = uint64_t(initial_epoch) * uint64_t(spe);
+    std::vector<std::unique_ptr<TokenFile>> mix_files;
+    std::vector<std::unique_ptr<Loader>> sources;
+    sources.push_back(std::make_unique<Loader>(train_file, src_rows[0], c.T, seed, meta.doc_token_id, start_batch,
+                                               meta.score_after_token, meta.score_prev_token, meta.row_length > 0, 3,
+                                               span_of(meta)));
+    for (size_t i = 0; i < mix_meta.size(); ++i) {
+        const DatasetMeta& m = mix_meta[i];
+        mix_files.push_back(std::make_unique<TokenFile>(m.train_file));
+        sources.push_back(std::make_unique<Loader>(*mix_files.back(), src_rows[i + 1], c.T, seed + 1000 * (i + 1),
+                                                   m.doc_token_id, start_batch, m.score_after_token,
+                                                   m.score_prev_token, m.row_length > 0, 3, span_of(m)));
+    }
+    MixLoader loader(std::move(sources), src_rows, c.T);
+    if (mixed) {
+        std::printf("mixed batches: %d rows of %s", src_rows[0], meta.name.c_str());
+        for (size_t i = 0; i < mix_meta.size(); ++i) std::printf(" + %d rows of %s", src_rows[i + 1], mix_meta[i].name.c_str());
+        std::printf(" (every batch)\n");
+    }
 
-    const size_t ntok = size_t(c.B) * c.T;
+    const size_t ntok = size_t(c.B) * c.T;  // one micro-batch
+    const size_t step_tokens = size_t(batch_rows) * c.T;
+    model.set_accumulation(accum);
     int *d_ids, *d_y;
     uint8_t* d_reset;
     float *d_inv_n, *d_val;
@@ -318,12 +375,13 @@ int cmd_train(int argc, char** argv) {
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
     LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
-    LBC_CUDA(cudaMalloc(&d_val, 2 * sizeof(float) * size_t(std::max(1, rc.training.validation_steps))));
+    LBC_CUDA(cudaMalloc(&d_val, 2 * sizeof(float) * size_t(std::max(1, rc.training.validation_steps * accum))));
     const Batch batch{d_ids, d_y, d_reset, d_inv_n};
-    auto copy_batch = [&](const HostBatch& hb) {
-        LBC_CUDA(cudaMemcpyAsync(d_ids, hb.ids, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
-        LBC_CUDA(cudaMemcpyAsync(d_y, hb.y, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
-        LBC_CUDA(cudaMemcpyAsync(d_reset, hb.reset, ntok, cudaMemcpyHostToDevice, s));
+    auto copy_batch = [&](const HostBatch& hb, int part = 0) {  // micro-batch `part` of the batch's rows
+        const size_t o = size_t(part) * ntok;
+        LBC_CUDA(cudaMemcpyAsync(d_ids, hb.ids + o, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_y, hb.y + o, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
+        LBC_CUDA(cudaMemcpyAsync(d_reset, hb.reset + o, ntok, cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_inv_n, hb.inv_n, sizeof(float), cudaMemcpyHostToDevice, s));
     };
 
@@ -339,9 +397,9 @@ int cmd_train(int argc, char** argv) {
     std::printf("device=cuda:%d (%s)  arch=lru-banks-cuda  params=%s (embeddings %s / mechanism %s)  memory=%.2f GiB\n",
                 dev, prop.name, with_commas(real).c_str(), with_commas(emb).c_str(), with_commas(real - emb).c_str(),
                 (total_b - free_b) / 1073741824.0);
-    std::printf("dataset=%s  context=%d  batch=%d  steps/epoch=%d (%.3g pass, random windows)  dense supervision  "
-                "epochs %d -> %d\n",
-                meta.name.c_str(), c.T, c.B, spe, double(spe) / double(spp), initial_epoch, total_epochs);
+    std::printf("dataset=%s  context=%d  batch=%d (micro-batches of %d: %d per update)  steps/epoch=%d (%.3g pass, "
+                "random windows)  dense supervision  epochs %d -> %d\n",
+                meta.name.c_str(), c.T, batch_rows, c.B, accum, spe, double(spe) / double(spp), initial_epoch, total_epochs);
     std::fflush(stdout);
 
     // per-step numbers: one asynchronous copy of the model's metrics record into a pinned ring after every step,
@@ -352,10 +410,10 @@ int cmd_train(int argc, char** argv) {
     LBC_CUDA(cudaHostAlloc(&ring, sizeof(float) * size_t(R) * size_t(rec), cudaHostAllocDefault));
     cudaEvent_t ev[R];
     for (auto& e : ev) LBC_CUDA(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-    std::vector<float> val_host(2 * size_t(std::max(1, rc.training.validation_steps)));
+    std::vector<float> val_host(2 * size_t(std::max(1, rc.training.validation_steps * accum)));
 
     const bool use_graph = rc.runtime.cuda_graph;
-    cudaGraphExec_t step_graph = nullptr, val_graph = nullptr;
+    cudaGraphExec_t step_graph = nullptr, acc_graph = nullptr, opt_graph = nullptr, val_graph = nullptr;
     bool step_eager_done = false, val_eager_done = false;
     auto capture = [&](auto&& body) {
         cudaGraph_t g;
@@ -368,7 +426,7 @@ int cmd_train(int argc, char** argv) {
         return exec;
     };
     const double ln2 = std::log(2.0);
-    const double tcpt = meta.train_chars_per_token, vcpt = meta.validation_chars_per_token;
+    const double tcpt = meta.train_chars_per_token, vcpt = vmeta.validation_chars_per_token;
 
     for (int epoch = initial_epoch; epoch < total_epochs; ++epoch) {
         std::printf("Epoch %d/%d\n", epoch + 1, total_epochs);
@@ -388,23 +446,46 @@ int cmd_train(int argc, char** argv) {
             char b[160];
             std::snprintf(b, sizeof b, " - lr: %.2e - grad_norm: %s - open: %s - tok/s: %.0fk", m.lr,
                           fmt_value(m.grad_norm).c_str(), open_str(m.open_w, m.open_r1, m.open_r2).c_str(),
-                          ntok / per_step / 1e3);
-            return v + b;
+                          step_tokens / per_step / 1e3);
+            if (sums.skipped) v += b + std::string(" - skipped: ") + std::to_string(sums.skipped);
+            else v += b;
+            return v;
         };
         for (int i = 0; i < spe; ++i) {
             HostBatch* hb = loader.next();
-            copy_batch(*hb);
-            loader.release(hb, s);
-            if (!use_graph || !step_eager_done) {  // the first step eagerly: it builds every GEMM plan
-                model.forward_backward(batch, s);
-                model.optimizer_step(s);
-                step_eager_done = true;
-            } else {
-                if (!step_graph) step_graph = capture([&] {
+            if (accum == 1) {
+                copy_batch(*hb);
+                loader.release(hb, s);
+                if (!use_graph || !step_eager_done) {  // the first step eagerly: it builds every GEMM plan
                     model.forward_backward(batch, s);
                     model.optimizer_step(s);
-                });
-                LBC_CUDA(cudaGraphLaunch(step_graph, s));
+                    step_eager_done = true;
+                } else {
+                    if (!step_graph) step_graph = capture([&] {
+                        model.forward_backward(batch, s);
+                        model.optimizer_step(s);
+                    });
+                    LBC_CUDA(cudaGraphLaunch(step_graph, s));
+                }
+            } else {  // gradient accumulation: the micro-batches add into one gradient (inv_n: the whole batch's)
+                for (int part = 0; part < accum; ++part) {
+                    copy_batch(*hb, part);
+                    if (!use_graph || !step_eager_done) {
+                        model.forward_backward(batch, s, part > 0);
+                    } else {
+                        cudaGraphExec_t& g = part == 0 ? step_graph : acc_graph;
+                        if (!g) g = capture([&] { model.forward_backward(batch, s, part > 0); });
+                        LBC_CUDA(cudaGraphLaunch(g, s));
+                    }
+                }
+                loader.release(hb, s);
+                if (!use_graph || !step_eager_done) {
+                    model.optimizer_step(s);
+                    step_eager_done = true;
+                } else {
+                    if (!opt_graph) opt_graph = capture([&] { model.optimizer_step(s); });
+                    LBC_CUDA(cudaGraphLaunch(opt_graph, s));
+                }
             }
             if (i >= R && consumed <= i - R) {  // the slot is still unread: wait for it
                 LBC_CUDA(cudaEventSynchronize(ev[(i - R) % R]));
@@ -435,10 +516,9 @@ int cmd_train(int argc, char** argv) {
         const double per_step = train_s / spe;
 
         // validation: the same rows every epoch, forward and loss only
-        double val_loss = -1, val_acc = -1;
-        if (val) {
-            for (int k = 0; k < val->steps(); ++k) {
-                copy_batch(val->batch(k));
+        auto validate = [&](ValidationSet& vs, double& loss_out, double& acc_out) {
+            for (int k = 0; k < vs.steps(); ++k) {
+                copy_batch(vs.batch(k));
                 if (!use_graph || !val_eager_done) {
                     model.forward_loss(batch, s);
                     val_eager_done = true;
@@ -449,15 +529,18 @@ int cmd_train(int argc, char** argv) {
                 LBC_CUDA(cudaMemcpyAsync(d_val + 2 * k, model.metrics_device(), 2 * sizeof(float),
                                          cudaMemcpyDeviceToDevice, s));
             }
-            LBC_CUDA(cudaMemcpyAsync(val_host.data(), d_val, 2 * sizeof(float) * size_t(val->steps()),
+            LBC_CUDA(cudaMemcpyAsync(val_host.data(), d_val, 2 * sizeof(float) * size_t(vs.steps()),
                                      cudaMemcpyDeviceToHost, s));
             LBC_CUDA(cudaStreamSynchronize(s));
-            val_loss = val_acc = 0;
-            for (int k = 0; k < val->steps(); ++k) {
-                val_loss += val_host[2 * size_t(k)] / val->steps();
-                val_acc += val_host[2 * size_t(k) + 1] / val->steps();
+            loss_out = acc_out = 0;
+            for (int k = 0; k < vs.steps(); ++k) {
+                loss_out += val_host[2 * size_t(k)] / vs.steps();
+                acc_out += val_host[2 * size_t(k) + 1] / vs.steps();
             }
-        }
+        };
+        double val_loss = -1, val_acc = -1, val2_loss = -1, val2_acc = -1;
+        if (val) validate(*val, val_loss, val_acc);
+        if (val2) validate(*val2, val2_loss, val2_acc);
         const double epoch_s = seconds_since(t0);
 
         std::string v = values(sums.last, per_step);
@@ -465,7 +548,19 @@ int cmd_train(int argc, char** argv) {
             v += " - val_loss: " + fmt_value(val_loss) + " - val_sparse_categorical_accuracy: " + fmt_value(val_acc);
             if (vcpt > 0) v += " - val_bpc: " + fmt_value(val_loss / ln2 / vcpt);
         }
+        if (val2)
+            v += " - " + v2name + "_loss: " + fmt_value(val2_loss) + " - " + v2name + "_accuracy: " + fmt_value(val2_acc);
         bar.draw(spe, std::to_string(long(epoch_s + 0.5)) + "s", per_step, v, true);
+        if (mixed) {  // the share of the scored targets each source gave so far (rows are fixed; targets vary)
+            const auto& t = loader.targets();
+            long long all = 0;
+            for (long long x : t) all += x;
+            std::printf("  scored targets so far: %s %.1f%%", meta.name.c_str(), 100.0 * double(t[0]) / double(std::max(1LL, all)));
+            for (size_t i = 1; i < t.size(); ++i)
+                std::printf(", %s %.1f%%", mix_meta[i - 1].name.c_str(), 100.0 * double(t[i]) / double(std::max(1LL, all)));
+            std::printf("\n");
+            std::fflush(stdout);
+        }
 
         // checkpoints: the latest (the resume point), numbered every checkpoint_every epochs, the best val_loss
         const bool improved = val && std::isfinite(val_loss) && (best_val < 0 || val_loss < best_val);
@@ -484,7 +579,8 @@ int cmd_train(int argc, char** argv) {
         std::ofstream csv(csv_path, std::ios::app);
         if (header)
             csv << "epoch,loss,sparse_categorical_accuracy,val_loss,val_sparse_categorical_accuracy,bpc,val_bpc,lr,"
-                   "grad_norm,open_w,open_r1,open_r2,ms_per_step,tokens_per_s,seconds\n";
+                   "grad_norm,open_w,open_r1,open_r2,ms_per_step,tokens_per_s,seconds" +
+                   (two_val ? "," + v2name + "_loss," + v2name + "_accuracy" : std::string()) + "\n";
         const int n = std::max(1, sums.n);
         const double mean_loss = sums.loss / n;
         auto num = [](double x) {
@@ -497,8 +593,10 @@ int cmd_train(int argc, char** argv) {
             << opt(bool(val), val_acc) << "," << opt(tcpt > 0, mean_loss / ln2 / tcpt) << ","
             << opt(val && vcpt > 0, val_loss / ln2 / vcpt) << "," << num(sums.last.lr) << ","
             << num(sums.grad_norm / n) << "," << num(sums.open_w / n) << "," << num(sums.open_r1 / n) << ","
-            << num(sums.open_r2 / n) << "," << num(per_step * 1e3) << "," << num(ntok / per_step) << ","
-            << num(epoch_s) << "\n";
+            << num(sums.open_r2 / n) << "," << num(per_step * 1e3) << "," << num(step_tokens / per_step) << ","
+            << num(epoch_s);
+        if (two_val) csv << "," << opt(bool(val2), val2_loss) << "," << opt(bool(val2), val2_acc);
+        csv << "\n";
     }
     return 0;
 }
@@ -509,15 +607,17 @@ int cmd_train(int argc, char** argv) {
 int cmd_dump(int argc, char** argv) {
     if (argc < 1) usage();
     const std::string run = argv[0];
-    std::string which = "latest", split, out = "/tmp/lbc_inspect", silence;
-    int rows = 2;
+    std::string which = "latest", split, out = "/tmp/lbc_inspect", silence, rows_from;
+    int rows = 2, window = 0;
     double tau_scale = 1.0, write_bias_add = 0.0;  // inference-time interventions (analysis only)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
         else if (a == "--split" && i + 1 < argc) split = argv[++i];
         else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+        else if (a == "--window" && i + 1 < argc) window = std::atoi(argv[++i]);  // rows of this length (not the run's)
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
+        else if (a == "--rows-from" && i + 1 < argc) rows_from = argv[++i];  // rows saved by eval --find-nan
         else if (a == "--silence" && i + 1 < argc) silence = argv[++i];
         else if (a == "--tau-scale" && i + 1 < argc) tau_scale = std::atof(argv[++i]);
         else if (a == "--write-bias-add" && i + 1 < argc) write_bias_add = std::atof(argv[++i]);
@@ -529,6 +629,11 @@ int cmd_dump(int argc, char** argv) {
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
     if (split.empty()) split = meta.validation_file;
     Config c = rc.model_config();
+    if (window > 0) {
+        c.T = window;
+        c.bank_chunk = std::min(c.bank_chunk, c.T);
+    }
+    if (!rows_from.empty()) rows = int(fs::file_size(rows_from) / (size_t(c.T) * 9));
     c.B = rows;
     cudaStream_t s;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -553,9 +658,29 @@ int cmd_dump(int argc, char** argv) {
     model.keep_row_loss();
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token, meta.row_length > 0);
-    const HostBatch& hb = vs.batch(0);
+                     meta.score_prev_token, meta.row_length > 0,
+                     Span{meta.span_open, meta.span_close});
+    HostBatch hb = vs.batch(0);
     const size_t ntok = size_t(c.B) * c.T;
+    std::vector<int> f_ids(ntok), f_y(ntok);
+    std::vector<uint8_t> f_reset(ntok);
+    float f_inv_n = 0.f;
+    if (!rows_from.empty()) {
+        std::ifstream f(rows_from, std::ios::binary);
+        int n = 0;
+        for (int b = 0; b < c.B; ++b) {
+            f.read(reinterpret_cast<char*>(f_ids.data() + size_t(b) * c.T), c.T * 4);
+            f.read(reinterpret_cast<char*>(f_y.data() + size_t(b) * c.T), c.T * 4);
+            f.read(reinterpret_cast<char*>(f_reset.data() + size_t(b) * c.T), c.T);
+        }
+        for (int y : f_y) n += y >= 0;
+        f_inv_n = 1.f / float(std::max(1, n));
+        hb.ids = f_ids.data();
+        hb.y = f_y.data();
+        hb.reset = f_reset.data();
+        hb.inv_n = &f_inv_n;
+        hb.n_targets = n;
+    }
     int *d_ids, *d_y;
     uint8_t* d_reset;
     float* d_inv_n;
@@ -629,9 +754,14 @@ int cmd_generate(int argc, char** argv) {
     int tokens = 100, topk = 50;
     double temp = 0.8;
     uint64_t seed = 1;
+    std::vector<int> stop = {0, 1};  // <bos> / <eos>: the document ends
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
+        else if (a == "--stop" && i + 1 < argc) {  // extra stop ids, comma separated (the stop id is kept)
+            std::stringstream ss(argv[++i]);
+            for (std::string x; std::getline(ss, x, ',');) stop.push_back(std::stoi(x));
+        }
         else if (a == "--ids" && i + 1 < argc) in = argv[++i];
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
         else if (a == "--tokens" && i + 1 < argc) tokens = std::atoi(argv[++i]);
@@ -708,7 +838,7 @@ int cmd_generate(int argc, char** argv) {
                 }
             ids.push_back(pick);
             gen.push_back(pick);
-            if (pick == marker || pick == 1) break;  // <bos> or <eos>: the document ends
+            if (pick == marker || std::find(stop.begin(), stop.end(), pick) != stop.end()) break;
         }
         for (size_t i = 0; i < gen.size(); ++i) fout << (i ? " " : "") << gen[i];
         fout << "\n";
@@ -726,7 +856,7 @@ int cmd_score(int argc, char** argv) {
     if (argc < 1) usage();
     const std::string run = argv[0];
     std::string which = "latest", in, out;
-    int rows = 64;
+    int rows = 0;  // 0: as many as fit about 256k tokens per pass
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--checkpoint" && i + 1 < argc) which = argv[++i];
@@ -740,8 +870,31 @@ int cmd_score(int argc, char** argv) {
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
+    std::vector<std::pair<std::vector<int>, std::vector<int>>> pairs;
+    {
+        std::ifstream f(in);
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t bar = line.find('|');
+            if (bar == std::string::npos) continue;
+            std::vector<int> a, b;
+            std::stringstream sa(line.substr(0, bar)), sb(line.substr(bar + 1));
+            for (int x; sa >> x;) a.push_back(x);
+            for (int x; sb >> x;) b.push_back(x);
+            pairs.emplace_back(std::move(a), std::move(b));
+        }
+    }
+    if (pairs.empty()) die(in + ": no pairs");
+    // the model is recurrent and every pair starts with the document marker (a state reset), so rows only need the
+    // longest pair's length, not the training window: rows of that length (a multiple of 64), many per pass
+    size_t longest = 0;
+    for (const auto& pr : pairs) longest = std::max(longest, pr.first.size() + pr.second.size());
     Config c = rc.model_config();
+    c.T = std::max(64, int((longest - 1 + 63) / 64 * 64));
+    c.bank_chunk = std::min(c.bank_chunk, c.T);
+    if (rows <= 0) rows = std::max(1, std::min(int(pairs.size()), (1 << 18) / c.T));
     c.B = rows;
+    const auto t_start = Clock::now();
     cudaStream_t s;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
@@ -758,20 +911,6 @@ int cmd_score(int argc, char** argv) {
     LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
     const float one = 1.f;
     LBC_CUDA(cudaMemcpy(d_inv_n, &one, sizeof(float), cudaMemcpyHostToDevice));
-    std::vector<std::pair<std::vector<int>, std::vector<int>>> pairs;
-    {
-        std::ifstream f(in);
-        std::string line;
-        while (std::getline(f, line)) {
-            const size_t bar = line.find('|');
-            if (bar == std::string::npos) continue;
-            std::vector<int> a, b;
-            std::stringstream sa(line.substr(0, bar)), sb(line.substr(bar + 1));
-            for (int x; sa >> x;) a.push_back(x);
-            for (int x; sb >> x;) b.push_back(x);
-            pairs.emplace_back(std::move(a), std::move(b));
-        }
-    }
     std::ofstream fo(out);
     std::vector<int> ids(ntok), y(ntok);
     std::vector<uint8_t> rst(ntok);
@@ -804,7 +943,8 @@ int cmd_score(int argc, char** argv) {
             fo << ll << " " << span[r].second << "\n";
         }
     }
-    std::printf("scored %zu pairs with %s (epoch %d)\n", pairs.size(), path.c_str(), info.epoch);
+    std::printf("scored %zu pairs with %s (epoch %d): rows of %d tokens, %d per pass, %.2f s\n", pairs.size(),
+                path.c_str(), info.epoch, c.T, rows, seconds_since(t_start));
     return 0;
 }
 
@@ -813,7 +953,7 @@ int cmd_score(int argc, char** argv) {
 int cmd_eval(int argc, char** argv) {
     if (argc < 1) usage();
     const std::string run = argv[0];
-    std::string which = "best", split, silence;
+    std::string which = "best", split, silence, find_nan;
     int steps = 0, rows = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -822,6 +962,7 @@ int cmd_eval(int argc, char** argv) {
         else if (a == "--steps" && i + 1 < argc) steps = std::atoi(argv[++i]);
         else if (a == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
         else if (a == "--silence" && i + 1 < argc) silence = argv[++i];
+        else if (a == "--find-nan" && i + 1 < argc) find_nan = argv[++i];  // save rows with a non-finite loss
         else usage();
     }
     std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
@@ -840,7 +981,8 @@ int cmd_eval(int argc, char** argv) {
     if (!silence.empty()) model.set_silence(parse_silence(silence, c.L));
     TokenFile file(split);
     ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token, meta.row_length > 0);
+                     meta.score_prev_token, meta.row_length > 0,
+                     Span{meta.span_open, meta.span_close});
     const size_t ntok = size_t(c.B) * c.T;
     int *d_ids, *d_y;
     uint8_t* d_reset;
@@ -852,6 +994,12 @@ int cmd_eval(int argc, char** argv) {
     const Batch batch{d_ids, d_y, d_reset, d_inv_n};
     double loss = 0, acc = 0;
     long long targets = 0;
+    std::ofstream nan_out;
+    int nan_rows = 0;
+    if (!find_nan.empty()) {
+        model.keep_row_loss();
+        nan_out.open(find_nan, std::ios::binary);  // per row: T int32 ids, T int32 y, T uint8 reset
+    }
     for (int k = 0; k < vs.steps(); ++k) {
         const HostBatch& hb = vs.batch(k);
         LBC_CUDA(cudaMemcpyAsync(d_ids, hb.ids, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
@@ -862,6 +1010,24 @@ int cmd_eval(int argc, char** argv) {
         float r[2];
         LBC_CUDA(cudaMemcpyAsync(r, model.metrics_device(), sizeof(r), cudaMemcpyDeviceToHost, s));
         LBC_CUDA(cudaStreamSynchronize(s));
+        if (!find_nan.empty()) {
+            const std::vector<float> rl = model.row_loss(s);
+            for (int b = 0; b < c.B; ++b) {
+                int first = -1, bad = 0;
+                for (int t = 0; t < c.T; ++t)
+                    if (!std::isfinite(rl[size_t(b) * c.T + t])) {
+                        if (first < 0) first = t;
+                        ++bad;
+                    }
+                if (first < 0) continue;
+                std::printf("non-finite loss: step %d row %d: %d positions, first %d (target %d)\n", k, b, bad, first,
+                            hb.y[size_t(b) * c.T + first]);
+                nan_out.write(reinterpret_cast<const char*>(hb.ids + size_t(b) * c.T), c.T * 4);
+                nan_out.write(reinterpret_cast<const char*>(hb.y + size_t(b) * c.T), c.T * 4);
+                nan_out.write(reinterpret_cast<const char*>(hb.reset + size_t(b) * c.T), c.T);
+                ++nan_rows;
+            }
+        }
         loss += double(r[0]) * hb.n_targets;  // target-weighted (rows differ in scored targets)
         acc += double(r[1]) * hb.n_targets;
         targets += hb.n_targets;
@@ -869,6 +1035,7 @@ int cmd_eval(int argc, char** argv) {
     std::printf("checkpoint=%s (epoch %d)  split=%s  steps=%d  targets=%lld  silence=%s  loss=%.4f  accuracy=%.4f\n",
                 path.c_str(), info.epoch, split.c_str(), vs.steps(), targets, silence.empty() ? "-" : silence.c_str(),
                 loss / std::max(1LL, targets), acc / std::max(1LL, targets));
+    if (!find_nan.empty()) std::printf("%d rows with a non-finite loss saved to %s\n", nan_rows, find_nan.c_str());
     return 0;
 }
 
@@ -885,6 +1052,9 @@ int main(int argc, char** argv) {
         if (cmd == "dump") return cmd_dump(argc - 2, argv + 2);
         if (cmd == "generate") return cmd_generate(argc - 2, argv + 2);
         if (cmd == "score") return cmd_score(argc - 2, argv + 2);
+        if (cmd == "test-calcx") return cmd_test_calcx(argc - 2, argv + 2);
+        if (cmd == "decode-check") return cmd_decode_check(argc - 2, argv + 2);
+        if (cmd == "grpo") return cmd_grpo(argc - 2, argv + 2);
     } catch (const std::exception& e) {
         die(e.what());
     }
