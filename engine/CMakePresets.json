@@ -1,23 +1,139 @@
 {
   "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 26,
+    "patch": 0
+  },
   "configurePresets": [
     {
-      "name": "release",
-      "displayName": "Release (Ninja)",
+      "name": "base",
+      "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "release",
+      "displayName": "Release: this machine's GPU",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "debug",
-      "displayName": "Debug (Ninja)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "displayName": "Debug",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug with AddressSanitizer + UndefinedBehaviorSanitizer on the host code",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LBC_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "lint",
+      "displayName": "Lint: clang 20 compiles C++ and CUDA with -Werror; clang-tidy, cppcheck",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++-20",
+        "CMAKE_CUDA_COMPILER": "clang++-20",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
+        "LBC_WERROR": "ON"
+      }
+    },
+    {
+      "name": "gate",
+      "displayName": "Gate: nvcc release build with -Werror for the pods' GPUs, plus format-check and lint",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_ARCHITECTURES": "89;90;120",
+        "LBC_WERROR": "ON"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "release" },
-    { "name": "debug", "configurePreset": "debug" }
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "lint",
+      "configurePreset": "lint",
+      "targets": [
+        "all",
+        "tidy",
+        "cppcheck"
+      ]
+    },
+    {
+      "name": "gate",
+      "configurePreset": "gate",
+      "targets": [
+        "gate"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "gate",
+      "configurePreset": "gate",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "ignore"
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "ignore"
+      },
+      "environment": {
+        "ASAN_OPTIONS": "protect_shadow_gap=0:detect_leaks=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1"
+      }
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "gate",
+      "displayName": "Format check, lint, build, test: the one command before every commit",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "gate"
+        },
+        {
+          "type": "build",
+          "name": "gate"
+        },
+        {
+          "type": "test",
+          "name": "gate"
+        }
+      ]
+    }
   ]
 }

@@ -23,9 +23,7 @@ find_package(CUDAToolkit REQUIRED)
 add_library(lbc_common INTERFACE)
 target_include_directories(lbc_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(lbc_common INTERFACE CUDA::cudart)
-target_compile_options(lbc_common INTERFACE
-  $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
-  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr -Xcompiler=-Wall,-Wextra>)
+include(cmake/Warnings.cmake)
 
 find_package(Threads REQUIRED)
 
@@ -45,6 +43,8 @@ add_library(lbc STATIC
   src/decode.cu)
 target_include_directories(lbc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lbc PUBLIC lbc_common CUDA::cublasLt Threads::Threads)
+set_source_files_properties(src/kernels_basic.cu src/kernels_lru_addr.cu src/kernels_bank.cu src/model.cu src/decode.cu
+  PROPERTIES COMPILE_OPTIONS "${LBC_KERNEL_WARNINGS}")
 
 add_executable(device_info tools/device_info.cu)
 target_link_libraries(device_info PRIVATE lbc_common)
@@ -62,3 +62,7 @@ target_link_libraries(check_epilogue PRIVATE lbc)
 
 add_executable(bench_fp8 tools/bench_fp8.cu)
 target_link_libraries(bench_fp8 PRIVATE lbc)
+
+# Format, lint and test targets (format, format-check, tidy, cppcheck, lint, gate): see cmake/Quality.cmake.
+enable_testing()
+include(cmake/Quality.cmake)
