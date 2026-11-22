@@ -8,6 +8,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -33,7 +34,7 @@ TokenFile::TokenFile(const std::string& path) {
     if (map_bytes_ < 12 || std::memcmp(bytes, "\x93NUMPY", 6) != 0) { throw std::runtime_error(path + " is not .npy"); }
     const int major = bytes[6];
     const size_t hlen = major == 1 ? size_t(bytes[8] | bytes[9] << 8)
-                                   : size_t(bytes[8] | bytes[9] << 8 | bytes[10] << 16 | size_t(bytes[11]) << 24);
+                                   : bytes[8] | bytes[9] << 8 | bytes[10] << 16 | size_t(bytes[11]) << 24;
     const size_t start = (major == 1 ? 10 : 12) + hlen;
     const std::string header(reinterpret_cast<const char*>(bytes) + (major == 1 ? 10 : 12), hlen);
     if (header.find("'<u2'") == std::string::npos) { throw std::runtime_error(path + ": expected uint16 ('<u2')"); }
@@ -102,12 +103,12 @@ int fill_row(const uint16_t* tok,
                 in = false;
             }
         }
-        const bool scored =
-            nx != marker && on && in && (score_prev < 0 || (p > 0 && p - 1 < n && tok[p - 1] == score_prev));
+        const bool scored = nx != marker && on && in
+                            && (score_prev < 0 || (p > 0 && p - 1 < n && std::cmp_equal(tok[p - 1], score_prev)));
         ids[t] = x;
         y[t] = scored ? nx : -1;
-        reset[t] = x == marker;
-        targets += scored;
+        reset[t] = static_cast<uint8_t>(x == marker);
+        targets += static_cast<int>(scored);
     }
     return targets;
 }
@@ -154,17 +155,17 @@ Loader::Loader(const TokenFile& file,
 
 Loader::~Loader() {
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<std::mutex> const lk(mu_);
         stop_ = true;
     }
     cv_.notify_all();
     thread_.join();
     for (auto& s : slots_) {
-        cudaFreeHost(s.hb.ids);
-        cudaFreeHost(s.hb.y);
-        cudaFreeHost(s.hb.reset);
-        cudaFreeHost(s.hb.inv_n);
-        cudaEventDestroy(s.done);
+        LBC_CUDA_CLEANUP(cudaFreeHost(s.hb.ids));
+        LBC_CUDA_CLEANUP(cudaFreeHost(s.hb.y));
+        LBC_CUDA_CLEANUP(cudaFreeHost(s.hb.reset));
+        LBC_CUDA_CLEANUP(cudaFreeHost(s.hb.inv_n));
+        LBC_CUDA_CLEANUP(cudaEventDestroy(s.done));
     }
 }
 
@@ -193,7 +194,7 @@ void Loader::fill(HostBatch& hb) {
 
 void Loader::run() {
     for (;;) {
-        Slot* s;
+        Slot* s = nullptr;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return stop_ || !slots_[produce_ % slots_.size()].ready; });
@@ -208,7 +209,7 @@ void Loader::run() {
         fill(s->hb);
         fill_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::lock_guard<std::mutex> const lk(mu_);
             s->ready = true;
             ++produce_;
         }
@@ -226,7 +227,7 @@ HostBatch* Loader::next() {
 
 void Loader::release(HostBatch* hb, cudaStream_t stream) {
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<std::mutex> const lk(mu_);
         Slot& s = slots_[consume_ % slots_.size()];
         if (&s.hb != hb) { throw std::runtime_error("Loader::release: batches must be released in order"); }
         LBC_CUDA(cudaEventRecord(s.done, stream));  // after the copies queued on `stream`
@@ -242,7 +243,7 @@ MixLoader::MixLoader(std::vector<std::unique_ptr<Loader>> sources, std::vector<i
     if (src_.empty() || src_.size() != rows_.size()) {
         throw std::runtime_error("MixLoader: one row count per source");
     }
-    for (int r : rows_) { B_ += r; }
+    for (int const r : rows_) { B_ += r; }
     const size_t n = size_t(B_) * T_;
     for (int i = 0; i < 2; ++i) {
         LBC_CUDA(cudaHostAlloc(&buf_[i].ids, n * sizeof(int), cudaHostAllocDefault));
@@ -256,13 +257,13 @@ MixLoader::MixLoader(std::vector<std::unique_ptr<Loader>> sources, std::vector<i
 
 MixLoader::~MixLoader() {
     for (int i = 0; i < 2; ++i) {
-        cudaFreeHost(buf_[i].ids);
-        cudaFreeHost(buf_[i].y);
-        cudaFreeHost(buf_[i].reset);
-        cudaFreeHost(buf_[i].inv_n);
-        cudaEventDestroy(done_[i]);
+        LBC_CUDA_CLEANUP(cudaFreeHost(buf_[i].ids));
+        LBC_CUDA_CLEANUP(cudaFreeHost(buf_[i].y));
+        LBC_CUDA_CLEANUP(cudaFreeHost(buf_[i].reset));
+        LBC_CUDA_CLEANUP(cudaFreeHost(buf_[i].inv_n));
+        LBC_CUDA_CLEANUP(cudaEventDestroy(done_[i]));
     }
-    cudaStreamDestroy(side_);
+    LBC_CUDA_CLEANUP(cudaStreamDestroy(side_));
 }
 
 HostBatch* MixLoader::next() {
@@ -312,7 +313,7 @@ ValidationSet::ValidationSet(const TokenFile& file,
         for (size_t i = 0; i + size_t(T) <= n; i += size_t(T)) { starts.push_back(i); }
     } else {
         for (size_t i = 0; i < n; ++i) {
-            if (tok[i] == marker) { starts.push_back(i); }
+            if (std::cmp_equal(tok[i], marker)) { starts.push_back(i); }
         }
     }
     if (starts.empty()) { starts.push_back(0); }
@@ -339,10 +340,10 @@ ValidationSet::ValidationSet(const TokenFile& file,
 
 ValidationSet::~ValidationSet() {
     for (auto& hb : batches_) {
-        cudaFreeHost(hb.ids);
-        cudaFreeHost(hb.y);
-        cudaFreeHost(hb.reset);
-        cudaFreeHost(hb.inv_n);
+        LBC_CUDA_CLEANUP(cudaFreeHost(hb.ids));
+        LBC_CUDA_CLEANUP(cudaFreeHost(hb.y));
+        LBC_CUDA_CLEANUP(cudaFreeHost(hb.reset));
+        LBC_CUDA_CLEANUP(cudaFreeHost(hb.inv_n));
     }
 }
 

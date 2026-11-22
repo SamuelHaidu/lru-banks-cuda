@@ -35,7 +35,7 @@ int main() {
         std::printf("    shared memory %zu KiB per SM, %zu KiB per block (opt-in); %d registers per SM\n",
                     p.sharedMemPerMultiprocessor / 1024, p.sharedMemPerBlockOptin / 1024, p.regsPerMultiprocessor);
         std::printf("    %d threads per SM, warp %d, ECC %s\n", p.maxThreadsPerMultiProcessor, p.warpSize,
-                    p.ECCEnabled ? "on" : "off");
+                    (p.ECCEnabled != 0) ? "on" : "off");
     }
     return 0;
 }

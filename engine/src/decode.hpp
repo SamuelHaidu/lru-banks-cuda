@@ -21,6 +21,8 @@ class Decoder {
     ~Decoder();
     Decoder(const Decoder&) = delete;
     Decoder& operator=(const Decoder&) = delete;
+    Decoder(Decoder&&) = delete;
+    Decoder& operator=(Decoder&&) = delete;
 
     // One token for R rows (host arrays): ids, slot, position (0 at the row's first token), reset (the token is the
     // document marker: the state restarts). Leaves the next-token logits on the device (logits(), R x V, when
@@ -67,9 +69,9 @@ class Decoder {
     uint8_t *ridx_, *gw_, *gr_, *gr2_;
     uint2* info_;
     // pinned host staging
-    int* h_in_;
-    int* h_out_;
-    float* h_outf_;
+    int* h_in_ = nullptr;
+    int* h_out_ = nullptr;
+    float* h_outf_ = nullptr;
 };
 
 }  // namespace lbc

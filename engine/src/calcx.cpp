@@ -8,33 +8,76 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <stdexcept>
+#include <string_view>
 
 #include "json.hpp"
+#include "lbc/text.hpp"
 
 namespace lbc::calcx {
 namespace {
 
 using i128 = __int128;
 
+// Checked 128-bit arithmetic: true when the exact result fits, which is then in r (Python ints fall back to floats).
+#ifndef __clang_analyzer__
+bool add_fits(i128 a, i128 b, i128& r) { return !__builtin_add_overflow(a, b, &r); }
+
+bool sub_fits(i128 a, i128 b, i128& r) { return !__builtin_sub_overflow(a, b, &r); }
+
+bool mul_fits(i128 a, i128 b, i128& r) { return !__builtin_mul_overflow(a, b, &r); }
+#else
+// clang 20's static analyzer crashes on the overflow builtins over __int128; it analyzes these equivalents
+constexpr i128 kMax = static_cast<i128>((static_cast<unsigned __int128>(1) << 127) - 1), kMin = -kMax - 1;
+
+bool add_fits(i128 a, i128 b, i128& r) {
+    if ((b > 0 && a > kMax - b) || (b < 0 && a < kMin - b)) { return false; }
+    r = a + b;
+    return true;
+}
+
+bool sub_fits(i128 a, i128 b, i128& r) {
+    if ((b < 0 && a > kMax + b) || (b > 0 && a < kMin + b)) { return false; }
+    r = a - b;
+    return true;
+}
+
+bool mul_fits(i128 a, i128 b, i128& r) {
+    if (a == 0 || b == 0) {
+        r = 0;
+        return true;
+    }
+    if ((a == -1 && b == kMin) || (b == -1 && a == kMin)) { return false; }
+    const i128 bound = (a > 0) == (b > 0) ? kMax : kMin;  // the product's sign picks the limit
+    if (a > 0 ? a > bound / b : a < bound / b) { return false; }
+    r = a * b;
+    return true;
+}
+#endif
+
 // ---- Python repr of floats (shortest round trip; exponent form below 1e-4 or from 1e16) -------------------------
 std::string float_repr(double x, bool point_zero) {
     if (std::isnan(x)) { return "nan"; }
     if (std::isinf(x)) { return x < 0 ? "-inf" : "inf"; }
-    if (x == 0.0) { return std::signbit(x) ? (point_zero ? "-0.0" : "-0") : (point_zero ? "0.0" : "0"); }
-    char buf[64];
-    int p = 1;
-    for (; p <= 17; ++p) {
-        std::snprintf(buf, sizeof buf, "%.*e", p - 1, x);
-        if (std::strtod(buf, nullptr) == x) { break; }
+    if (x == 0.0) {
+        const std::string zero = point_zero ? "0.0" : "0";
+        return std::signbit(x) ? "-" + zero : zero;
     }
-    std::string s = buf, digits;
+    std::string s;  // the fewest significant digits that read back as x
+    for (int p = 1; p <= 17; ++p) {
+        s = strformat("%.*e", p - 1, x);
+        if (std::strtod(s.c_str(), nullptr) == x) { break; }
+    }
+    std::string digits;
     const bool neg = s[0] == '-';
-    size_t e = s.find('e');
+    size_t const e = s.find('e');
     for (size_t i = neg ? 1 : 0; i < e; ++i) {
         if (s[i] != '.') { digits += s[i]; }
     }
-    const int exp = std::atoi(s.c_str() + e + 1);
+    std::string_view exp_text = std::string_view(s).substr(e + 1);  // "+05", "-07"
+    if (exp_text.starts_with('+')) { exp_text.remove_prefix(1); }
+    const int exp = parse_int(exp_text, "float exponent");
     while (digits.size() > 1 && digits.back() == '0') { digits.pop_back(); }
     std::string out = neg ? "-" : "";
     if (exp >= -4 && exp < 16) {
@@ -48,9 +91,7 @@ std::string float_repr(double x, bool point_zero) {
     } else {
         out += digits.substr(0, 1);
         if (digits.size() > 1) { out += "." + digits.substr(1); }
-        char eb[16];
-        std::snprintf(eb, sizeof eb, "e%c%02d", exp < 0 ? '-' : '+', std::abs(exp));
-        out += eb;
+        out += strformat("e%c%02d", exp < 0 ? '-' : '+', std::abs(exp));
     }
     return out;
 }
@@ -127,7 +168,7 @@ Num binop(char op, const Num& a, const Num& b) {
             i128 r = 1, base = a.i;
             bool over = false;
             for (i128 e = b.i; e > 0; --e) {
-                if (__builtin_mul_overflow(r, base, &r)) {
+                if (!mul_fits(r, base, r)) {
                     over = true;
                     break;
                 }
@@ -140,7 +181,7 @@ Num binop(char op, const Num& a, const Num& b) {
         const double x = a.as_f(), y = bf;
         if (x == 0.0 && y < 0) { throw DivZero{}; }
         if (x < 0 && y != std::floor(y)) {  // Python 3: a complex result
-            const double mag = std::pow(-x, y), ang = 3.14159265358979323846 * y;
+            const double mag = std::pow(-x, y), ang = std::numbers::pi * y;
             Num c;
             c.k = Num::Complex;
             c.f = mag * std::cos(ang);
@@ -152,20 +193,23 @@ Num binop(char op, const Num& a, const Num& b) {
         return mk_f(r);
     }
     if (a.k == Num::Int && b.k == Num::Int) {
-        i128 r;
+        i128 r = 0;
         switch (op) {
             case '+':
-                if (!__builtin_add_overflow(a.i, b.i, &r)) { return mk_i(r); }
+                if (add_fits(a.i, b.i, r)) { return mk_i(r); }
                 return mk_f(double(a.i) + double(b.i));
             case '-':
-                if (!__builtin_sub_overflow(a.i, b.i, &r)) { return mk_i(r); }
+                if (sub_fits(a.i, b.i, r)) { return mk_i(r); }
                 return mk_f(double(a.i) - double(b.i));
             case '*':
-                if (!__builtin_mul_overflow(a.i, b.i, &r)) { return mk_i(r); }
+                if (mul_fits(a.i, b.i, r)) { return mk_i(r); }
                 return mk_f(double(a.i) * double(b.i));
             case '/':  // Python rounds the exact rational once
                 if (b.i == 0) { throw DivZero{}; }
-                if (a.i % b.i == 0) { return mk_f(double(a.i / b.i)); }
+                if (a.i % b.i == 0) {
+                    const i128 exact = a.i / b.i;
+                    return mk_f(double(exact));
+                }
                 return mk_f(double((long double)a.i / (long double)b.i));
             case 'f':
                 if (b.i == 0) { throw DivZero{}; }
@@ -174,6 +218,7 @@ Num binop(char op, const Num& a, const Num& b) {
                 if (b.i == 0) { throw DivZero{}; }
                 return mk_i(a.i - floordiv_i(a.i, b.i) * b.i);
             }
+            default: break;  // the float operators below
         }
     }
     const double x = a.as_f(), y = b.as_f();
@@ -187,10 +232,11 @@ Num binop(char op, const Num& a, const Num& b) {
         case 'f':
         case '%': {
             if (y == 0.0) { throw DivZero{}; }
-            double fd, md;
+            double fd = NAN, md = NAN;
             float_divmod(x, y, fd, md);
             return mk_f(op == 'f' ? fd : md);
         }
+        default: break;
     }
     throw Unsupported{};
 }
@@ -225,7 +271,7 @@ struct Parser {
         return false;
     }
 
-    std::unique_ptr<Node> bin(char op, std::unique_ptr<Node> a, std::unique_ptr<Node> b) {
+    static std::unique_ptr<Node> bin(char op, std::unique_ptr<Node> a, std::unique_ptr<Node> b) {
         auto n = std::make_unique<Node>();
         n->op = op;
         n->a = std::move(a);
@@ -293,7 +339,12 @@ struct Parser {
         if (s.compare(i, 2, "0x") == 0 || s.compare(i, 2, "0X") == 0 || s.compare(i, 2, "0o") == 0
             || s.compare(i, 2, "0O") == 0 || s.compare(i, 2, "0b") == 0 || s.compare(i, 2, "0B") == 0) {
             const char kind = char(std::tolower(s[i + 1]));
-            const int base = kind == 'x' ? 16 : kind == 'o' ? 8 : 2;
+            int base = 2;
+            if (kind == 'x') {
+                base = 16;
+            } else if (kind == 'o') {
+                base = 8;
+            }
             i += 2;
             i128 v = 0;
             size_t nd = 0;
@@ -309,7 +360,7 @@ struct Parser {
                     }
                 }
                 if (d < 0 || d >= base) { break; }
-                if (__builtin_mul_overflow(v, base, &v) || __builtin_add_overflow(v, d, &v)) { throw Overflow{}; }
+                if (!mul_fits(v, base, v) || !add_fits(v, d, v)) { throw Overflow{}; }
                 ++nd;
             }
             if (!nd) { throw SyntaxErr{}; }
@@ -362,8 +413,15 @@ struct Parser {
             }
             i128 v = 0;
             bool over = false;
-            for (char ch : digits) {
-                if (__builtin_mul_overflow(v, 10, &v) || __builtin_add_overflow(v, ch - '0', &v)) { over = true; }
+            // v * 10 + digit while it fits in 128 bits (larger literals become floats, as in Python's float())
+            constexpr i128 kMax = static_cast<i128>((static_cast<unsigned __int128>(1) << 127) - 1);
+            for (char const ch : digits) {
+                const int digit = ch - '0';
+                if (over || v > (kMax - digit) / 10) {
+                    over = true;
+                } else {
+                    v = v * 10 + digit;
+                }
             }
             n->v = over ? mk_f(std::strtod(digits.c_str(), nullptr)) : mk_i(v);
         }
@@ -401,9 +459,7 @@ std::string fmt_number(const Num& x) {
     if (std::isfinite(v) && v == std::floor(v) && std::fabs(v) < 1e15) { return i128_str(i128(v)); }
     if (std::isnan(v)) { return "nan"; }
     if (std::isinf(v)) { return v < 0 ? "-inf" : "inf"; }
-    char buf[512];
-    std::snprintf(buf, sizeof buf, "%.6f", v);
-    std::string s = buf;
+    std::string s = strformat("%.6f", v);
     while (!s.empty() && s.back() == '0') { s.pop_back(); }
     while (!s.empty() && s.back() == '.') { s.pop_back(); }
     if (s == "-0") {
@@ -426,10 +482,10 @@ std::string py_repr(const std::string& s) {
     const char q = dq ? '"' : '\'';
     std::string out(1, q);
     for (size_t i = 0; i < s.size(); ++i) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const auto c = static_cast<unsigned char>(s[i]);
         if (c == '\\') {
             out += "\\\\";
-        } else if (c == q) {
+        } else if (c == static_cast<unsigned char>(q)) {
             out += std::string("\\") + char(q);
         } else if (c == '\n') {
             out += "\\n";
@@ -438,13 +494,10 @@ std::string py_repr(const std::string& s) {
         } else if (c == '\t') {
             out += "\\t";
         } else if (c < 0x20 || c == 0x7f) {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\x%02x", c);
-            out += b;
+            out += strformat("\\x%02x", unsigned(c));
         } else if (c == 0xC2 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) < 0xA0) {
-            char b[8];  // U+0080..U+009F (C1 controls) are not printable
-            std::snprintf(b, sizeof b, "\\x%02x", static_cast<unsigned char>(s[i + 1]) - 0x80 + 0x80);
-            out += b;
+            // U+0080..U+009F (C1 controls) are not printable
+            out += strformat("\\x%02x", unsigned(static_cast<unsigned char>(s[i + 1])));
             ++i;
         } else {
             out += char(c);
@@ -472,7 +525,7 @@ std::string calculator(const std::string& expression) {
 std::string calc(const std::string& expression) {
     size_t pows = 0;
     for (size_t p = 0; (p = expression.find("**", p)) != std::string::npos; p += 2) { ++pows; }
-    for (char ch : expression) { pows += ch == '^'; }
+    for (char const ch : expression) { pows += static_cast<size_t>(ch == '^'); }
     if (expression.size() > 200 || pows > 2) { return "Error: cannot evaluate " + py_repr(expression); }
     try {
         return calculator(expression);
@@ -502,7 +555,7 @@ std::optional<std::string> answer(const std::string& output) {
     size_t p = 0;
     while ((p = output.find(key, p)) != std::string::npos) {
         const size_t st = p + key.size();
-        size_t q = output.find(close_tag, st + 1);
+        size_t const q = output.find(close_tag, st + 1);
         const size_t nl = output.find('\n', st);
         if (q == std::string::npos) { break; }
         if (nl != std::string::npos && nl < q) {  // the lazy group cannot cross a newline
@@ -540,7 +593,7 @@ std::vector<double> step_values(const std::string& text) {
         const size_t st = p + 8, q = text.find("</result>", st);
         if (q == std::string::npos) { break; }
         const std::string r = text.substr(st, q - st);
-        if (r.rfind("Error", 0) != 0) {
+        if (!r.starts_with("Error")) {
             if (auto v = number(r)) { out.push_back(*v); }
         }
         p = q + 9;
@@ -550,14 +603,14 @@ std::vector<double> step_values(const std::string& text) {
 
 double step_credit(const std::string& output, int calls, const Question& q) {
     std::vector<double> gold;
-    for (double v : q.steps) {
+    for (double const v : q.steps) {
         bool given = false;
-        for (double x : q.qnums) { given |= close(v, x); }
+        for (double const x : q.qnums) { given |= close(v, x); }
         if (!given) { gold.push_back(v); }
     }
     if (gold.empty()) { return 0.0; }
     int matched = 0;
-    for (double v : step_values(output)) {
+    for (double const v : step_values(output)) {
         for (size_t j = 0; j < gold.size(); ++j) {
             if (close(v, gold[j])) {
                 ++matched;
@@ -590,7 +643,7 @@ std::vector<Question> load_questions(const std::string& path,
         const json::Value d = json::parse(line);
         Question q;
         q.source = d.find("source")->str;
-        if (!sources.empty() && std::find(sources.begin(), sources.end(), q.source) == sources.end()) { continue; }
+        if (!sources.empty() && std::ranges::find(sources, q.source) == sources.end()) { continue; }
         q.id = d.find("id")->str;
         const std::string& t = d.find("text")->str;
         const auto g = answer(t);

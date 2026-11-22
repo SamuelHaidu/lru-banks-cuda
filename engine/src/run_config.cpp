@@ -4,6 +4,7 @@
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
 
 namespace lbc {
 
@@ -92,7 +93,7 @@ struct Reader {
 
     void begin(const char* s) {
         section = s;
-        sections.push_back(s);
+        sections.emplace_back(s);
         seen.clear();
         cur = root.find(s);
         if (cur && !cur->is_object()) { bad(section, "must be an object"); }
@@ -100,7 +101,7 @@ struct Reader {
 
     template <class T>
     void operator()(const char* key, T& x) {
-        seen.push_back(key);
+        seen.emplace_back(key);
         if (!cur) { return; }
         if (const json::Value* v = cur->find(key)) { from_value(*v, x, section + "." + key); }
     }
@@ -108,7 +109,7 @@ struct Reader {
     void end() {
         if (!cur) { return; }
         for (const auto& [k, v] : cur->obj) {
-            if (std::find(seen.begin(), seen.end(), k) == seen.end()) {
+            if (std::ranges::find(seen, k) == seen.end()) {
                 std::string allowed;
                 for (const auto& s : seen) { allowed += (allowed.empty() ? "" : ", ") + s; }
                 bad(section + "." + k, "is not a known key (known: " + allowed + ")");
@@ -196,7 +197,7 @@ RunConfig RunConfig::from_json(const json::Value& v) {
     Reader r(v);
     visit(r, rc);
     for (const auto& [k, x] : v.obj) {
-        if (std::find(r.sections.begin(), r.sections.end(), k) == r.sections.end()) {
+        if (std::ranges::find(r.sections, k) == r.sections.end()) {
             bad(k, "is not a known section (arch_params, data, training, runtime)");
         }
     }
@@ -216,9 +217,9 @@ void RunConfig::validate() const {
         check(a.embed_dim >= 8 && a.embed_dim % 8 == 0, "arch_params.embed_dim", "must be a positive multiple of 8");
     }
     check(a.num_layers >= 1, "arch_params.num_layers", "must be at least 1");
-    check(a.hops.empty() || int(a.hops.size()) == a.num_layers, "arch_params.hops",
+    check(a.hops.empty() || std::cmp_equal(a.hops.size(), a.num_layers), "arch_params.hops",
           "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (2 everywhere)");
-    for (int h : a.hops) { check(h == 1 || h == 2, "arch_params.hops", "entries must be 1 or 2"); }
+    for (int const h : a.hops) { check(h == 1 || h == 2, "arch_params.hops", "entries must be 1 or 2"); }
     check(a.lru_dim >= 4 && a.lru_dim % 4 == 0, "arch_params.lru_dim", "must be a positive multiple of 4");
     check(a.num_heads >= 1, "arch_params.num_heads", "must be at least 1");
     check(ffn_dim() >= 8 && ffn_dim() % 8 == 0, "arch_params.ffn_mult", "x dim must be a positive multiple of 8");
@@ -231,9 +232,9 @@ void RunConfig::validate() const {
     check(a.gate_budget >= 0, "arch_params.gate_budget", "must be >= 0");
     check(a.window_size >= 8 && a.window_size % 8 == 0, "arch_params.window_size", "must be a positive multiple of 8");
     check(a.head_dim == 32 || a.head_dim == 64, "arch_params.head_dim", "must be 32 or 64 (the kernels' sizes)");
-    check(a.bank_slots.empty() || int(a.bank_slots.size()) == a.num_layers, "arch_params.bank_slots",
+    check(a.bank_slots.empty() || std::cmp_equal(a.bank_slots.size(), a.num_layers), "arch_params.bank_slots",
           "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (128 everywhere)");
-    for (int n : a.bank_slots) {
+    for (int const n : a.bank_slots) {
         check(n >= 2 && n <= SLOTS, "arch_params.bank_slots", "entries must be in [2, " + std::to_string(SLOTS) + "]");
     }
     check(a.topk == 2, "arch_params.topk", "is fixed at 2 by the kernels");
@@ -244,7 +245,7 @@ void RunConfig::validate() const {
           "needs one entry per mix dataset");
     {
         int mixed = 0;
-        for (double f : data.mix_fractions) {
+        for (double const f : data.mix_fractions) {
             const int r = int(std::lround(f * data.batch_size));
             check(f > 0 && r >= 1, "data.mix_fractions", "entries must give at least one row of the batch");
             mixed += r;
@@ -261,7 +262,7 @@ void RunConfig::validate() const {
     check(t.lr_cycles >= 1, "training.lr_cycles", "must be at least 1");
     check(t.lr_min_ratio >= 0 && t.lr_min_ratio <= 1, "training.lr_min_ratio", "must be in [0, 1]");
     check(t.lr_decay_shape == "linear" || t.lr_decay_shape == "cosine", "training.lr_decay_shape",
-          "must be \"linear\" or \"cosine\"");
+          R"(must be "linear" or "cosine")");
     check(t.weight_decay >= 0, "training.weight_decay", "must be >= 0");
     check(t.beta_1 >= 0 && t.beta_1 < 1 && t.beta_2 >= 0 && t.beta_2 < 1, "training.beta_1 / beta_2",
           "must be in [0, 1)");

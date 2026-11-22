@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "../src/calcx.hpp"
@@ -29,6 +30,7 @@
 #include "../src/run_config.hpp"
 #include "../src/tokenizer.hpp"
 #include "lbc/check.hpp"
+#include "lbc/text.hpp"
 #include "lbc_rl.hpp"
 
 namespace lbc {
@@ -53,9 +55,11 @@ std::vector<int64_t> read_npy_i64(const std::string& path, int& cols) {
     if (header.find("<i8") == std::string::npos) { throw std::runtime_error(path + ": not int64"); }
     const size_t a = header.find('(') + 1, b = header.find(')');
     const std::string shape = header.substr(a, b - a);
-    long rows = std::atol(shape.c_str());
     const size_t comma = shape.find(',');
-    cols = comma != std::string::npos && comma + 1 < shape.size() ? std::atoi(shape.c_str() + comma + 1) : 1;
+    const long rows = parse_long(shape.substr(0, comma), path + ": rows");
+    std::string rest = comma == std::string::npos ? std::string() : shape.substr(comma + 1);
+    rest.erase(0, rest.find_first_not_of(' '));
+    cols = rest.empty() ? 1 : parse_int(rest, path + ": cols");
     if (cols <= 0) { cols = 1; }
     std::vector<int64_t> v(static_cast<size_t>(rows) * size_t(cols));
     f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size() * 8));
@@ -89,15 +93,15 @@ int cmd_test_calcx(int argc, char** argv) {
         if (a == "--split" && i + 1 < argc) {
             split = argv[++i];
         } else if (a == "--limit" && i + 1 < argc) {
-            limit = std::atol(argv[++i]);
+            limit = parse_long(argv[++i], "--limit");
         }
     }
     const auto t0 = std::chrono::steady_clock::now();
-    Tokenizer tok(argv[1]);
+    Tokenizer const tok(argv[1]);
     const std::vector<std::string> texts = doc_texts(dir + "/" + split + ".docs.jsonl");
     int cols = 0;
     const std::vector<int64_t> cat = read_npy_i64(dir + "/" + split + ".categories.npy", cols);
-    TokenFile tf(dir + "/" + split + ".npy");
+    TokenFile const tf(dir + "/" + split + ".npy");
     const size_t n = limit > 0 ? std::min(texts.size(), size_t(limit)) : texts.size();
     if (cat.size() / size_t(cols) != texts.size()) { throw std::runtime_error("docs and categories differ in count"); }
     size_t dec_bad = 0, enc_bad = 0, calls = 0, calc_bad = 0, ans_bad = 0, rew_bad = 0;
@@ -118,8 +122,8 @@ int cmd_test_calcx(int argc, char** argv) {
                 size_t k = 0;
                 while (k < e.size() && k < ids.size() && e[k] == ids[k]) { ++k; }
                 const size_t a = k >= 3 ? k - 3 : 0;
-                std::vector<int> want(ids.begin() + long(a), ids.begin() + long(std::min(ids.size(), k + 4)));
-                std::vector<int> got(e.begin() + long(a), e.begin() + long(std::min(e.size(), k + 4)));
+                std::vector<int> const want(ids.begin() + long(a), ids.begin() + long(std::min(ids.size(), k + 4)));
+                std::vector<int> const got(e.begin() + long(a), e.begin() + long(std::min(e.size(), k + 4)));
                 examples.push_back("encode differs: doc " + std::to_string(d) + " near [" + tok.decode(want) + "] vs ["
                                    + tok.decode(got) + "]");
             }
@@ -163,7 +167,7 @@ int cmd_test_calcx(int argc, char** argv) {
     std::printf("  calculator: %zu calls, %zu results differ\n", calls, calc_bad);
     std::printf("  reward: %zu questions, %zu reference answers not correct, %zu rewards != 1\n", nq, ans_bad, rew_bad);
     for (const auto& e : examples) { std::printf("    %s\n", e.c_str()); }
-    return (dec_bad || enc_bad || calc_bad || ans_bad) ? 1 : 0;
+    return ((dec_bad != 0u) || (enc_bad != 0u) || (calc_bad != 0u) || (ans_bad != 0u)) ? 1 : 0;
 }
 
 // lbc decode-check RUN_DIR [--checkpoint PATH] [--rows B]: per-token loss of validation rows from the training
@@ -181,7 +185,7 @@ int cmd_decode_check(int argc, char** argv) {
         if (a == "--checkpoint" && i + 1 < argc) {
             path = argv[++i];
         } else if (a == "--rows" && i + 1 < argc) {
-            rows = std::atoi(argv[++i]);
+            rows = parse_int(argv[++i], "--rows");
         }
     }
     const CheckpointInfo info = read_checkpoint_info(path);
@@ -190,19 +194,19 @@ int cmd_decode_check(int argc, char** argv) {
     Config c = rc.model_config();
     c.B = rows;
     const int T = c.T, V = c.V;
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     model.keep_row_loss();
-    TokenFile file(meta.validation_file);
-    ValidationSet vs(file, c.B, T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
+    TokenFile const file(meta.validation_file);
+    ValidationSet const vs(file, c.B, T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
+                           meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
     const HostBatch& hb = vs.batch(0);
     const size_t ntok = size_t(c.B) * T;
-    int *d_ids, *d_y, *d_yt;
-    uint8_t* d_reset;
-    float *d_inv_n, *d_one, *d_scr, *d_rl;
+    int *d_ids = nullptr, *d_y = nullptr, *d_yt = nullptr;
+    uint8_t* d_reset = nullptr;
+    float *d_inv_n = nullptr, *d_one = nullptr, *d_scr = nullptr, *d_rl = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * 4));
     LBC_CUDA(cudaMalloc(&d_y, ntok * 4));
     LBC_CUDA(cudaMalloc(&d_yt, size_t(rows) * 4));
@@ -220,7 +224,8 @@ int cmd_decode_check(int argc, char** argv) {
     model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
     const std::vector<float> ref = model.row_loss(s);
 
-    if (std::getenv("LBC_FWD_B1")) {  // the training forward with one row per batch, against the B-row forward
+    // the training forward with one row per batch, against the B-row forward
+    if (std::getenv("LBC_FWD_B1") != nullptr) {  // NOLINT(concurrency-mt-unsafe): nothing calls setenv
         Config c1 = c;
         c1.B = 1;
         Model m1(c1, uint64_t(rc.data.seed));
@@ -239,7 +244,7 @@ int cmd_decode_check(int argc, char** argv) {
                     const double d = std::fabs(double(r1[size_t(t)]) - ref[o + size_t(t)]);
                     sd += d;
                     md = std::max(md, d);
-                    bg += d > 0.05;
+                    bg += static_cast<long>(d > 0.05);
                     ++nn;
                 }
             }
@@ -250,7 +255,7 @@ int cmd_decode_check(int argc, char** argv) {
     Decoder dec(model, rows, rows);
     std::printf("decode-check %s (epoch %d): %d rows x %d tokens; decoder state %.1f MB\n", path.c_str(), info.epoch,
                 rows, T, dec.state_bytes() / 1e6);
-    const size_t nr = static_cast<size_t>(rows);
+    const auto nr = static_cast<size_t>(rows);
     std::vector<int> ids(nr), slot(nr), tpos(nr), yt(nr);
     std::vector<uint8_t> rst(nr);
     std::vector<float> got(nr);
@@ -277,9 +282,10 @@ int cmd_decode_check(int argc, char** argv) {
             max_d = std::max(max_d, d);
             sum_d += d;
             sum_ref += ref[size_t(b) * T + t];
-            big += d > 0.05;
+            big += static_cast<long>(d > 0.05);
             ++n;
-            if (std::getenv("LBC_DEBUG") && b == 0 && (t < 12 || d > 0.3)) {
+            // NOLINTNEXTLINE(concurrency-mt-unsafe): nothing calls setenv
+            if ((std::getenv("LBC_DEBUG") != nullptr) && b == 0 && (t < 12 || d > 0.3)) {
                 std::printf("    row 0 t %d: forward %.4f decode %.4f\n", t, ref[size_t(b) * T + t], got[size_t(b)]);
             }
         }
@@ -333,7 +339,9 @@ struct GrpoCfg {
 GrpoCfg load_grpo(const std::string& path) {
     const json::Value v = json::read_file(path);
     GrpoCfg c;
-    for (const auto& [k, x] : v.obj) {
+    for (const auto& entry : v.obj) {
+        const std::string& k = entry.first;
+        const json::Value& x = entry.second;
         auto str = [&](std::string& o) { o = x.str; };
         auto num = [&](auto& o) { o = static_cast<std::decay_t<decltype(o)>>(x.num); };
         if (k == "init_from") {
@@ -569,7 +577,7 @@ std::vector<Rollout> rollout(Decoder& dec,
     for (int step = 0; step < max_new; ++step) {
         live.clear();
         for (int r = 0; r < N; ++r) {
-            if (!done[size_t(r)]) { live.push_back(r); }
+            if (done[size_t(r)] == 0u) { live.push_back(r); }
         }
         if (live.empty()) { break; }
         const int R = int(live.size());
@@ -598,7 +606,7 @@ std::vector<Rollout> rollout(Decoder& dec,
             Rollout& ro = out[size_t(r)];
             auto& f = forced[size_t(r)];
             const bool own = f.empty();
-            int t;
+            int t = 0;
             if (own) {
                 t = tok_out[size_t(j)];
                 if (t < 0) {  // the decoder produced no finite logits for this row
@@ -645,7 +653,7 @@ std::vector<Rollout> rollout(Decoder& dec,
                     ro.finished = true;
                 }
             }
-            if (int(gen[size_t(r)].size()) >= max_new) { done[size_t(r)] = 1; }
+            if (std::cmp_greater_equal(gen[size_t(r)].size(), max_new)) { done[size_t(r)] = 1; }
         }
         tm.host += secs_since(th);
     }
@@ -663,7 +671,7 @@ int longest_run(const Rollout& r) {
     int run = 0, best = 0, prev = -1;
     for (size_t i = 0; i < r.own.size(); ++i) {
         const int t = r.ids[size_t(r.n_prompt) + i];
-        if (!r.own[i]) {
+        if (r.own[i] == 0u) {
             prev = -1;
             run = 0;
             continue;
@@ -734,7 +742,7 @@ int cmd_grpo(int argc, char** argv) {
     c.beta2 = float(g.beta2);
     c.clip = float(g.clip);
     const int T = c.T;
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     int done_updates = 0;
@@ -756,8 +764,10 @@ int cmd_grpo(int argc, char** argv) {
         for (auto& [src, v] : by) {  // a fixed sample per source
             std::vector<size_t> idx(v.size());
             for (size_t i = 0; i < idx.size(); ++i) { idx[i] = i; }
-            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return hash3(7, a, 0) < hash3(7, b, 0); });
-            for (size_t i = 0; i < idx.size() && int(i) < g.eval_per_source; ++i) { tests.push_back(*v[idx[i]]); }
+            std::ranges::sort(idx, [&](size_t a, size_t b) { return hash3(7, a, 0) < hash3(7, b, 0); });
+            for (size_t i = 0; i < idx.size() && std::cmp_less(i, g.eval_per_source); ++i) {
+                tests.push_back(*v[idx[i]]);
+            }
         }
     }
     const int slots = g.chunk * g.group;
@@ -775,14 +785,14 @@ int cmd_grpo(int argc, char** argv) {
     std::vector<float> hw_rep(ntok);
     if (g.replay_rows > 0) {
         if (g.pretrain_dataset.empty()) { throw std::runtime_error("replay_rows needs pretrain_dataset"); }
-        if (g.replay_rows % c.B) { throw std::runtime_error("replay_rows must be a multiple of micro_rows"); }
+        if ((g.replay_rows % c.B) != 0) { throw std::runtime_error("replay_rows must be a multiple of micro_rows"); }
         const DatasetMeta pm = DatasetMeta::load(g.pretrain_dataset);
         rfile = std::make_unique<TokenFile>(pm.train_file);
         rload = std::make_unique<Loader>(*rfile, c.B, T, g.seed + 11 + uint64_t(done_updates), pm.doc_token_id);
     }
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float *d_inv_n, *d_w, *d_lp;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float *d_inv_n = nullptr, *d_w = nullptr, *d_lp = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * 4));
     LBC_CUDA(cudaMalloc(&d_y, ntok * 4));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -820,11 +830,7 @@ int cmd_grpo(int argc, char** argv) {
         const double pv = pval ? pretrain_val(model, *pval, d_ids, d_y, d_reset, d_inv_n, s, T, c.B) : -1;
         const double acc = double(ok) / std::max<size_t>(1, ro.size());
         std::string srcs;
-        for (auto& [k, v] : by) {
-            char b[64];
-            std::snprintf(b, sizeof b, " %s %.3f", k.c_str(), double(v.first) / v.second);
-            srcs += b;
-        }
+        for (auto& [k, v] : by) { srcs += strformat(" %s %.3f", k.c_str(), double(v.first) / v.second); }
         std::printf("[eval %d] accuracy %.4f (%s ) answered %.3f pretrain_val %.4f (%.0f s)\n", update, acc,
                     srcs.c_str(), double(answered) / ro.size(), pv, secs_since(t0));
         std::fflush(stdout);
@@ -844,7 +850,8 @@ int cmd_grpo(int argc, char** argv) {
                 std::string t;
                 for (const char ch : r.text) {
                     if (ch == '"' || ch == '\\') {
-                        t += '\\', t += ch;
+                        t += '\\';
+                        t += ch;
                     } else if (ch == '\n') {
                         t += "\\n";
                     } else if (static_cast<unsigned char>(ch) < 0x20) {
@@ -853,10 +860,10 @@ int cmd_grpo(int argc, char** argv) {
                         t += ch;
                     }
                 }
-                d << "{\"source\": \"" << tests[size_t(r.q)].source << "\", \"ok\": "
+                d << R"({"source": ")" << tests[size_t(r.q)].source << R"(", "ok": )"
                   << (calcx::correct(calcx::answer(r.text), tests[size_t(r.q)].gold) ? "true" : "false")
                   << ", \"finished\": " << (r.finished ? "true" : "false") << ", \"calls\": " << r.calls
-                  << ", \"gen\": " << (long(r.ids.size()) - r.n_prompt) << ", \"text\": \"" << t << "\"}\n";
+                  << ", \"gen\": " << (long(r.ids.size()) - r.n_prompt) << R"(, "text": ")" << t << "\"}\n";
             }
         }
         return acc;
@@ -869,8 +876,8 @@ int cmd_grpo(int argc, char** argv) {
     uint64_t pass = 0;
     auto reshuffle = [&]() {
         for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
-        std::sort(order.begin(), order.end(),
-                  [&](size_t a, size_t b) { return hash3(g.seed + 11, pass, a) < hash3(g.seed + 11, pass, b); });
+        std::ranges::sort(
+            order, [&](size_t a, size_t b) { return hash3(g.seed + 11, pass, a) < hash3(g.seed + 11, pass, b); });
         ++pass;
         cursor = 0;
     };
@@ -883,7 +890,7 @@ int cmd_grpo(int argc, char** argv) {
         for (int done = 0; done < g.sample_questions;) {
             std::vector<const calcx::Question*> qs;
             std::vector<int> qi;
-            while (int(qs.size()) < std::min(g.chunk, g.sample_questions - done)) {
+            while (std::cmp_less(qs.size(), std::min(g.chunk, g.sample_questions - done))) {
                 if (cursor >= order.size()) { reshuffle(); }
                 const size_t i = order[cursor++];
                 qs.push_back(&train[i]);
@@ -911,7 +918,8 @@ int cmd_grpo(int argc, char** argv) {
                     std::string t;
                     for (const char ch : qs[q]->prompt + clean) {
                         if (ch == '"' || ch == '\\') {
-                            t += '\\', t += ch;
+                            t += '\\';
+                            t += ch;
                         } else if (ch == '\n') {
                             t += "\\n";
                         } else if (ch == '\t') {
@@ -922,7 +930,7 @@ int cmd_grpo(int argc, char** argv) {
                             t += ch;
                         }
                     }
-                    f << "{\"source\": \"" << qs[q]->source << "\", \"id\": \"" << qs[q]->id << "\", \"text\": \"" << t
+                    f << R"({"source": ")" << qs[q]->source << R"(", "id": ")" << qs[q]->id << R"(", "text": ")" << t
                       << "\"}\n";
                 }
             }
@@ -959,7 +967,7 @@ int cmd_grpo(int argc, char** argv) {
             std::vector<const calcx::Question*> qs;
             std::vector<int> qi;
             const int want = chunks == 0 ? g.questions : g.chunk;
-            while (int(qs.size()) < std::min(want, g.chunk)) {
+            while (std::cmp_less(qs.size(), std::min(want, g.chunk))) {
                 if (cursor >= order.size()) { reshuffle(); }
                 const size_t i = order[cursor++];
                 if (g.greso && zv[i] > 0) {
@@ -1000,10 +1008,11 @@ int cmd_grpo(int argc, char** argv) {
                     std::map<std::string, int> cnt;
                     std::vector<std::string> sigs(size_t(g.group));
                     for (int k = 0; k < g.group; ++k) {
-                        Rollout& r = ro[q * size_t(g.group) + size_t(k)];
+                        Rollout const& r = ro[q * size_t(g.group) + size_t(k)];
                         if (r.ok && !r.degen) { ++cnt[sigs[size_t(k)] = solution_sig(r.text)]; }
                     }
-                    mn = 1e9, mx = -1e9;
+                    mn = 1e9;
+                    mx = -1e9;
                     for (int k = 0; k < g.group; ++k) {
                         Rollout& r = ro[q * size_t(g.group) + size_t(k)];
                         if (r.ok && !r.degen) { r.reward += g.novelty / cnt[sigs[size_t(k)]]; }
@@ -1013,9 +1022,9 @@ int cmd_grpo(int argc, char** argv) {
                 }
                 const bool mix = mx - mn > 1e-6;
                 zv[size_t(qi[q])] = mix ? 0 : zv[size_t(qi[q])] + 1;
-                mixed += mix;
-                solved += all_ok;
-                group_mixed.push_back(mix);
+                mixed += static_cast<int>(mix);
+                solved += static_cast<int>(all_ok);
+                group_mixed.push_back(static_cast<int>(mix));
             }
             all.insert(all.end(), std::make_move_iterator(ro.begin()), std::make_move_iterator(ro.end()));
             if (g.target_mixed <= 0 || mixed >= g.target_mixed) { break; }
@@ -1053,20 +1062,19 @@ int cmd_grpo(int argc, char** argv) {
             for (int k = 0; k < g.group; ++k) {
                 Rollout& r = all[q * size_t(g.group) + size_t(k)];
                 rsum += r.reward;
-                okc += r.ok;
-                answered += bool(calcx::answer(r.text));
+                okc += static_cast<double>(r.ok);
+                answered += static_cast<double>(bool(calcx::answer(r.text)));
                 gen_tok += double(r.ids.size()) - r.n_prompt;
                 calls += r.calls;
-                if (r.ent_n) {
+                if (r.ent_n != 0) {
                     ent += r.ent_sum / r.ent_n;
                     ++ent_n;
                 }
-                degen += r.degen;
+                degen += static_cast<int>(r.degen);
                 const bool raft = g.mode == "raft";
-                if (raft ? (!r.ok || r.degen) : !group_mixed[q]) { continue; }
-                const double adv = raft       ? 1.0
-                                   : g.no_std ? r.reward - mean
-                                              : (r.reward - mean) / std::max(sd, g.std_floor);
+                if (raft ? (!r.ok || r.degen) : (group_mixed[q] == 0)) { continue; }
+                double adv = 1.0;  // RAFT: every kept solution counts the same
+                if (!raft) { adv = g.no_std ? r.reward - mean : (r.reward - mean) / std::max(sd, g.std_floor); }
                 if (g.unique && adv > 0) {
                     if (!seen.insert(solution_sig(r.text)).second) {
                         ++dupes;
@@ -1074,18 +1082,18 @@ int cmd_grpo(int argc, char** argv) {
                     }
                 }
                 const size_t L = r.ids.size();
-                if (L > size_t(T)) {
+                if (std::cmp_greater(L, T)) {
                     continue;  // (cannot happen with prompts + max_new under T)
                 }
                 if (rows == 0 || fill + L > size_t(T)) { new_row(); }
                 const size_t base = size_t(rows - 1) * T + fill;
                 for (size_t i = 0; i < L; ++i) {
                     hid[base + i] = r.ids[i];
-                    hres[base + i] = r.ids[i] == 0;
+                    hres[base + i] = static_cast<uint8_t>(r.ids[i] == 0);
                 }
                 for (size_t i = 0; i + 1 < L; ++i) {
                     const long gi = long(i + 1) - r.n_prompt;  // the generated token that ids[i + 1] is
-                    if (gi < 0 || !r.own[size_t(gi)]) { continue; }
+                    if (gi < 0 || (r.own[size_t(gi)] == 0u)) { continue; }
                     hy[base + i] = r.ids[i + 1];
                     hw[base + i] = float(adv);
                     hlp[base + i] = r.lp[size_t(gi)];
@@ -1097,7 +1105,7 @@ int cmd_grpo(int argc, char** argv) {
         const int nro = int(all.size());
         float loss = 0, gnorm = 0, lr = 0;
         if (own_tokens > 0) {
-            while (rows % c.B) {
+            while ((rows % c.B) != 0) {
                 new_row();  // whole micro-batches (padding rows: no targets)
             }
             const float inv = 1.f / float(own_tokens);
@@ -1121,7 +1129,7 @@ int cmd_grpo(int argc, char** argv) {
                         b.clip_high = float(g.clip_high);
                     }
                     model.forward_backward(b, s, b0 > 0);
-                    float r0;
+                    float r0 = NAN;
                     LBC_CUDA(cudaMemcpyAsync(&r0, model.metrics_device(), 4, cudaMemcpyDeviceToHost, s));
                     LBC_CUDA(cudaStreamSynchronize(s));  // the host buffers' next slice is copied next
                     lsum += r0;
@@ -1129,8 +1137,7 @@ int cmd_grpo(int argc, char** argv) {
                 for (int k = 0; rload && k < g.replay_rows / c.B;
                      ++k) {  // pretraining rows, weight replay_coef overall
                     HostBatch* hb = rload->next();
-                    std::fill(hw_rep.begin(), hw_rep.end(),
-                              float(g.replay_coef * double(own_tokens) / std::max(1, hb->n_targets)));
+                    std::ranges::fill(hw_rep, float(g.replay_coef * double(own_tokens) / std::max(1, hb->n_targets)));
                     LBC_CUDA(cudaMemcpyAsync(d_ids, hb->ids, ntok * 4, cudaMemcpyHostToDevice, s));
                     LBC_CUDA(cudaMemcpyAsync(d_y, hb->y, ntok * 4, cudaMemcpyHostToDevice, s));
                     LBC_CUDA(cudaMemcpyAsync(d_reset, hb->reset, ntok, cudaMemcpyHostToDevice, s));
@@ -1155,9 +1162,9 @@ int cmd_grpo(int argc, char** argv) {
         const int ng = int(group_mixed.size());
         csv << u + 1 << "," << rsum / nro << "," << okc / nro << "," << double(mixed) / ng << "," << double(solved) / ng
             << "," << questions << "," << skipped << "," << chunks << "," << nro << "," << rows << "," << own_tokens
-            << "," << gen_tok / nro << "," << calls / nro << "," << answered / nro << "," << (ent_n ? ent / ent_n : 0)
-            << "," << loss << "," << gnorm << "," << lr << "," << tm.prefill << "," << tm.decode << "," << tm.host
-            << "," << t_train << "," << t_total << "\n";
+            << "," << gen_tok / nro << "," << calls / nro << "," << answered / nro << ","
+            << ((ent_n != 0) ? ent / ent_n : 0) << "," << loss << "," << gnorm << "," << lr << "," << tm.prefill << ","
+            << tm.decode << "," << tm.host << "," << t_train << "," << t_total << "\n";
         csv.flush();
         std::printf(
             "update %d: reward %.3f acc %.3f mixed %.2f solved %.2f skipped %d rollouts %d len %.0f calls %.2f "
@@ -1165,8 +1172,8 @@ int cmd_grpo(int argc, char** argv) {
             "%.1f = "
             "%.1f s)\n",
             u + 1, rsum / nro, okc / nro, double(mixed) / ng, double(solved) / ng, skipped, nro, gen_tok / nro,
-            calls / nro, ent_n ? ent / ent_n : 0, degen, dupes, own_tokens, rows, gnorm, lr, tm.prefill, tm.decode,
-            tm.host, t_train, t_total);
+            calls / nro, (ent_n != 0) ? ent / ent_n : 0, degen, dupes, own_tokens, rows, gnorm, lr, tm.prefill,
+            tm.decode, tm.host, t_train, t_total);
         std::fflush(stdout);
         const bool do_eval = (u + 1) % g.eval_every == 0 || u + 1 == g.updates;
         double acc = -1;

@@ -18,7 +18,22 @@
             ::lbc::fail(#call, cublasLtGetStatusString(lbc_st_), __FILE__, __LINE__); \
     } while (0)
 
+#define LBC_CUBLAS_CLEANUP(call)                                                      \
+    do {                                                                              \
+        const cublasStatus_t lbc_st_ = (call);                                        \
+        if (lbc_st_ != CUBLAS_STATUS_SUCCESS)                                         \
+            ::lbc::warn(#call, cublasLtGetStatusString(lbc_st_), __FILE__, __LINE__); \
+    } while (0)
+
 namespace lbc {
+
+// Sets a cuBLASLt matmul attribute from a value (the attribute API takes its address and size; for the pointer
+// attributes the value is itself a pointer).
+template <class T>
+void set_attribute(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t attr, const T& value) {
+    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion,bugprone-sizeof-expression): the API's form
+    LBC_CUBLAS(cublasLtMatmulDescSetAttribute(desc, attr, &value, sizeof(value)));
+}
 
 enum class Out { F32, BF16 };
 
@@ -43,6 +58,8 @@ class Gemm {
     ~Gemm();
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
+    Gemm(Gemm&&) = delete;
+    Gemm& operator=(Gemm&&) = delete;
 
     // D[M x N] = alpha * op(A)[M x K] * op(B)[K x N] + beta * D, all row-major; op(X) = X^T when tX. lda, ldb, ldd
     // are the row strides of the stored matrices (A stored M x K, or K x M when tA).

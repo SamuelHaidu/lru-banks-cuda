@@ -35,6 +35,7 @@
 #include "../src/model.hpp"
 #include "../src/run_config.hpp"
 #include "lbc/check.hpp"
+#include "lbc/text.hpp"
 #include "lbc_rl.hpp"
 
 using namespace lbc;
@@ -48,7 +49,7 @@ double seconds_since(Clock::time_point t) { return std::chrono::duration<double>
 
 [[noreturn]] void die(const std::string& msg) {
     std::fprintf(stderr, "lbc: %s\n", msg.c_str());
-    std::exit(1);
+    std::exit(1);  // NOLINT(concurrency-mt-unsafe): no other thread runs here
 }
 
 void usage() {
@@ -64,7 +65,14 @@ void usage() {
                  "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed "
                  "S] [--stop ID,ID]\n"
                  "  lbc score  RUN_DIR --pairs FILE --out FILE [--checkpoint best|latest|PATH] [--rows N]\n");
-    std::exit(2);
+    std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, before any thread starts
+}
+
+// --checkpoint best | latest | PATH
+std::string checkpoint_path(const std::string& run, const std::string& which) {
+    if (which == "best") { return run + "/checkpoints/best.lbc"; }
+    if (which == "latest") { return run + "/model.lbc"; }
+    return which;
 }
 
 std::string with_commas(unsigned long long n) {
@@ -81,10 +89,19 @@ std::vector<int> parse_silence(const std::string& spec, int L) {
     while (std::getline(ss, item, ',')) {
         const size_t c = item.find(':');
         if (c == std::string::npos) { die("--silence takes layer:hop pairs, e.g. 0:2,3:1"); }
-        const int l = std::atoi(item.substr(0, c).c_str());
+        const int l = parse_int(item.substr(0, c), "--silence layer");
         const std::string w = item.substr(c + 1);
-        const int bits = w == "1" ? 1 : w == "2" ? 2 : w == "ffn" ? 4 : w == "all" ? 7 : 0;
-        if (l < 0 || l >= L || !bits) { die("--silence: no part " + item + " (layer:1|2|ffn|all)"); }
+        int bits = 0;  // 1: hop 1, 2: hop 2, 4: the FFN
+        if (w == "1") {
+            bits = 1;
+        } else if (w == "2") {
+            bits = 2;
+        } else if (w == "ffn") {
+            bits = 4;
+        } else if (w == "all") {
+            bits = 7;
+        }
+        if (l < 0 || l >= L || (bits == 0)) { die("--silence: no part " + item + " (layer:1|2|ffn|all)"); }
         mask[size_t(l)] |= bits;
     }
     return mask;
@@ -133,35 +150,19 @@ int cmd_config(int argc, char** argv) {
 
 // -- the progress bar (Keras's layout) ----------------------------------------------------------------------------
 
-std::string fmt_value(double v) {
-    char b[32];
-    std::snprintf(b, sizeof b, std::fabs(v) >= 1e-3 || v == 0 ? "%.4f" : "%.4e", v);
-    return b;
-}
+std::string fmt_value(double v) { return std::fabs(v) >= 1e-3 || v == 0 ? strformat("%.4f", v) : strformat("%.4e", v); }
 
 std::string fmt_eta(double s) {
-    char b[32];
-    const long t = long(s + 0.5);
-    if (t >= 3600) {
-        std::snprintf(b, sizeof b, "%ld:%02ld:%02ld", t / 3600, (t % 3600) / 60, t % 60);
-    } else if (t >= 60) {
-        std::snprintf(b, sizeof b, "%ld:%02ld", t / 60, t % 60);
-    } else {
-        std::snprintf(b, sizeof b, "%lds", t);
-    }
-    return b;
+    const long t = std::lround(s);
+    if (t >= 3600) { return strformat("%ld:%02ld:%02ld", t / 3600, (t % 3600) / 60, t % 60); }
+    if (t >= 60) { return strformat("%ld:%02ld", t / 60, t % 60); }
+    return strformat("%lds", t);
 }
 
 std::string fmt_per_step(double sec) {
-    char b[32];
-    if (sec >= 1) {
-        std::snprintf(b, sizeof b, "%.0fs/step", sec);
-    } else if (sec >= 1e-3) {
-        std::snprintf(b, sizeof b, "%.0fms/step", sec * 1e3);
-    } else {
-        std::snprintf(b, sizeof b, "%.0fus/step", sec * 1e6);
-    }
-    return b;
+    if (sec >= 1) { return strformat("%.0fs/step", sec); }
+    if (sec >= 1e-3) { return strformat("%.0fms/step", sec * 1e3); }
+    return strformat("%.0fus/step", sec * 1e6);
 }
 
 class Progress {
@@ -176,8 +177,7 @@ class Progress {
         for (int k = 0; k < fill; ++k) { bar += "━"; }
         std::string rest;
         for (int k = fill; k < 20; ++k) { rest += "━"; }
-        char head[64];
-        std::snprintf(head, sizeof head, "%*d/%d", width, done, total_);
+        const std::string head = strformat("%*d/%d", width, done, total_);
         std::string line = std::string("\x1b[1m") + head + "\x1b[0m \x1b[32m" + bar + "\x1b[0m\x1b[37m" + rest
                            + "\x1b[0m \x1b[1m" + time + "\x1b[0m " + fmt_per_step(per_step) + values;
         const size_t len = line.size();
@@ -216,13 +216,7 @@ struct EpochSums {
 };
 
 std::string open_str(double w, double r1, double r2) {
-    char b[64];
-    if (r2 < 0) {
-        std::snprintf(b, sizeof b, "%.2f/%.2f/-", w, r1);
-    } else {
-        std::snprintf(b, sizeof b, "%.2f/%.2f/%.2f", w, r1, r2);
-    }
-    return b;
+    return r2 < 0 ? strformat("%.2f/%.2f/-", w, r1) : strformat("%.2f/%.2f/%.2f", w, r1, r2);
 }
 
 // epochs completed according to metrics.csv (its last row's 0-based epoch + 1; 0 when missing or empty)
@@ -237,7 +231,7 @@ int csv_epochs(const std::string& path) {
         }
     }
     if (rows < 2) { return 0; }
-    return std::atoi(last.substr(0, last.find(',')).c_str()) + 1;
+    return parse_int(last.substr(0, last.find(',')), "metrics.csv epoch") + 1;
 }
 
 void copy_atomic(const std::string& from, const std::string& to) {
@@ -247,7 +241,7 @@ void copy_atomic(const std::string& from, const std::string& to) {
 }
 
 json::Value arch_without_window(const json::Value& config) {
-    json::Value a = config.find("arch_params") ? *config.find("arch_params") : json::Value::object();
+    json::Value a = (config.find("arch_params") != nullptr) ? *config.find("arch_params") : json::Value::object();
     if (json::Value* w = a.find("window_size")) {
         *w = json::Value();  // a resumed run may change its window
     }
@@ -261,7 +255,7 @@ int cmd_train(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--epochs" && i + 1 < argc) {
-            epochs_override = std::atoi(argv[++i]);
+            epochs_override = parse_int(argv[++i], "--epochs");
         } else {
             usage();
         }
@@ -304,15 +298,15 @@ int cmd_train(int argc, char** argv) {
         return 0;
     }
 
-    Config c = rc.model_config();
-    cudaStream_t s;
+    Config const c = rc.model_config();
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    TokenFile train_file(meta.train_file);
+    TokenFile const train_file(meta.train_file);
     const int batch_rows = rc.data.batch_size, accum = batch_rows / c.B;  // c.B: rows per forward/backward
     const size_t spp = Loader::steps_per_pass(train_file.size(), batch_rows, c.T);
     if (spp == 0) { die("the train split holds less than one batch"); }
     const int spe = std::max(1, int(double(spp) * rc.data.epoch_passes));
-    const uint64_t seed = uint64_t(rc.data.seed);
+    const auto seed = uint64_t(rc.data.seed);
     Model model(c, seed);
     if (resume) {
         load_checkpoint(latest, model, s);
@@ -387,9 +381,9 @@ int cmd_train(int argc, char** argv) {
     const size_t ntok = size_t(c.B) * c.T;  // one micro-batch
     const size_t step_tokens = size_t(batch_rows) * c.T;
     model.set_accumulation(accum);
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float *d_inv_n, *d_val;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float *d_inv_n = nullptr, *d_val = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -436,8 +430,8 @@ int cmd_train(int argc, char** argv) {
     cudaGraphExec_t step_graph = nullptr, acc_graph = nullptr, opt_graph = nullptr, val_graph = nullptr;
     bool step_eager_done = false, val_eager_done = false;
     auto capture = [&](auto&& body) {
-        cudaGraph_t g;
-        cudaGraphExec_t exec;
+        cudaGraph_t g = nullptr;
+        cudaGraphExec_t exec = nullptr;
         LBC_CUDA(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
         body();
         LBC_CUDA(cudaStreamEndCapture(s, &g));
@@ -445,7 +439,7 @@ int cmd_train(int argc, char** argv) {
         LBC_CUDA(cudaGraphDestroy(g));
         return exec;
     };
-    const double ln2 = std::log(2.0);
+    const double ln2 = std::numbers::ln2;
     const double tcpt = meta.train_chars_per_token, vcpt = vmeta.validation_chars_per_token;
 
     for (int epoch = initial_epoch; epoch < total_epochs; ++epoch) {
@@ -461,12 +455,11 @@ int cmd_train(int argc, char** argv) {
             std::string v = " - loss: " + fmt_value(m.loss)
                             + " - sparse_categorical_accuracy: " + fmt_value(sums.acc / std::max(1, sums.n));
             if (tcpt > 0) { v += " - bpc: " + fmt_value(m.loss / ln2 / tcpt); }
-            char b[160];
-            std::snprintf(b, sizeof b, " - lr: %.2e - grad_norm: %s - open: %s - tok/s: %.0fk", m.lr,
-                          fmt_value(m.grad_norm).c_str(), open_str(m.open_w, m.open_r1, m.open_r2).c_str(),
-                          step_tokens / per_step / 1e3);
+            const std::string b =
+                strformat(" - lr: %.2e - grad_norm: %s - open: %s - tok/s: %.0fk", m.lr, fmt_value(m.grad_norm).c_str(),
+                          open_str(m.open_w, m.open_r1, m.open_r2).c_str(), step_tokens / per_step / 1e3);
             if (sums.skipped) {
-                v += b + std::string(" - skipped: ") + std::to_string(sums.skipped);
+                v += b + " - skipped: " + std::to_string(sums.skipped);
             } else {
                 v += b;
             }
@@ -482,7 +475,7 @@ int cmd_train(int argc, char** argv) {
                     model.optimizer_step(s);
                     step_eager_done = true;
                 } else {
-                    if (!step_graph) {
+                    if (step_graph == nullptr) {
                         step_graph = capture([&] {
                             model.forward_backward(batch, s);
                             model.optimizer_step(s);
@@ -497,7 +490,7 @@ int cmd_train(int argc, char** argv) {
                         model.forward_backward(batch, s, part > 0);
                     } else {
                         cudaGraphExec_t& g = part == 0 ? step_graph : acc_graph;
-                        if (!g) {
+                        if (g == nullptr) {
                             g = capture([&] { model.forward_backward(batch, s, part > 0); });
                         }
                         LBC_CUDA(cudaGraphLaunch(g, s));
@@ -508,7 +501,7 @@ int cmd_train(int argc, char** argv) {
                     model.optimizer_step(s);
                     step_eager_done = true;
                 } else {
-                    if (!opt_graph) {
+                    if (opt_graph == nullptr) {
                         opt_graph = capture([&] { model.optimizer_step(s); });
                     }
                     LBC_CUDA(cudaGraphLaunch(opt_graph, s));
@@ -554,7 +547,7 @@ int cmd_train(int argc, char** argv) {
                     }
                     LBC_CUDA(cudaGraphLaunch(val_graph, s));
                 }
-                LBC_CUDA(cudaMemcpyAsync(d_val + 2 * k, model.metrics_device(), 2 * sizeof(float),
+                LBC_CUDA(cudaMemcpyAsync(d_val + size_t(2) * k, model.metrics_device(), 2 * sizeof(float),
                                          cudaMemcpyDeviceToDevice, s));
             }
             LBC_CUDA(cudaMemcpyAsync(val_host.data(), d_val, 2 * sizeof(float) * size_t(vs.steps()),
@@ -580,11 +573,11 @@ int cmd_train(int argc, char** argv) {
             v += " - " + v2name + "_loss: " + fmt_value(val2_loss) + " - " + v2name
                  + "_accuracy: " + fmt_value(val2_acc);
         }
-        bar.draw(spe, std::to_string(long(epoch_s + 0.5)) + "s", per_step, v, true);
+        bar.draw(spe, std::to_string(std::lround(epoch_s)) + "s", per_step, v, true);
         if (mixed) {  // the share of the scored targets each source gave so far (rows are fixed; targets vary)
             const auto& t = loader.targets();
             long long all = 0;
-            for (long long x : t) { all += x; }
+            for (long long const x : t) { all += x; }
             std::printf("  scored targets so far: %s %.1f%%", meta.name.c_str(),
                         100.0 * double(t[0]) / double(std::max(1LL, all)));
             for (size_t i = 1; i < t.size(); ++i) {
@@ -601,8 +594,7 @@ int cmd_train(int argc, char** argv) {
         save_checkpoint(latest, model, config_json, epoch + 1, best_val, s);
         const int every = rc.training.checkpoint_every;
         if (every > 0 && (epoch + 1) % every == 0) {
-            char name[64];
-            std::snprintf(name, sizeof name, "/checkpoints/checkpoint_%05d.lbc", epoch + 1);
+            const std::string name = strformat("/checkpoints/checkpoint_%05d.lbc", epoch + 1);
             copy_atomic(latest, run + name);
         }
         if (improved) { copy_atomic(latest, run + "/checkpoints/best.lbc"); }
@@ -617,11 +609,7 @@ int cmd_train(int argc, char** argv) {
         }
         const int n = std::max(1, sums.n);
         const double mean_loss = sums.loss / n;
-        auto num = [](double x) {
-            char b[32];
-            std::snprintf(b, sizeof b, "%.8g", x);
-            return std::string(b);
-        };
+        auto num = [](double x) { return strformat("%.8g", x); };
         auto opt = [&](bool have, double x) { return have ? num(x) : std::string(); };
         csv << epoch << "," << num(mean_loss) << "," << num(sums.acc / n) << "," << opt(bool(val), val_loss) << ","
             << opt(bool(val), val_acc) << "," << opt(tcpt > 0, mean_loss / ln2 / tcpt) << ","
@@ -650,9 +638,9 @@ int cmd_dump(int argc, char** argv) {
         } else if (a == "--split" && i + 1 < argc) {
             split = argv[++i];
         } else if (a == "--rows" && i + 1 < argc) {
-            rows = std::atoi(argv[++i]);
+            rows = parse_int(argv[++i], "--rows");
         } else if (a == "--window" && i + 1 < argc) {
-            window = std::atoi(argv[++i]);  // rows of this length (not the run's)
+            window = parse_int(argv[++i], "--window");  // rows of this length (not the run's)
         } else if (a == "--out" && i + 1 < argc) {
             out = argv[++i];
         } else if (a == "--rows-from" && i + 1 < argc) {
@@ -660,16 +648,14 @@ int cmd_dump(int argc, char** argv) {
         } else if (a == "--silence" && i + 1 < argc) {
             silence = argv[++i];
         } else if (a == "--tau-scale" && i + 1 < argc) {
-            tau_scale = std::atof(argv[++i]);
+            tau_scale = parse_double(argv[++i], "--tau-scale");
         } else if (a == "--write-bias-add" && i + 1 < argc) {
-            write_bias_add = std::atof(argv[++i]);
+            write_bias_add = parse_double(argv[++i], "--write-bias-add");
         } else {
             usage();
         }
     }
-    const std::string path = which == "best"     ? run + "/checkpoints/best.lbc"
-                             : which == "latest" ? run + "/model.lbc"
-                                                 : which;
+    const std::string path = checkpoint_path(run, which);
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
@@ -681,7 +667,7 @@ int cmd_dump(int argc, char** argv) {
     }
     if (!rows_from.empty()) { rows = int(fs::file_size(rows_from) / (size_t(c.T) * 9)); }
     c.B = rows;
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
@@ -692,7 +678,7 @@ int cmd_dump(int argc, char** argv) {
         LBC_CUDA(cudaMemcpy(P.data(), model.params(), P.size() * 4, cudaMemcpyDeviceToHost));
         for (const auto& t : model.tensors()) {
             const bool tau = t.name.find("log_tau") != std::string::npos,
-                       bias = t.name.size() > 4 && t.name.compare(t.name.size() - 4, 4, "_bwg") == 0;
+                       bias = t.name.size() > 4 && t.name.ends_with("_bwg");
             for (size_t i = 0; i < size_t(t.rows) * t.cols; ++i) {
                 if (tau) { P[t.off + i] += float(std::log(tau_scale)); }
                 if (bias) { P[t.off + i] += float(write_bias_add); }
@@ -703,9 +689,9 @@ int cmd_dump(int argc, char** argv) {
         std::printf("intervention: read temperatures x%.2f, write-gate biases %+.1f\n", tau_scale, write_bias_add);
     }
     model.keep_row_loss();
-    TokenFile file(split);
-    ValidationSet vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
+    TokenFile const file(split);
+    ValidationSet const vs(file, c.B, c.T, 1, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
+                           meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
     HostBatch hb = vs.batch(0);
     const size_t ntok = size_t(c.B) * c.T;
     std::vector<int> f_ids(ntok), f_y(ntok);
@@ -715,11 +701,11 @@ int cmd_dump(int argc, char** argv) {
         std::ifstream f(rows_from, std::ios::binary);
         int n = 0;
         for (int b = 0; b < c.B; ++b) {
-            f.read(reinterpret_cast<char*>(f_ids.data() + size_t(b) * c.T), c.T * 4);
-            f.read(reinterpret_cast<char*>(f_y.data() + size_t(b) * c.T), c.T * 4);
+            f.read(reinterpret_cast<char*>(f_ids.data() + size_t(b) * c.T), size_t(c.T) * 4);
+            f.read(reinterpret_cast<char*>(f_y.data() + size_t(b) * c.T), size_t(c.T) * 4);
             f.read(reinterpret_cast<char*>(f_reset.data() + size_t(b) * c.T), c.T);
         }
-        for (int y : f_y) { n += y >= 0; }
+        for (int const y : f_y) { n += static_cast<int>(y >= 0); }
         f_inv_n = 1.f / float(std::max(1, n));
         hb.ids = f_ids.data();
         hb.y = f_y.data();
@@ -727,9 +713,9 @@ int cmd_dump(int argc, char** argv) {
         hb.inv_n = &f_inv_n;
         hb.n_targets = n;
     }
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float* d_inv_n;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -753,9 +739,9 @@ int cmd_dump(int argc, char** argv) {
           << "\nF " << c.F << "\nB " << c.B << "\nT " << c.T << "\nDH " << c.dh << "\nSLOTS " << SLOTS << "\ntau "
           << c.tau << "\nslot_hl_min " << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max << "\nfactorized "
           << int(c.factorized) << "\ntied " << int(c.tied) << "\nhops ";
-        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.hops_of(l); }
+        for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.hops_of(l); }
         f << "\nbank_slots ";
-        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.slots_of(l); }
+        for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slots_of(l); }
         f << "\nloss " << r[0] << "\naccuracy " << r[1] << "\nn_targets " << hb.n_targets << "\nepoch " << info.epoch
           << "\n";
     }
@@ -813,11 +799,11 @@ int cmd_generate(int argc, char** argv) {
         } else if (a == "--out" && i + 1 < argc) {
             out = argv[++i];
         } else if (a == "--tokens" && i + 1 < argc) {
-            tokens = std::atoi(argv[++i]);
+            tokens = parse_int(argv[++i], "--tokens");
         } else if (a == "--temperature" && i + 1 < argc) {
-            temp = std::atof(argv[++i]);
+            temp = parse_double(argv[++i], "--temperature");
         } else if (a == "--top-k" && i + 1 < argc) {
-            topk = std::atoi(argv[++i]);
+            topk = parse_int(argv[++i], "--top-k");
         } else if (a == "--seed" && i + 1 < argc) {
             seed = std::strtoull(argv[++i], nullptr, 10);
         } else {
@@ -825,24 +811,22 @@ int cmd_generate(int argc, char** argv) {
         }
     }
     if (in.empty() || out.empty()) { die("generate needs --ids FILE and --out FILE"); }
-    const std::string path = which == "best"     ? run + "/checkpoints/best.lbc"
-                             : which == "latest" ? run + "/model.lbc"
-                                                 : which;
+    const std::string path = checkpoint_path(run, which);
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
     Config c = rc.model_config();
     c.B = 1;
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     std::vector<float> table(static_cast<size_t>(c.V) * c.E0);  // the readout table on the host
     LBC_CUDA(cudaMemcpy(table.data(), model.readout_table_params(), table.size() * 4, cudaMemcpyDeviceToHost));
     const int T = c.T, marker = meta.doc_token_id;
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float* d_inv_n;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, T * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, T * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, T));
@@ -859,7 +843,7 @@ int cmd_generate(int argc, char** argv) {
     while (std::getline(fin, line)) {
         std::vector<int> ids;
         std::stringstream ls(line);
-        for (int x; ls >> x;) { ids.push_back(x); }
+        for (int x = 0; ls >> x;) { ids.push_back(x); }
         if (ids.empty()) { continue; }
         std::vector<int> gen;
         for (int k = 0; k < tokens; ++k) {
@@ -867,7 +851,7 @@ int cmd_generate(int argc, char** argv) {
             std::vector<int> row(static_cast<size_t>(T), marker);
             std::copy(ids.end() - len, ids.end(), row.begin());
             std::vector<uint8_t> rst(static_cast<size_t>(T));
-            for (int t = 0; t < T; ++t) { rst[size_t(t)] = row[size_t(t)] == marker; }
+            for (int t = 0; t < T; ++t) { rst[size_t(t)] = static_cast<uint8_t>(row[size_t(t)] == marker); }
             LBC_CUDA(cudaMemcpyAsync(d_ids, row.data(), T * sizeof(int), cudaMemcpyHostToDevice, s));
             LBC_CUDA(cudaMemcpyAsync(d_reset, rst.data(), T, cudaMemcpyHostToDevice, s));
             model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
@@ -890,16 +874,17 @@ int cmd_generate(int argc, char** argv) {
             double r = u(rng);
             int pick = logit[size_t(K - 1)].second;
             for (int i = 0; i < K; ++i) {
-                if ((r -= pr[size_t(i)]) <= 0) {
+                r -= pr[size_t(i)];
+                if (r <= 0) {
                     pick = logit[size_t(i)].second;
                     break;
                 }
             }
             ids.push_back(pick);
             gen.push_back(pick);
-            if (pick == marker || std::find(stop.begin(), stop.end(), pick) != stop.end()) { break; }
+            if (pick == marker || std::ranges::find(stop, pick) != stop.end()) { break; }
         }
-        for (size_t i = 0; i < gen.size(); ++i) { fout << (i ? " " : "") << gen[i]; }
+        for (size_t i = 0; i < gen.size(); ++i) { fout << ((i != 0u) ? " " : "") << gen[i]; }
         fout << "\n";
         ++prompts;
     }
@@ -925,15 +910,13 @@ int cmd_score(int argc, char** argv) {
         } else if (a == "--out" && i + 1 < argc) {
             out = argv[++i];
         } else if (a == "--rows" && i + 1 < argc) {
-            rows = std::atoi(argv[++i]);
+            rows = parse_int(argv[++i], "--rows");
         } else {
             usage();
         }
     }
     if (in.empty() || out.empty()) { die("score needs --pairs FILE and --out FILE"); }
-    const std::string path = which == "best"     ? run + "/checkpoints/best.lbc"
-                             : which == "latest" ? run + "/model.lbc"
-                                                 : which;
+    const std::string path = checkpoint_path(run, which);
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
@@ -946,8 +929,8 @@ int cmd_score(int argc, char** argv) {
             if (bar == std::string::npos) { continue; }
             std::vector<int> a, b;
             std::stringstream sa(line.substr(0, bar)), sb(line.substr(bar + 1));
-            for (int x; sa >> x;) { a.push_back(x); }
-            for (int x; sb >> x;) { b.push_back(x); }
+            for (int x = 0; sa >> x;) { a.push_back(x); }
+            for (int x = 0; sb >> x;) { b.push_back(x); }
             pairs.emplace_back(std::move(a), std::move(b));
         }
     }
@@ -962,16 +945,16 @@ int cmd_score(int argc, char** argv) {
     if (rows <= 0) { rows = std::max(1, std::min(int(pairs.size()), (1 << 18) / c.T)); }
     c.B = rows;
     const auto t_start = Clock::now();
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     model.keep_row_loss();
     const int T = c.T, marker = meta.doc_token_id;
     const size_t ntok = static_cast<size_t>(rows) * T;
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float* d_inv_n;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -983,8 +966,8 @@ int cmd_score(int argc, char** argv) {
     std::vector<uint8_t> rst(ntok);
     for (size_t p0 = 0; p0 < pairs.size(); p0 += size_t(rows)) {
         const size_t n = std::min(pairs.size() - p0, size_t(rows));
-        std::fill(ids.begin(), ids.end(), marker);
-        std::fill(y.begin(), y.end(), -1);
+        std::ranges::fill(ids, marker);
+        std::ranges::fill(y, -1);
         std::vector<std::pair<int, int>> span(n);  // per row: first target position, count
         for (size_t r = 0; r < n; ++r) {
             std::vector<int> seq = pairs[p0 + r].first;
@@ -993,12 +976,12 @@ int cmd_score(int argc, char** argv) {
             const int len = std::min<int>(int(seq.size()), T + 1), off = int(seq.size()) - len;
             // input positions 0..len-2 predict seq[off + 1 .. off + len - 1]; the continuation is the last cont.size()
             for (int t = 0; t + 1 < len; ++t) {
-                ids[r * T + size_t(t)] = seq[size_t(off + t)];
-                if (t + 1 >= len - int(cont.size())) { y[r * T + size_t(t)] = seq[size_t(off + t + 1)]; }
+                ids[r * T + size_t(t)] = seq[size_t(off) + size_t(t)];
+                if (t + 1 >= len - int(cont.size())) { y[r * T + size_t(t)] = seq[size_t(off) + size_t(t) + 1]; }
             }
             span[r] = {len - 1 - int(cont.size()), int(cont.size())};
         }
-        for (size_t i = 0; i < ntok; ++i) { rst[i] = ids[i] == marker; }
+        for (size_t i = 0; i < ntok; ++i) { rst[i] = static_cast<uint8_t>(ids[i] == marker); }
         LBC_CUDA(cudaMemcpyAsync(d_ids, ids.data(), ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_y, y.data(), ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_reset, rst.data(), ntok, cudaMemcpyHostToDevice, s));
@@ -1029,9 +1012,9 @@ int cmd_eval(int argc, char** argv) {
         } else if (a == "--split" && i + 1 < argc) {
             split = argv[++i];
         } else if (a == "--steps" && i + 1 < argc) {
-            steps = std::atoi(argv[++i]);
+            steps = parse_int(argv[++i], "--steps");
         } else if (a == "--rows" && i + 1 < argc) {
-            rows = std::atoi(argv[++i]);
+            rows = parse_int(argv[++i], "--rows");
         } else if (a == "--silence" && i + 1 < argc) {
             silence = argv[++i];
         } else if (a == "--find-nan" && i + 1 < argc) {
@@ -1040,7 +1023,7 @@ int cmd_eval(int argc, char** argv) {
             usage();
         }
     }
-    std::string path = which == "best" ? run + "/checkpoints/best.lbc" : which == "latest" ? run + "/model.lbc" : which;
+    std::string path = checkpoint_path(run, which);
     if (which == "best" && !fs::exists(path)) { path = run + "/model.lbc"; }
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
@@ -1051,18 +1034,18 @@ int cmd_eval(int argc, char** argv) {
     if (rows > 0) {
         c.B = rows;  // fewer rows per batch (e.g. beside a training run)
     }
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
     if (!silence.empty()) { model.set_silence(parse_silence(silence, c.L)); }
-    TokenFile file(split);
-    ValidationSet vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
-                     meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
+    TokenFile const file(split);
+    ValidationSet const vs(file, c.B, c.T, steps, uint64_t(rc.data.seed), meta.doc_token_id, meta.score_after_token,
+                           meta.score_prev_token, meta.row_length > 0, Span{meta.span_open, meta.span_close});
     const size_t ntok = size_t(c.B) * c.T;
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float* d_inv_n;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
@@ -1099,8 +1082,8 @@ int cmd_eval(int argc, char** argv) {
                 if (first < 0) { continue; }
                 std::printf("non-finite loss: step %d row %d: %d positions, first %d (target %d)\n", k, b, bad, first,
                             hb.y[size_t(b) * c.T + first]);
-                nan_out.write(reinterpret_cast<const char*>(hb.ids + size_t(b) * c.T), c.T * 4);
-                nan_out.write(reinterpret_cast<const char*>(hb.y + size_t(b) * c.T), c.T * 4);
+                nan_out.write(reinterpret_cast<const char*>(hb.ids + size_t(b) * c.T), size_t(c.T) * 4);
+                nan_out.write(reinterpret_cast<const char*>(hb.y + size_t(b) * c.T), size_t(c.T) * 4);
                 nan_out.write(reinterpret_cast<const char*>(hb.reset + size_t(b) * c.T), c.T);
                 ++nan_rows;
             }

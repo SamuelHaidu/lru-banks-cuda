@@ -14,7 +14,7 @@ constexpr int RPAD = SLOTS + 1;  // router rows padded: lane d reading column m 
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o; o >>= 1) { v += __shfl_xor_sync(FULL, v, o); }
+    for (int o = 16; o != 0; o >>= 1) { v += __shfl_xor_sync(FULL, v, o); }
     return v;
 }
 
@@ -23,7 +23,7 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.f / (1.f + __expf(-
 // (value, index) argmax over the warp, ties to the lower index; every lane gets the result
 __device__ __forceinline__ void warp_argmax(float& v, int& i) {
 #pragma unroll
-    for (int o = 16; o; o >>= 1) {
+    for (int o = 16; o != 0; o >>= 1) {
         const float ov = __shfl_xor_sync(FULL, v, o);
         const int oi = __shfl_xor_sync(FULL, i, o);
         if (ov > v || (ov == v && oi < i)) {
@@ -38,7 +38,7 @@ struct LruConst {
 };
 
 __device__ __forceinline__ LruConst lru_const(float nu, float theta) {
-    LruConst c;
+    LruConst c{};
     c.rho = __expf(nu);
     const float mag = __expf(-c.rho);
     c.lr = mag * cosf(theta);
@@ -78,7 +78,7 @@ __global__ void k_lru_fwd(const bf16* __restrict__ P,
         }
 #pragma unroll
         for (int u = 0; u < LRU_UNROLL; ++u) {
-            const float keep = rr[u] ? 0.f : 1.f;
+            const float keep = (rr[u] != 0u) ? 0.f : 1.f;
             const float nr = keep * (c.lr * hr - c.li * hi) + c.gam * xr[u];
             hi = keep * (c.lr * hi + c.li * hr) + c.gam * xi[u];
             hr = nr;
@@ -137,7 +137,7 @@ __global__ void k_lru_bwd(const float* __restrict__ ds,
             dp[size_t(t) * lddp + n] = __float2bfloat16(c.gam * gr);
             dp[size_t(t) * lddp + N + n] = __float2bfloat16(c.gam * gi);
             dgam += gr * xr[u] + gi * xi[u];
-            const float keep = rr[u] ? 0.f : 1.f;
+            const float keep = (rr[u] != 0u) ? 0.f : 1.f;
             const float hpr = keep * pr[u], hpi = keep * pi[u];
             dlr += gr * hpr + gi * hpi;
             dli += -gr * hpi + gi * hpr;
@@ -156,8 +156,8 @@ template <int DH>
 __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block) {
     constexpr int E = DH / 32;
     extern __shared__ float smem[];
-    float* Rs = smem;                // [DH][RPAD]
-    float* st_s = smem + DH * RPAD;  // [4]
+    float* Rs = smem;                        // [DH][RPAD]
+    float* st_s = smem + size_t(DH) * RPAD;  // [4]
     const int h = blockIdx.x, H = a.H, HD = H * DH;
     for (int i = threadIdx.x; i < DH * SLOTS; i += blockDim.x) {
         Rs[(i / SLOTS) * RPAD + i % SLOTS] = a.R[size_t(h) * DH * SLOTS + i];
@@ -177,7 +177,7 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
             const int d = lane + 32 * c;
             kp[c] = a.bk[h * DH + d];
             if (t > 0 && !rst) { kp[c] += __bfloat162float(gprev[h * DH + d]); }
-            qp[c] = __bfloat162float(a.G[size_t(r) * a.ldG + HD + h * DH + d]);
+            qp[c] = __bfloat162float(a.G[size_t(r) * a.ldG + HD + size_t(h) * DH + d]);
             ks += kp[c] * kp[c];
             qs += qp[c] * qp[c];
         }
@@ -192,9 +192,9 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
 #pragma unroll 8
             for (int dd = 0; dd < 32; ++dd) {
                 const float kd = __shfl_sync(FULL, k[c], dd);
-                const float* row = Rs + (32 * c + dd) * RPAD + lane;
+                const float* row = Rs + size_t(32 * c + dd) * RPAD + lane;
 #pragma unroll
-                for (int j = 0; j < 4; ++j) { l[j] += kd * row[32 * j]; }
+                for (int j = 0; j < 4; ++j) { l[j] += kd * row[size_t(32) * j]; }
             }
         }
 #pragma unroll
@@ -229,12 +229,12 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
         const size_t rh = size_t(r) * H + h;
 #pragma unroll
         for (int c = 0; c < E; ++c) {
-            a.k[rh * DH + lane + 32 * c] = __float2bfloat16(k[c]);
-            a.q[rh * DH + lane + 32 * c] = __float2bfloat16(qp[c] / fmaxf(qn, NORM_EPS));
+            a.k[size_t(rh) * DH + (lane + 32 * c)] = __float2bfloat16(k[c]);
+            a.q[size_t(rh) * DH + (lane + 32 * c)] = __float2bfloat16(qp[c] / fmaxf(qn, NORM_EPS));
         }
         if (lane == 0) {
-            const float aw = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * HD + H + h]) + a.bwg[h];
-            const float ar = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * HD + h]) + a.brg[h];
+            const float aw = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * size_t(HD) + H + h]) + a.bwg[h];
+            const float ar = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * size_t(HD) + h]) + a.brg[h];
             const bool gw = !rst && t > 0 && aw > 0.f, gr = ar > 0.f;  // no write without a previous state
             a.kn[rh] = kn;
             a.qn[rh] = qn;
@@ -279,7 +279,7 @@ __global__ void k_lru_step(const bf16* __restrict__ P,
     const int r = idx / N, n = idx % N;
     const LruConst c = lru_const(nu[n], theta[n]);
     float* h = state + size_t(map[r]) * 2 * N;
-    const float keep = reset[r] ? 0.f : 1.f;
+    const float keep = (reset[r] != 0u) ? 0.f : 1.f;
     const float xr = __bfloat162float(P[size_t(r) * ldp + n]), xi = __bfloat162float(P[size_t(r) * ldp + N + n]);
     const float hr = h[n], hi = h[N + n];
     const float nr = keep * (c.lr * hr - c.li * hi) + c.gam * xr;  // as k_lru_fwd
@@ -307,10 +307,10 @@ template <int DH>
 __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block) {
     constexpr int E = DH / 32;
     extern __shared__ float smem[];
-    float* Rs = smem;                     // [DH][RPAD]
-    float* dRs = smem + DH * RPAD;        // [DH][RPAD]
-    float* dbk_s = smem + 2 * DH * RPAD;  // [DH]
-    float* dg_s = dbk_s + DH;             // [2]
+    float* Rs = smem;                             // [DH][RPAD]
+    float* dRs = smem + size_t(DH) * RPAD;        // [DH][RPAD]
+    float* dbk_s = smem + size_t(2) * DH * RPAD;  // [DH]
+    float* dg_s = dbk_s + DH;                     // [2]
     const int h = blockIdx.x, H = a.H, HD = H * DH;
     for (int i = threadIdx.x; i < DH * SLOTS; i += blockDim.x) {
         Rs[(i / SLOTS) * RPAD + i % SLOTS] = a.R[size_t(h) * DH * SLOTS + i];
@@ -334,7 +334,7 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             k[c] = __bfloat162float(a.k[rh * DH + d]);
             dk[c] =
                 gw ? __bfloat162float(a.dk2[rh * 2 * DH + d]) + __bfloat162float(a.dk2[(rh * 2 + 1) * DH + d]) : 0.f;
-            a.dv[size_t(r) * a.lddv + h * DH + d] = __float2bfloat16(
+            a.dv[size_t(r) * a.lddv + size_t(h) * DH + d] = __float2bfloat16(
                 gw ? __bfloat162float(a.dv2[rh * 2 * DH + d]) + __bfloat162float(a.dv2[(rh * 2 + 1) * DH + d]) : 0.f);
         }
         const float dr1 = a.dr2[rh * 2], dr2 = a.dr2[rh * 2 + 1];
@@ -366,8 +366,8 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
         float qdq = 0.f, q[E], dq[E];
 #pragma unroll
         for (int c = 0; c < E; ++c) {
-            q[c] = __bfloat162float(a.q[rh * DH + lane + 32 * c]);
-            dq[c] = a.dq[rh * DH + lane + 32 * c];
+            q[c] = __bfloat162float(a.q[size_t(rh) * DH + (lane + 32 * c)]);
+            dq[c] = a.dq[size_t(rh) * DH + (lane + 32 * c)];
             qdq += q[c] * dq[c];
         }
         qdq = warp_sum(qdq);
@@ -378,11 +378,11 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             const float dkp = (dk[c] - k[c] * kdk) / fmaxf(a.kn[rh], NORM_EPS);
             // k_pre at row r is G_k at row r - 1 (zero without a previous state); every G_k row gets written here:
             // row r - 1 by row r, a row's last token by itself (nothing reads it)
-            if (t > 0) { a.dG[size_t(r - 1) * a.ldG + h * DH + d] = __float2bfloat16(rst ? 0.f : dkp); }
-            if (t == a.T - 1) { a.dG[size_t(r) * a.ldG + h * DH + d] = __float2bfloat16(0.f); }
+            if (t > 0) { a.dG[size_t(r - 1) * a.ldG + size_t(h) * DH + d] = __float2bfloat16(rst ? 0.f : dkp); }
+            if (t == a.T - 1) { a.dG[size_t(r) * a.ldG + size_t(h) * DH + d] = __float2bfloat16(0.f); }
             atomicAdd(&dbk_s[d], dkp);
             const float dqp = (dq[c] - q[c] * qdq) / fmaxf(a.qn[rh], NORM_EPS);
-            a.dG[size_t(r) * a.ldG + HD + h * DH + d] = __float2bfloat16(dqp);
+            a.dG[size_t(r) * a.ldG + HD + size_t(h) * DH + d] = __float2bfloat16(dqp);
         }
         if (lane == 0) {
             const float bw = a.budget > 0.f ? 2.f * a.budget * (a.stats[0] / a.count - a.target) / a.count : 0.f;
@@ -391,8 +391,8 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             const float dar = (a.dgr[rh] + br) * sr * (1.f - sr);
             const float sw = sigmoid(a.aw[rh]);
             const float daw = (rst || t == 0) ? 0.f : (dgw + bw) * sw * (1.f - sw);
-            a.dG[size_t(r) * a.ldG + 2 * HD + h] = __float2bfloat16(dar);
-            a.dG[size_t(r) * a.ldG + 2 * HD + H + h] = __float2bfloat16(daw);
+            a.dG[size_t(r) * a.ldG + 2 * size_t(HD) + h] = __float2bfloat16(dar);
+            a.dG[size_t(r) * a.ldG + 2 * size_t(HD) + H + h] = __float2bfloat16(daw);
             atomicAdd(&dg_s[0], dar);
             atomicAdd(&dg_s[1], daw);
         }
@@ -401,7 +401,7 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
     for (int i = threadIdx.x; i < DH * SLOTS; i += blockDim.x) {
         atomicAdd(a.dR + size_t(h) * DH * SLOTS + i, dRs[(i / SLOTS) * RPAD + i % SLOTS]);
     }
-    for (int i = threadIdx.x; i < DH; i += blockDim.x) { atomicAdd(a.dbk + h * DH + i, dbk_s[i]); }
+    for (int i = threadIdx.x; i < DH; i += blockDim.x) { atomicAdd(a.dbk + size_t(h) * DH + i, dbk_s[i]); }
     if (threadIdx.x == 0) {
         atomicAdd(a.dbrg + h, dg_s[0]);
         atomicAdd(a.dbwg + h, dg_s[1]);
@@ -424,12 +424,14 @@ __global__ void __launch_bounds__(256) k_q2_fwd(Q2Fwd a, int rows_per_block) {
         float qp[E], qs = 0.f;
 #pragma unroll
         for (int c = 0; c < E; ++c) {
-            qp[c] = __bfloat162float(a.G2[size_t(r) * a.ldG2 + h * DH + lane + 32 * c]);
+            qp[c] = __bfloat162float(a.G2[size_t(r) * a.ldG2 + size_t(h) * DH + (lane + 32 * c)]);
             qs += qp[c] * qp[c];
         }
         const float qn = sqrtf(warp_sum(qs));
 #pragma unroll
-        for (int c = 0; c < E; ++c) { a.q[w * DH + lane + 32 * c] = __float2bfloat16(qp[c] / fmaxf(qn, NORM_EPS)); }
+        for (int c = 0; c < E; ++c) {
+            a.q[size_t(w) * DH + (lane + 32 * c)] = __float2bfloat16(qp[c] / fmaxf(qn, NORM_EPS));
+        }
         if (lane == 0) {
             const float ar = __bfloat162float(a.G2[size_t(r) * a.ldG2 + HD + h]) + a.brg[h];
             a.qn[w] = qn;
@@ -464,14 +466,14 @@ __global__ void __launch_bounds__(256) k_q2_bwd(Q2Bwd a, int rows_per_block) {
         float q[E], dq[E], qdq = 0.f;
 #pragma unroll
         for (int c = 0; c < E; ++c) {
-            q[c] = __bfloat162float(a.q[w * DH + lane + 32 * c]);
-            dq[c] = a.dq[w * DH + lane + 32 * c];
+            q[c] = __bfloat162float(a.q[size_t(w) * DH + (lane + 32 * c)]);
+            dq[c] = a.dq[size_t(w) * DH + (lane + 32 * c)];
             qdq += q[c] * dq[c];
         }
         qdq = warp_sum(qdq);
 #pragma unroll
         for (int c = 0; c < E; ++c) {
-            a.dG2[size_t(r) * a.ldG2 + h * DH + lane + 32 * c] =
+            a.dG2[size_t(r) * a.ldG2 + size_t(h) * DH + (lane + 32 * c)] =
                 __float2bfloat16((dq[c] - q[c] * qdq) / fmaxf(a.qn[w], NORM_EPS));
         }
         if (lane == 0) {
@@ -525,7 +527,7 @@ void lru_fwd(const bf16* P,
              int T,
              int N,
              cudaStream_t st) {
-    if (T % LRU_UNROLL) { fail("lru_fwd", "T must be a multiple of 8", __FILE__, __LINE__); }
+    if ((T % LRU_UNROLL) != 0) { fail("lru_fwd", "T must be a multiple of 8", __FILE__, __LINE__); }
     k_lru_fwd<<<(B * N + 127) / 128, 128, 0, st>>>(P, ldp, nu, theta, reset, s, sb, B, T, N);
     LBC_CUDA(cudaGetLastError());
 }

@@ -33,20 +33,20 @@ Fp8Gemm make_fp8(cublasLtHandle_t lt, int M, int N, int K, const float* sa, cons
     const cublasOperation_t T = CUBLAS_OP_T, Nn = CUBLAS_OP_N;
     LBC_CUBLAS(cublasLtMatmulDescSetAttribute(g.op, CUBLASLT_MATMUL_DESC_TRANSA, &T, sizeof(T)));
     LBC_CUBLAS(cublasLtMatmulDescSetAttribute(g.op, CUBLASLT_MATMUL_DESC_TRANSB, &Nn, sizeof(Nn)));
-    LBC_CUBLAS(cublasLtMatmulDescSetAttribute(g.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sa, sizeof(sa)));
-    LBC_CUBLAS(cublasLtMatmulDescSetAttribute(g.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sb, sizeof(sb)));
+    set_attribute(g.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, sa);
+    set_attribute(g.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, sb);
     LBC_CUBLAS(cublasLtMatrixLayoutCreate(&g.a, CUDA_R_8F_E4M3, K, N, K));  // Wt: column-major K x N (op T: N x K)
     LBC_CUBLAS(cublasLtMatrixLayoutCreate(&g.b, CUDA_R_8F_E4M3, K, M, K));  // X: column-major K x M
     LBC_CUBLAS(cublasLtMatrixLayoutCreate(&g.d, CUDA_R_16BF, N, M, N));
-    cublasLtMatmulPreference_t pref;
+    cublasLtMatmulPreference_t pref = nullptr;
     LBC_CUBLAS(cublasLtMatmulPreferenceCreate(&pref));
     LBC_CUBLAS(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
     cublasLtMatmulHeuristicResult_t res{};
     int found = 0;
     LBC_CUBLAS(cublasLtMatmulAlgoGetHeuristic(lt, g.op, g.a, g.b, g.d, g.d, pref, 1, &res, &found));
-    if (!found) { fail("fp8 heuristic", "no algorithm", __FILE__, __LINE__); }
+    if (found == 0) { fail("fp8 heuristic", "no algorithm", __FILE__, __LINE__); }
     g.algo = res.algo;
-    cublasLtMatmulPreferenceDestroy(pref);
+    LBC_CUBLAS_CLEANUP(cublasLtMatmulPreferenceDestroy(pref));
     return g;
 }
 
@@ -55,7 +55,7 @@ __global__ void k_amax(const bf16* x, size_t n, float* amax) {
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         m = fmaxf(m, fabsf(__bfloat162float(x[i])));
     }
-    for (int o = 16; o; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o)); }
+    for (int o = 16; o != 0; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o)); }
     if ((threadIdx.x & 31) == 0) {
         atomicMax(reinterpret_cast<int*>(amax), __float_as_int(m));  // m >= 0
     }
@@ -71,14 +71,14 @@ __global__ void k_cast_fp8(const bf16* x, __nv_fp8_e4m3* y, size_t n, const floa
 }  // namespace
 
 int main() {
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreate(&s));
-    cublasLtHandle_t lt;
+    cublasLtHandle_t lt = nullptr;
     LBC_CUBLAS(cublasLtCreate(&lt));
     const size_t ws_bytes = size_t(32) << 20;
-    void* ws;
+    void* ws = nullptr;
     LBC_CUDA(cudaMalloc(&ws, ws_bytes));
-    float* one;
+    float* one = nullptr;
     LBC_CUDA(cudaMalloc(&one, sizeof(float)));
     const float h1 = 1.f;
     LBC_CUDA(cudaMemcpy(one, &h1, sizeof(float), cudaMemcpyHostToDevice));
@@ -88,15 +88,17 @@ int main() {
     struct Shape {
         const char* name;
         int M, N, K;
-    } shapes[] = {{"FFN up   (32768 x 512 -> 2048)", 32768, 2048, 512},
-                  {"FFN down (32768 x 2048 -> 512)", 32768, 512, 2048}};
+    };
+
+    const Shape shapes[] = {{"FFN up   (32768 x 512 -> 2048)", 32768, 2048, 512},
+                            {"FFN down (32768 x 2048 -> 512)", 32768, 512, 2048}};
 
     std::printf("%-34s %10s %10s %8s %12s\n", "shape", "bf16 ms", "fp8 ms", "speedup", "quantize ms");
     for (const auto& sh : shapes) {
         const size_t nx = size_t(sh.M) * sh.K, nw = size_t(sh.K) * sh.N, nd = size_t(sh.M) * sh.N;
-        bf16 *X, *W, *Wt, *D;
-        __nv_fp8_e4m3 *X8, *Wt8;
-        float* amax;
+        bf16 *X = nullptr, *W = nullptr, *Wt = nullptr, *D = nullptr;
+        __nv_fp8_e4m3 *X8 = nullptr, *Wt8 = nullptr;
+        float* amax = nullptr;
         LBC_CUDA(cudaMalloc(&X, nx * 2));
         LBC_CUDA(cudaMalloc(&W, nw * 2));
         LBC_CUDA(cudaMalloc(&Wt, nw * 2));

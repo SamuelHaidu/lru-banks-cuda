@@ -31,12 +31,22 @@ void put_utf8(std::string& s, uint32_t c) {
 uint32_t next_cp(const std::string& s, size_t& i) {
     const auto b = [&](size_t k) { return uint8_t(s[k]); };
     const uint8_t c = b(i);
-    int n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+    int n = 0;  // the sequence's length from its lead byte (0: not a lead byte)
+    if (c < 0x80) {
+        n = 1;
+    } else if ((c >> 5) == 6) {
+        n = 2;
+    } else if ((c >> 4) == 14) {
+        n = 3;
+    } else if ((c >> 3) == 30) {
+        n = 4;
+    }
     if (n == 0 || i + size_t(n) > s.size()) {
         ++i;
         return c;
     }
-    uint32_t cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+    static constexpr uint8_t lead_mask[5] = {0, 0xFF, 0x1F, 0x0F, 0x07};  // the lead byte's payload bits
+    uint32_t cp = c & lead_mask[n];
     for (int k = 1; k < n; ++k) {
         if ((b(i + size_t(k)) & 0xC0) != 0x80) {
             ++i;
@@ -117,7 +127,12 @@ bool is_letter(uint32_t c) {
 
 enum Cls { SPACE, LETTER, NUMBER, OTHER };
 
-Cls cls(uint32_t c) { return is_space(c) ? SPACE : is_letter(c) ? LETTER : is_number(c) ? NUMBER : OTHER; }
+Cls cls(uint32_t c) {
+    if (is_space(c)) { return SPACE; }
+    if (is_letter(c)) { return LETTER; }
+    if (is_number(c)) { return NUMBER; }
+    return OTHER;
+}
 
 // the pre-tokenizer: pieces as byte ranges of `s`
 void pretokenize(const std::string& s, std::vector<std::pair<size_t, size_t>>& out) {
@@ -167,7 +182,7 @@ void pretokenize(const std::string& s, std::vector<std::pair<size_t, size_t>>& o
 Tokenizer::Tokenizer(const std::string& path) {
     const json::Value t = json::read_file(path);
     const json::Value* model = t.find("model");
-    if (!model || !model->find("vocab") || !model->find("merges")) {
+    if ((model == nullptr) || (model->find("vocab") == nullptr) || (model->find("merges") == nullptr)) {
         throw std::runtime_error(path + ": no BPE model");
     }
     for (const auto& [tok, idv] : model->find("vocab")->obj) {
@@ -199,7 +214,7 @@ Tokenizer::Tokenizer(const std::string& path) {
             added_list_.push_back(content);
         }
     }
-    std::sort(added_list_.begin(), added_list_.end(), [](auto& a, auto& b) { return a.size() > b.size(); });
+    std::ranges::sort(added_list_, [](auto& a, auto& b) { return a.size() > b.size(); });
     // GPT-2 bytes_to_unicode
     int n = 0;
     for (int b = 0; b < 256; ++b) {
@@ -222,7 +237,7 @@ void Tokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
         return;
     }
     std::vector<std::string> w;
-    for (unsigned char b : piece) { w.push_back(byte_to_char_[b]); }
+    for (unsigned char const b : piece) { w.push_back(byte_to_char_[b]); }
     while (w.size() > 1) {
         int best = INT_MAX;
         size_t bi = 0;

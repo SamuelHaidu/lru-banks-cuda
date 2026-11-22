@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include "kernels.hpp"
 #include "lbc/check.hpp"
@@ -70,11 +71,11 @@ Decoder::Decoder(Model& model, int slots, int max_rows) : m_(model), slots_(slot
 }
 
 Decoder::~Decoder() {
-    for (void* p : allocs_) { cudaFree(p); }
-    if (d_pairs_) { cudaFree(d_pairs_); }
-    cudaFreeHost(h_in_);
-    cudaFreeHost(h_out_);
-    cudaFreeHost(h_outf_);
+    for (void* p : allocs_) { LBC_CUDA_CLEANUP(cudaFree(p)); }
+    if (d_pairs_ != nullptr) { LBC_CUDA_CLEANUP(cudaFree(d_pairs_)); }
+    LBC_CUDA_CLEANUP(cudaFreeHost(h_in_));
+    LBC_CUDA_CLEANUP(cudaFreeHost(h_out_));
+    LBC_CUDA_CLEANUP(cudaFreeHost(h_outf_));
 }
 
 size_t Decoder::state_bytes() const {
@@ -85,10 +86,10 @@ size_t Decoder::state_bytes() const {
 void Decoder::copy_slots(const std::vector<int2>& pairs, cudaStream_t s) {
     if (pairs.empty()) { return; }
     const Config& c = m_.c_;
-    if (int(pairs.size()) > pairs_cap_) {
-        if (d_pairs_) {
+    if (std::cmp_greater(pairs.size(), pairs_cap_)) {
+        if (d_pairs_ != nullptr) {
             LBC_CUDA(cudaStreamSynchronize(s));
-            cudaFree(d_pairs_);
+            LBC_CUDA_CLEANUP(cudaFree(d_pairs_));
         }
         pairs_cap_ = int(pairs.size());
         LBC_CUDA(cudaMalloc(&d_pairs_, size_t(pairs_cap_) * sizeof(int2)));
@@ -127,17 +128,17 @@ void Decoder::step(const int* ids,
         hi[r] = real ? ids[r] : 0;
         hi[Rp + r] = real ? slot[r] : slots_;
         hi[2 * Rp + r] = real ? tpos[r] : 0;
-        reinterpret_cast<uint8_t*>(hi + 3 * Rp)[r] = real ? reset[r] : 1;
+        reinterpret_cast<uint8_t*>(hi + size_t(3) * Rp)[r] = real ? reset[r] : 1;
     }
-    uint64_t* hk = reinterpret_cast<uint64_t*>(hi + 4 * Rp);
-    if (key) {
+    auto* hk = reinterpret_cast<uint64_t*>(hi + size_t(4) * Rp);
+    if (key != nullptr) {
         for (int r = 0; r < Rp; ++r) { hk[r] = r < R ? key[r] : 0; }
     }
     LBC_CUDA(cudaMemcpyAsync(d_ids_, hi, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
     LBC_CUDA(cudaMemcpyAsync(d_map_, hi + Rp, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
-    LBC_CUDA(cudaMemcpyAsync(d_tpos_, hi + 2 * Rp, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
-    LBC_CUDA(cudaMemcpyAsync(d_reset_, hi + 3 * Rp, size_t(Rp), cudaMemcpyHostToDevice, s));
-    if (key) { LBC_CUDA(cudaMemcpyAsync(d_key_, hk, size_t(Rp) * 8, cudaMemcpyHostToDevice, s)); }
+    LBC_CUDA(cudaMemcpyAsync(d_tpos_, hi + size_t(2) * Rp, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
+    LBC_CUDA(cudaMemcpyAsync(d_reset_, hi + size_t(3) * Rp, size_t(Rp), cudaMemcpyHostToDevice, s));
+    if (key != nullptr) { LBC_CUDA(cudaMemcpyAsync(d_key_, hk, size_t(Rp) * 8, cudaMemcpyHostToDevice, s)); }
 
     const int D = c.D, HD = c.HD(), H = c.H, F = c.F, S2 = c.S2(), E0 = c.E0;
     if (c.factorized) {
@@ -187,18 +188,18 @@ void Decoder::step(const int* ids,
     for (int r0 = 0; r0 < R; r0 += logit_rows_) {
         const int rows = std::min(logit_rows_, R - r0);
         m.mm(s, false, true, rows, c.V, E0, hr_ + size_t(r0) * E0, E0, m.readout_table(), E0, logits_, c.V, Out::F32);
-        if (key) {
+        if (key != nullptr) {
             sample_rows(logits_, rows, c.V, temperature, d_key_ + r0, d_tok_ + r0, d_logp_ + r0, d_ent_ + r0, s);
         }
     }
-    if (!key) { return; }
+    if (key == nullptr) { return; }
     LBC_CUDA(cudaMemcpyAsync(h_out_, d_tok_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(h_outf_, d_logp_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(h_outf_ + R, d_ent_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaStreamSynchronize(s));
     std::memcpy(tok, h_out_, size_t(R) * 4);
-    if (logp) { std::memcpy(logp, h_outf_, size_t(R) * 4); }
-    if (ent) { std::memcpy(ent, h_outf_ + R, size_t(R) * 4); }
+    if (logp != nullptr) { std::memcpy(logp, h_outf_, size_t(R) * 4); }
+    if (ent != nullptr) { std::memcpy(ent, h_outf_ + R, size_t(R) * 4); }
 }
 
 }  // namespace lbc

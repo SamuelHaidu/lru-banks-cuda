@@ -1,5 +1,7 @@
 #include "json.hpp"
 
+#include "lbc/text.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -56,8 +58,12 @@ bool Value::operator==(const Value& o) const {
 namespace {
 
 struct Parser {
+    // nesting is bounded, so a corrupt or hostile file cannot overflow the stack
+    static constexpr int kMaxDepth = 128;
+
     const std::string& s;
     size_t i = 0;
+    int depth = 0;
 
     [[noreturn]] void error(const std::string& what) const {
         throw std::runtime_error("json: " + what + " at offset " + std::to_string(i));
@@ -151,6 +157,13 @@ struct Parser {
     }
 
     Value value() {
+        if (++depth > kMaxDepth) { error("nested deeper than " + std::to_string(kMaxDepth)); }
+        Value v = value_here();
+        --depth;
+        return v;
+    }
+
+    Value value_here() {
         ws();
         if (i >= s.size()) { error("unexpected end"); }
         const char c = s[i];
@@ -222,15 +235,10 @@ struct Parser {
 
 std::string number(double d) {
     if (!std::isfinite(d)) { return "null"; }
-    if (d == std::floor(d) && std::fabs(d) < 1e15) {
-        char buf[32];
-        std::snprintf(buf, sizeof buf, "%.0f", d);
-        return buf;
-    }
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%.15g", d);  // the shortest of 15 / 17 digits that reads back exactly
-    if (std::strtod(buf, nullptr) != d) { std::snprintf(buf, sizeof buf, "%.17g", d); }
-    return buf;
+    if (d == std::floor(d) && std::fabs(d) < 1e15) { return strformat("%.0f", d); }
+    std::string s = strformat("%.15g", d);  // the shortest of 15 / 17 digits that reads back exactly
+    if (parse_double(s, "json number") != d) { s = strformat("%.17g", d); }
+    return s;
 }
 
 std::string quote(const std::string& s) {
@@ -244,9 +252,7 @@ std::string quote(const std::string& s) {
             case '\t': out += "\\t"; break;
             default:
                 if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof buf, "\\u%04x", unsigned(c));
-                    out += buf;
+                    out += strformat("\\u%04x", unsigned(c));
                 } else {
                     out += c;
                 }
@@ -322,7 +328,7 @@ std::string dump(const Value& v, int indent) {
 }
 
 Value read_file(const std::string& path) {
-    std::ifstream f(path);
+    std::ifstream const f(path);
     if (!f) { throw std::runtime_error("cannot read " + path); }
     std::stringstream ss;
     ss << f.rdbuf();

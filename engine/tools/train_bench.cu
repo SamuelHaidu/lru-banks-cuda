@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "../src/model.hpp"
 #include "../src/run_config.hpp"
 #include "lbc/check.hpp"
+#include "lbc/text.hpp"
 
 using namespace lbc;
 
@@ -48,7 +50,7 @@ Args parse(int argc, char** argv) {
         auto val = [&]() -> const char* {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "%s needs a value\n", k.c_str());
-                std::exit(2);
+                std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, no threads yet
             }
             return argv[++i];
         };
@@ -57,31 +59,31 @@ Args parse(int argc, char** argv) {
         } else if (k == "--dump") {
             a.dump = val();
         } else if (k == "--dump-after") {
-            a.dump_after = std::atoi(val());
+            a.dump_after = parse_int(val(), "--dump-after");
         } else if (k == "--steps") {
-            a.steps = std::atoi(val());
+            a.steps = parse_int(val(), "--steps");
         } else if (k == "--warmup") {
-            a.warmup = std::atoi(val());
+            a.warmup = parse_int(val(), "--warmup");
         } else if (k == "--batch") {
-            a.batch = std::atoi(val());
+            a.batch = parse_int(val(), "--batch");
         } else if (k == "--seq") {
-            a.seq = std::atoi(val());
+            a.seq = parse_int(val(), "--seq");
         } else if (k == "--layers") {
-            a.layers = std::atoi(val());
+            a.layers = parse_int(val(), "--layers");
         } else if (k == "--gate-w") {
-            a.gate_w = std::atof(val());
+            a.gate_w = parse_double(val(), "--gate-w");
         } else if (k == "--gate-r") {
-            a.gate_r = std::atof(val());
+            a.gate_r = parse_double(val(), "--gate-r");
         } else if (k == "--lr") {
-            a.lr = std::atof(val());
+            a.lr = parse_double(val(), "--lr");
         } else if (k == "--budget") {
-            a.budget = std::atof(val());
+            a.budget = parse_double(val(), "--budget");
         } else if (k == "--seed") {
-            a.seed = std::strtoull(val(), nullptr, 10);
+            a.seed = parse_number<uint64_t>(val(), "--seed");
         } else if (k == "--ce-chunk") {
-            a.ce_chunk = std::atoi(val());
+            a.ce_chunk = parse_int(val(), "--ce-chunk");
         } else if (k == "--bank-chunk") {
-            a.bank_chunk = std::atoi(val());
+            a.bank_chunk = parse_int(val(), "--bank-chunk");
         } else if (k == "--tiny") {
             a.tiny = true;
         } else if (k == "--gate-report") {
@@ -91,23 +93,23 @@ Args parse(int argc, char** argv) {
         } else if (k == "--no-graph") {
             a.graph = false;
         } else if (k == "--budget-target") {
-            a.budget_target = std::atof(val());
+            a.budget_target = parse_double(val(), "--budget-target");
         } else if (k == "--set") {
             const std::string kv = val();
             const size_t eq = kv.find('=');
             if (eq == std::string::npos) {
                 std::fprintf(stderr, "--set needs section.key=value\n");
-                std::exit(2);
+                std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, no threads yet
             }
             a.sets.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         } else {
             std::fprintf(stderr, "unknown argument %s\n", k.c_str());
-            std::exit(2);
+            std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, no threads yet
         }
     }
     if (a.data.empty()) {
         std::fprintf(stderr, "--data PATH (a uint16 .npy token file) is required\n");
-        std::exit(2);
+        std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, no threads yet
     }
     return a;
 }
@@ -137,9 +139,9 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
           << c.ldPV() << "\nldG " << c.ldG() << "\nldG2 " << c.ldG2() << "\ntau " << c.tau << "\nslot_hl_min "
           << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max << "\nbudget " << c.budget << "\nbudget_target "
           << c.budget_target << "\nfactorized " << int(c.factorized) << "\ntied " << int(c.tied) << "\nhops ";
-        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.hops_of(l); }
+        for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.hops_of(l); }
         f << "\nbank_slots ";
-        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.slots_of(l); }
+        for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slots_of(l); }
         f << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\n";
     }
     {
@@ -166,7 +168,7 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     const Args a = parse(argc, argv);
     // the flags, then --set, through the run config (so every value is checked); constant learning rate
     RunConfig rc;
@@ -206,15 +208,15 @@ int main(int argc, char** argv) {
     }
     const Config c = rc.model_config();
 
-    TokenFile file(a.data);
+    TokenFile const file(a.data);
     Loader loader(file, c.B, c.T, a.seed);
     Model model(c, a.seed);
-    cudaStream_t s;
+    cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const size_t ntok = size_t(c.B) * c.T;
-    int *d_ids, *d_y;
-    uint8_t* d_reset;
-    float* d_inv_n;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
@@ -223,7 +225,7 @@ int main(int argc, char** argv) {
     size_t free_b = 0, total_b = 0;
     LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
     std::printf("model: %zu params, %d layers (hops", model.num_params(), c.L);
-    for (int l = 0; l < c.L; ++l) { std::printf("%s%d", l ? "," : " ", c.hops_of(l)); }
+    for (int l = 0; l < c.L; ++l) { std::printf("%s%d", (l != 0) ? "," : " ", c.hops_of(l)); }
     std::printf("), D %d, LRU %d complex, %d heads x %d, %d slots, FFN %d, vocab %d x %d (%s, %s)\n", c.D, c.N, c.H,
                 c.dh, SLOTS, c.F, c.V, c.E0, c.factorized ? "factorized" : "not factorized",
                 c.tied ? "tied" : "untied");
@@ -250,7 +252,7 @@ int main(int argc, char** argv) {
             model.optimizer_step(s);
         }
         HostBatch* hb = loader.next();
-        HostBatch keep = *hb;  // the pinned buffers stay valid until the slot is refilled (after this run)
+        HostBatch const keep = *hb;  // the pinned buffers stay valid until the slot is refilled (after this run)
         const Batch b = copy_batch(hb);
         model.forward_backward(b, s);
         LBC_CUDA(cudaStreamSynchronize(s));
@@ -260,9 +262,9 @@ int main(int argc, char** argv) {
     }
 
     const int total = a.warmup + a.steps;
-    float* d_hist;
+    float* d_hist = nullptr;
     LBC_CUDA(cudaMalloc(&d_hist, total * sizeof(float)));
-    cudaEvent_t t0, t1;
+    cudaEvent_t t0 = nullptr, t1 = nullptr;
     LBC_CUDA(cudaEventCreate(&t0));
     LBC_CUDA(cudaEventCreate(&t1));
     double wait_before = 0.0;
@@ -281,8 +283,8 @@ int main(int argc, char** argv) {
             model.forward_backward(b, s);
             model.optimizer_step(s);
         } else {
-            if (!step_graph) {
-                cudaGraph_t g;
+            if (step_graph == nullptr) {
+                cudaGraph_t g = nullptr;
                 LBC_CUDA(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
                 model.forward_backward(b, s);
                 model.optimizer_step(s);
@@ -312,23 +314,25 @@ int main(int argc, char** argv) {
 
     const std::vector<float> g = model.gate_stats(s);
     std::printf("open gates (last step), per layer write / read 1 / read 2:");
-    for (int n = 0; n < c.L; ++n) { std::printf("  L%d %.2f %.2f %.2f", n, g[3 * n], g[3 * n + 1], g[3 * n + 2]); }
+    for (int n = 0; n < c.L; ++n) {
+        std::printf("  L%d %.2f %.2f %.2f", n, g[3 * size_t(n)], g[3 * n + 1], g[3 * n + 2]);
+    }
     std::printf("\n");
 
-    if (a.gate_report) {  // the last step's read gates: how often all heads of a token are closed (rows a GEMM could
-                          // skip)
+    // the last step's read gates: how often all heads of a token are closed (rows a GEMM could skip)
+    if (a.gate_report) {
         std::printf("gate report (last step): per layer, hop: open reads, tokens with every head closed\n");
         for (int n = 0; n < c.L; ++n) {
             std::vector<uint8_t> ridx, gw, gr, gr2;
             model.decisions(n, ridx, gw, gr, gr2, s);
             for (int hop = 0; hop < 2; ++hop) {
-                const std::vector<uint8_t>& g = hop == 0 ? gr : gr2;
+                const std::vector<uint8_t>& gates = hop == 0 ? gr : gr2;
                 size_t open = 0, all_closed = 0;
                 for (size_t r = 0; r < ntok; ++r) {
                     int o = 0;
-                    for (int h = 0; h < c.H; ++h) { o += g[r * c.H + h]; }
+                    for (int h = 0; h < c.H; ++h) { o += gates[r * c.H + h]; }
                     open += o;
-                    all_closed += o == 0;
+                    all_closed += static_cast<size_t>(o == 0);
                 }
                 std::printf("  L%d hop %d: open %.3f, all heads closed %.4f\n", n, hop + 1,
                             double(open) / (double(ntok) * c.H), double(all_closed) / double(ntok));
@@ -350,15 +354,15 @@ int main(int argc, char** argv) {
         LBC_CUDA(cudaStreamSynchronize(s));  // the stream is non-blocking: cudaMemcpy would not wait for it
         const std::vector<float> gh = download(model.grads(), model.num_params());
         std::vector<std::pair<double, std::string>> norms;
-        double total = 0;
+        double total_sq = 0;
         for (const auto& t : model.tensors()) {
             double ss = 0;
             for (size_t i = 0; i < size_t(t.rows) * t.cols; ++i) { ss += double(gh[t.off + i]) * gh[t.off + i]; }
-            total += ss;
+            total_sq += ss;
             norms.emplace_back(std::sqrt(ss), t.name);
         }
-        std::sort(norms.rbegin(), norms.rend());
-        std::printf("gradient norm (profiled step) %.4g; largest tensors:", std::sqrt(total));
+        std::ranges::sort(std::ranges::reverse_view(norms));
+        std::printf("gradient norm (profiled step) %.4g; largest tensors:", std::sqrt(total_sq));
         for (size_t i = 0; i < std::min<size_t>(14, norms.size()); ++i) {
             std::printf(" %s %.3g", norms[i].second.c_str(), norms[i].first);
         }
@@ -368,7 +372,7 @@ int main(int argc, char** argv) {
         const int groups[5] = {0, HD, 2 * HD, 2 * HD + c.H, 2 * HD + 2 * c.H};
         const char* gname[4] = {"key", "query", "read gate", "write gate"};
         for (const auto& t : model.tensors()) {
-            if (t.name.size() < 3 || t.name.compare(t.name.size() - 3, 3, "_Ws") != 0) { continue; }
+            if (t.name.size() < 3 || !t.name.ends_with("_Ws")) { continue; }
             std::printf("  %s by columns:", t.name.c_str());
             for (int k = 0; k < 4; ++k) {
                 double ss = 0;
@@ -390,4 +394,13 @@ int main(int argc, char** argv) {
     LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
     std::printf("GPU memory in use: %.2f GiB\n", (total_b - free_b) / 1073741824.0);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "train_bench: %s\n", e.what());
+        return 1;
+    }
 }

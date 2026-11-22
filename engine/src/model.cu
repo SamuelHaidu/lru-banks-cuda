@@ -4,6 +4,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include <utility>
 
 #include "kernels.hpp"
 #include "lbc/check.hpp"
@@ -26,10 +27,10 @@ T* Model::alloc(size_t n) {
 
 Model::Model(const Config& c, uint64_t seed) : c_(c) {
     const int D = c.D, HD = c.HD(), S2 = c.S2(), H = c.H, F = c.F, E0 = c.E0, V = c.V, M = c.M();
-    if (int(c.hops.size()) != 0 && int(c.hops.size()) != c.L) {
+    if (int(c.hops.size()) != 0 && std::cmp_not_equal(c.hops.size(), c.L)) {
         fail("Model", "hops needs one entry per layer", __FILE__, __LINE__);
     }
-    if (!c.slots.empty() && int(c.slots.size()) != c.L) {
+    if (!c.slots.empty() && std::cmp_not_equal(c.slots.size(), c.L)) {
         fail("Model", "slots needs one entry per layer", __FILE__, __LINE__);
     }
     if (c.dh != 32 && c.dh != 64) { fail("Model", "the head size must be 32 or 64", __FILE__, __LINE__); }
@@ -176,7 +177,7 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     loss_ = metrics_;
     acc_ = metrics_ + 1;
     stats_ = metrics_ + 2;
-    gsq_ = metrics_ + 2 + 6 * c.L;
+    gsq_ = metrics_ + 2 + size_t(6) * c.L;
     lr_ = gsq_ + 1;
     step_ = alloc<int>(1);
     LBC_CUDA(cudaMemset(step_, 0, sizeof(int)));
@@ -187,10 +188,10 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
 
 Model::~Model() {
     for (auto& mk : marks_) {
-        cudaEventDestroy(mk.a);
-        cudaEventDestroy(mk.b);
+        LBC_CUDA_CLEANUP(cudaEventDestroy(mk.a));
+        LBC_CUDA_CLEANUP(cudaEventDestroy(mk.b));
     }
-    for (void* ptr : allocations_) { cudaFree(ptr); }
+    for (void* ptr : allocations_) { LBC_CUDA_CLEANUP(cudaFree(ptr)); }
 }
 
 void Model::init(uint64_t seed) {
@@ -222,9 +223,10 @@ void Model::init(uint64_t seed) {
         // LRU half-lives log-spaced over [lru_hl_min, lru_hl_max]: |lambda| = 2^(-1 / half-life)
         std::uniform_real_distribution<float> ud(0.f, 6.283185307179586f);
         for (int j = 0; j < N; ++j) {
-            const double hl = std::exp(std::log(c_.lru_hl_min)
-                                       + (std::log(c_.lru_hl_max) - std::log(c_.lru_hl_min)) * j / std::max(1, N - 1));
-            hp[tensors_[x.nu].off + j] = float(std::log(std::log(2.0) / hl));
+            const double hl = std::exp(std::log(double(c_.lru_hl_min))
+                                       + (std::log(double(c_.lru_hl_max)) - std::log(double(c_.lru_hl_min))) * j
+                                             / std::max(1, N - 1));
+            hp[tensors_[x.nu].off + j] = float(std::log(std::numbers::ln2 / hl));
             hp[tensors_[x.theta].off + j] = ud(rng);
         }
         normal(x.Ws, 0.02f);
@@ -260,8 +262,9 @@ void Model::init(uint64_t seed) {
         const int ns = c_.slots_of(n);
         for (int m = 0; m < SLOTS; ++m) {
             const int mm = std::min(m, ns - 1);
-            const double hl = std::exp(std::log(c_.slot_hl_min)
-                                       + (std::log(c_.slot_hl_max) - std::log(c_.slot_hl_min)) * mm / (ns - 1));
+            const double hl =
+                std::exp(std::log(double(c_.slot_hl_min))
+                         + (std::log(double(c_.slot_hl_max)) - std::log(double(c_.slot_hl_min))) * mm / (ns - 1));
             for (int h = 0; h < c_.H; ++h) { la[(size_t(n) * c_.H + h) * SLOTS + m] = float(std::log(0.5) / hl); }
         }
     }
@@ -272,8 +275,8 @@ void Model::init(uint64_t seed) {
 
 void Model::prepare_weights(cudaStream_t s) {
     const int D = c_.D, HD = c_.HD(), F = c_.F, E0 = c_.E0;
-    if (Eb_) { prep_weight(p(E_), nullptr, Eb_, c_.V, E0, s); }
-    if (Eoutb_) { prep_weight(p(E_out_), nullptr, Eoutb_, c_.V, E0, s); }
+    if (Eb_ != nullptr) { prep_weight(p(E_), nullptr, Eb_, c_.V, E0, s); }
+    if (Eoutb_ != nullptr) { prep_weight(p(E_out_), nullptr, Eoutb_, c_.V, E0, s); }
     if (c_.factorized) {
         prep_weight(p(W_in_), nullptr, Winb_, E0, D, s);
         prep_weight(p(W_out_), p(final_norm_), Woutb_, D, E0, s);
@@ -315,12 +318,12 @@ std::vector<std::pair<std::string, float>> Model::profile_ms() {
         float ms = 0.f;
         LBC_CUDA(cudaEventElapsedTime(&ms, mk.a, mk.b));
         acc[mk.cat] += ms;
-        cudaEventDestroy(mk.a);
-        cudaEventDestroy(mk.b);
+        LBC_CUDA_CLEANUP(cudaEventDestroy(mk.a));
+        LBC_CUDA_CLEANUP(cudaEventDestroy(mk.b));
     }
     marks_.clear();
     std::vector<std::pair<std::string, float>> out(acc.begin(), acc.end());
-    std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::ranges::sort(out, [](auto& a, auto& b) { return a.second > b.second; });
     return out;
 }
 
@@ -355,8 +358,8 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     const int M = c_.M(), D = c_.D, HD = c_.HD(), H = c_.H, F = c_.F, S2 = c_.S2();
     const LayerIdx& x = li_[n];
     const LayerW& w = lw_[n];
-    LayerA& a = la_[n];
-    float* st = stats_ + 6 * n;
+    LayerA const& a = la_[n];
+    float* st = stats_ + size_t(6) * n;
 
     tic(s, "norm+elementwise");
     rmsnorm_fwd(h_, a.xh1, a.rstd1, M, D, s);
@@ -373,7 +376,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
         s);
     toc(s);
     const BankWrites bw = writes(n, b);
-    if (a.ckpt) {
+    if (a.ckpt != nullptr) {
         tic(s, "bank_fwd");
         bank_checkpoint(bw, a.ckpt, carry_, cflags_, s);  // the adjoint's scratch is free in the forward
         toc(s);
@@ -381,7 +384,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q, a.gr, p(x.ltau), 2, a.o1, nullptr, nullptr, nullptr, nullptr, nullptr, a.zpre}, s);
     toc(s);
-    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 1))) {  // analysis: a silenced read adds nothing
+    if (silence_.size() <= size_t(n) || !((silence_[size_t(n)] & 1) != 0)) {  // analysis: a silenced read adds nothing
         mm(s, false, false, M, D, HD, a.o1, HD, w.Wo, D, h_, D, Out::F32, 1.f);
     }
     tic(s, "norm+elementwise");
@@ -390,7 +393,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     // U = gelu(xh2 W1' + b1) with the pre-activation Z kept (aux), then h += U W2 + b2: both in GEMM epilogues
     mm(s, false, false, M, F, D, a.xh2, D, w.W1, F, a.U, F, Out::BF16, 0.f,
        Epilogue{Epilogue::GeluAuxBias, w.b1, nullptr, a.Z, F});
-    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 4))) {  // analysis: a silenced FFN adds nothing
+    if (silence_.size() <= size_t(n) || !((silence_[size_t(n)] & 4) != 0)) {  // analysis: a silenced FFN adds nothing
         mm(s, false, false, M, D, F, a.U, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2)});
     }
     if (c_.hops_of(n) == 1) { return; }
@@ -404,7 +407,7 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     tic(s, "bank_fwd");
     bank_fwd(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, a.o2, nullptr, nullptr, nullptr, nullptr, nullptr}, s);
     toc(s);
-    if (!(silence_.size() > size_t(n) && (silence_[size_t(n)] & 2))) {
+    if (silence_.size() <= size_t(n) || !((silence_[size_t(n)] & 2) != 0)) {
         mm(s, false, false, M, D, HD, a.o2, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
     }
 }
@@ -414,7 +417,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     const LayerIdx& x = li_[n];
     const LayerW& w = lw_[n];
     const LayerA& a = la_[n];
-    const float* st = stats_ + 6 * n;
+    const float* st = stats_ + size_t(6) * n;
     const float count = float(M) * H;
     const BankWrites bw = writes(n, b);
     const bool two = c_.hops_of(n) == 2;
@@ -528,8 +531,8 @@ void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
         mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eo, E0, logits_, V, Out::F32);
         tic(s, "ce_softmax");
         ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s,
-                row_loss_ ? row_loss_ + r0 : nullptr, b.w ? b.w + r0 : nullptr, b.lp_old ? b.lp_old + r0 : nullptr,
-                b.tis_cap, b.clip_low, b.clip_high);
+                (row_loss_ != nullptr) ? row_loss_ + r0 : nullptr, (b.w != nullptr) ? b.w + r0 : nullptr,
+                (b.lp_old != nullptr) ? b.lp_old + r0 : nullptr, b.tis_cap, b.clip_low, b.clip_high);
         toc(s);
         if (!backward) { continue; }
         mm(s, false, false, rows, E0, V, dlog_, V, Eo, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
@@ -571,12 +574,12 @@ void Model::forward_backward(const Batch& b, cudaStream_t s, bool accumulate) {
 }
 
 void Model::keep_row_loss() {
-    if (!row_loss_) { row_loss_ = alloc<float>(size_t(c_.M())); }
+    if (row_loss_ == nullptr) { row_loss_ = alloc<float>(size_t(c_.M())); }
 }
 
 std::vector<float> Model::row_loss(cudaStream_t s) {
     std::vector<float> out(size_t(c_.M()), 0.f);
-    if (row_loss_) {
+    if (row_loss_ != nullptr) {
         LBC_CUDA(cudaMemcpyAsync(out.data(), row_loss_, out.size() * 4, cudaMemcpyDeviceToHost, s));
         LBC_CUDA(cudaStreamSynchronize(s));
     }
@@ -587,7 +590,7 @@ std::vector<bf16> Model::download_read(int n, int which, cudaStream_t s) {
     const LayerA& a = la_[size_t(n)];
     const bf16* p = which == 0 ? a.q : which == 1 ? a.q2 : which == 2 ? a.o1 : which == 3 ? a.o2 : a.k;
     std::vector<bf16> out;
-    if (!p) { return out; }
+    if (p == nullptr) { return out; }
     out.resize(size_t(c_.M()) * c_.HD());
     LBC_CUDA(cudaMemcpyAsync(out.data(), p, out.size() * sizeof(bf16), cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaStreamSynchronize(s));
@@ -627,7 +630,7 @@ StepMetrics Model::decode_metrics(const float* r) const {
     const float count = float(c_.M()) * c_.H * float(accum_);  // gate stats summed over the update's micro-batches
     int twos = 0;
     for (int n = 0; n < c_.L; ++n) {
-        const float* st = r + 2 + 6 * n;
+        const float* st = r + 2 + size_t(6) * n;
         m.open_w += st[1] / count / c_.L;
         m.open_r1 += st[3] / count / c_.L;
         if (c_.hops_of(n) == 2) {
@@ -635,14 +638,14 @@ StepMetrics Model::decode_metrics(const float* r) const {
             ++twos;
         }
     }
-    m.open_r2 = twos ? m.open_r2 / twos : -1.f;
+    m.open_r2 = (twos != 0) ? m.open_r2 / twos : -1.f;
     m.grad_norm = std::sqrt(r[2 + 6 * c_.L]);
     m.lr = r[3 + 6 * c_.L];
     return m;
 }
 
 size_t Model::embedding_params() const {
-    size_t n = size_t(c_.V) * c_.E0;
+    size_t const n = size_t(c_.V) * c_.E0;
     return c_.tied ? n : 2 * n;
 }
 
@@ -673,10 +676,10 @@ void Model::decisions(int n,
     LBC_CUDA(cudaMemcpyAsync(ridx.data(), la_[n].ridx, MH * 2, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(gw.data(), la_[n].gw, MH, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(gr.data(), la_[n].gr, MH, cudaMemcpyDeviceToHost, s));
-    if (la_[n].gr2) {
+    if (la_[n].gr2 != nullptr) {
         LBC_CUDA(cudaMemcpyAsync(gr2.data(), la_[n].gr2, MH, cudaMemcpyDeviceToHost, s));
     } else {
-        std::fill(gr2.begin(), gr2.end(), uint8_t(0));
+        std::ranges::fill(gr2, uint8_t(0));
     }
     LBC_CUDA(cudaStreamSynchronize(s));
 }

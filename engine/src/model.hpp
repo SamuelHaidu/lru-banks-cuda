@@ -85,10 +85,10 @@ struct StepMetrics {
 
 // device pointers (fixed across steps, so a step can be a CUDA graph); inv_n = 1 / targets, from the loader
 struct Batch {
-    const int* ids;
-    const int* y;
-    const uint8_t* reset;
-    const float* inv_n;
+    const int* ids{};
+    const int* y{};
+    const uint8_t* reset{};
+    const float* inv_n{};
     const float* w = nullptr;       // RL: per-token weight of the loss (the advantage); null: 1
     const float* lp_old = nullptr;  // RL: the rollout's log-probability of each target (truncated importance weights)
     float tis_cap = 2.f;
@@ -103,6 +103,8 @@ class Model {
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
+    Model(Model&&) = delete;
+    Model& operator=(Model&&) = delete;
 
     // loss and every gradient (gradients zeroed first, unless `accumulate`: added to the previous micro-batches')
     void forward_backward(const Batch& batch, cudaStream_t s, bool accumulate = false);
@@ -172,8 +174,9 @@ class Model {
 
   private:
     struct LayerIdx {  // tensor indices (-1: absent, the hop-2 tensors of a 1-hop layer)
-        int norm1, Wa, nu, theta, Ws, bk, brg, bwg, R, ltau, ltau2 = -1, Wo, Wo2 = -1, ffn_norm, W1, b1, W2, b2,
-                                                             q2_norm = -1, Wq2 = -1, brg2 = -1;
+        int norm1 = -1, Wa = -1, nu = -1, theta = -1, Ws = -1, bk = -1, brg = -1, bwg = -1, R = -1, ltau = -1;
+        int ltau2 = -1, Wo = -1, Wo2 = -1, ffn_norm = -1, W1 = -1, b1 = -1, W2 = -1, b2 = -1;
+        int q2_norm = -1, Wq2 = -1, brg2 = -1;
     };
 
     struct LayerW {  // bf16 GEMM weights (and the FFN's first bias: the GELU epilogue takes it in bf16)

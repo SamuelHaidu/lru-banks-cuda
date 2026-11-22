@@ -32,10 +32,12 @@ class L2Flusher {
         LBC_CUDA(cudaMalloc(&buf_, bytes_));
     }
 
-    ~L2Flusher() { cudaFree(buf_); }
+    ~L2Flusher() { LBC_CUDA_CLEANUP(cudaFree(buf_)); }
 
     L2Flusher(const L2Flusher&) = delete;
     L2Flusher& operator=(const L2Flusher&) = delete;
+    L2Flusher(L2Flusher&&) = delete;
+    L2Flusher& operator=(L2Flusher&&) = delete;
 
     void flush(cudaStream_t stream) { LBC_CUDA(cudaMemsetAsync(buf_, 0, bytes_, stream)); }
 
@@ -46,10 +48,10 @@ class L2Flusher {
 
 // Runs `fn(stream)` `warmup` times, then `runs` timed times (one event pair each). `fn` launches work on `stream`.
 template <class Fn>
-Stats time_it(Fn&& fn, cudaStream_t stream, int warmup = 3, int runs = 20, L2Flusher* flusher = nullptr) {
+Stats time_it(Fn fn, cudaStream_t stream, int warmup = 3, int runs = 20, L2Flusher* flusher = nullptr) {
     for (int i = 0; i < warmup; ++i) { fn(stream); }
     LBC_CUDA(cudaGetLastError());
-    cudaEvent_t start, stop;
+    cudaEvent_t start = nullptr, stop = nullptr;
     LBC_CUDA(cudaEventCreate(&start));
     LBC_CUDA(cudaEventCreate(&stop));
     std::vector<double> ms(static_cast<std::size_t>(runs));
@@ -67,7 +69,7 @@ Stats time_it(Fn&& fn, cudaStream_t stream, int warmup = 3, int runs = 20, L2Flu
     LBC_CUDA(cudaEventDestroy(start));
     LBC_CUDA(cudaEventDestroy(stop));
     std::vector<double> sorted = ms;
-    std::sort(sorted.begin(), sorted.end());
+    std::ranges::sort(sorted);
     const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / runs;
     return {sorted[sorted.size() / 2], sorted.front(), mean, runs};
 }

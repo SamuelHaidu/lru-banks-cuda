@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -24,6 +25,8 @@ class TokenFile {
     ~TokenFile();
     TokenFile(const TokenFile&) = delete;
     TokenFile& operator=(const TokenFile&) = delete;
+    TokenFile(TokenFile&&) = delete;
+    TokenFile& operator=(TokenFile&&) = delete;
 
     const uint16_t* data() const { return data_; }
 
@@ -68,11 +71,15 @@ class Loader {
            Span span = {});
 
     // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
-    static size_t steps_per_pass(size_t tokens, int B, int T) { return tokens > size_t(T) ? (tokens - T) / T / B : 0; }
+    static size_t steps_per_pass(size_t tokens, int B, int T) {
+        return std::cmp_greater(tokens, T) ? (tokens - T) / T / B : 0;
+    }
 
     ~Loader();
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
+    Loader(Loader&&) = delete;
+    Loader& operator=(Loader&&) = delete;
 
     HostBatch* next();                                 // blocks until the next batch is ready
     void release(HostBatch* hb, cudaStream_t stream);  // call after queuing its copies on `stream`: refilled once done
@@ -118,6 +125,8 @@ class MixLoader {
     ~MixLoader();
     MixLoader(const MixLoader&) = delete;
     MixLoader& operator=(const MixLoader&) = delete;
+    MixLoader(MixLoader&&) = delete;
+    MixLoader& operator=(MixLoader&&) = delete;
     HostBatch* next();                                 // blocks until every source's next batch is ready
     void release(HostBatch* hb, cudaStream_t stream);  // after queuing its copies on `stream`
 
@@ -154,6 +163,8 @@ class ValidationSet {
     ~ValidationSet();
     ValidationSet(const ValidationSet&) = delete;
     ValidationSet& operator=(const ValidationSet&) = delete;
+    ValidationSet(ValidationSet&&) = delete;
+    ValidationSet& operator=(ValidationSet&&) = delete;
 
     int steps() const { return int(batches_.size()); }
 

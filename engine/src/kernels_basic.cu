@@ -12,13 +12,13 @@ constexpr unsigned FULL = 0xffffffffu;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o; o >>= 1) { v += __shfl_xor_sync(FULL, v, o); }
+    for (int o = 16; o != 0; o >>= 1) { v += __shfl_xor_sync(FULL, v, o); }
     return v;
 }
 
 __device__ __forceinline__ float warp_max(float v) {
 #pragma unroll
-    for (int o = 16; o; o >>= 1) { v = fmaxf(v, __shfl_xor_sync(FULL, v, o)); }
+    for (int o = 16; o != 0; o >>= 1) { v = fmaxf(v, __shfl_xor_sync(FULL, v, o)); }
     return v;
 }
 
@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(256) k_rmsnorm_bwd(const float* __restrict__ d
                                                      int acc) {
     __shared__ float s_col[1024];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5, nd = D / 32;
-    if (colsum) {
+    if (colsum != nullptr) {
         for (int j = threadIdx.x; j < D; j += blockDim.x) { s_col[j] = 0.f; }
     }
     float cs[32];
@@ -104,14 +104,14 @@ __global__ void __launch_bounds__(256) k_rmsnorm_bwd(const float* __restrict__ d
             if (i < nd) {
                 const int j = lane + 32 * i;
                 float v = r * (g[j] - __bfloat162float(y[j]) * dot);
-                if (acc) { v += out[j]; }
+                if (acc != 0) { v += out[j]; }
                 out[j] = v;
                 outb[j] = __float2bfloat16(v);
                 cs[i] += v;
             }
         }
     }
-    if (!colsum) { return; }
+    if (colsum == nullptr) { return; }
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
@@ -215,11 +215,11 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
     const float* l = logits + row * V;
-    bf16* d = dlogits ? dlogits + row * V : nullptr;
+    bf16* d = (dlogits != nullptr) ? dlogits + row * V : nullptr;
     const int target = y[row];
     if (target < 0) {
-        if (row_loss && threadIdx.x == 0) { row_loss[row] = 0.f; }
-        if (d) {
+        if ((row_loss != nullptr) && threadIdx.x == 0) { row_loss[row] = 0.f; }
+        if (d != nullptr) {
             for (int j = threadIdx.x; j < V; j += blockDim.x) { d[j] = __float2bfloat16(0.f); }
         }
         return;
@@ -240,9 +240,9 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     m = mb;
     const float inv = 1.f / s;
     const float nll = logf(s) + m - l[target];
-    if (w) {  // per-token weight (an RL advantage), times the truncated importance ratio p_now / p_rollout
+    if (w != nullptr) {  // per-token weight (an RL advantage), times the truncated importance ratio p_now / p_rollout
         float wt = w[row];
-        if (lp_old) {
+        if (lp_old != nullptr) {
             const float ratio = __expf(-nll - lp_old[row]);
             // PPO clip (clip_high > 0): no gradient once the ratio left [1 - low, 1 + high] in the advantage's
             // direction (DAPO's clip-higher: high > low)
@@ -253,7 +253,7 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
         }
         inv_n *= wt;
     }
-    if (d) {
+    if (d != nullptr) {
         for (int j = threadIdx.x; j < V; j += blockDim.x) {
             float p = __expf(l[j] - m) * inv;
             if (j == target) { p -= 1.f; }
@@ -262,7 +262,7 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     }
     if (threadIdx.x == 0) {
         atomicAdd(loss_sum, nll * inv_n);
-        if (row_loss) { row_loss[row] = nll; }
+        if (row_loss != nullptr) { row_loss[row] = nll; }
         if (l[target] >= m) {
             atomicAdd(correct_sum, inv_n);  // the target is the row's (first) maximum
         }
@@ -295,7 +295,7 @@ __global__ void k_adamw(float* __restrict__ p,
                         float* __restrict__ lr_out) {
     const float bc1 = 1.f - powf(b1, float(*step)), bc2 = 1.f - powf(b2, float(*step));
     const float lr = schedule_lr(sched, *step - 1);  // *step counts this update already
-    if (blockIdx.x == 0 && threadIdx.x == 0 && lr_out) { *lr_out = lr; }
+    if (blockIdx.x == 0 && threadIdx.x == 0 && (lr_out != nullptr)) { *lr_out = lr; }
     const float norm = sqrtf(*gsq);
     if (!isfinite(norm)) {
         return;  // a non-finite gradient: skip the update (weights and moments unchanged)
@@ -308,7 +308,7 @@ __global__ void k_adamw(float* __restrict__ p,
         m[i] = mi;
         v[i] = vi;
         float pi = p[i];
-        if (decay[i]) { pi -= lr * wd * pi; }
+        if (decay[i] != 0u) { pi -= lr * wd * pi; }
         p[i] = pi - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
     }
 }
@@ -322,7 +322,7 @@ __global__ void k_prep_weight(const float* __restrict__ W,
                               int cols) {
     const size_t n = size_t(rows) * cols;
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
-        Wb[i] = __float2bfloat16(gain ? gain[i / cols] * W[i] : W[i]);
+        Wb[i] = __float2bfloat16((gain != nullptr) ? gain[i / cols] * W[i] : W[i]);
     }
 }
 
@@ -335,14 +335,14 @@ __global__ void k_unfold_grad(const float* __restrict__ dWp,
                               int cols) {
     const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= rows) { return; }
-    const float g = gain ? gain[row] : 1.f;
+    const float g = (gain != nullptr) ? gain[row] : 1.f;
     float acc = 0.f;
     for (int j = lane; j < cols; j += 32) {
         const size_t i = size_t(row) * cols + j;
         dW[i] += g * dWp[i];
         acc += W[i] * dWp[i];
     }
-    if (gain) {
+    if (gain != nullptr) {
         acc = warp_sum(acc);
         if (lane == 0) { dgain[row] += acc; }
     }
@@ -368,7 +368,7 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) k_sample(const float* __restri
     const float* x = logits + size_t(r) * V;
     const bool greedy = temp <= 0.f;
     const float it = greedy ? 1.f : 1.f / temp;
-    const uint64_t k = key ? key[r] : 0;
+    const uint64_t k = (key != nullptr) ? key[r] : 0;
     float mx = -INFINITY, best = -INFINITY;
     int bi = 0x7fffffff;
     for (int v = tid; v < V; v += SAMPLE_THREADS) {
@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) k_sample(const float* __restri
     }
     __shared__ float s_m[32], s_b[32];
     __shared__ int s_i[32];
-    for (int o = 16; o; o >>= 1) {
+    for (int o = 16; o != 0; o >>= 1) {
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
         const float ob = __shfl_xor_sync(0xffffffffu, best, o);
         const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
@@ -405,7 +405,7 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) k_sample(const float* __restri
         mx = s_m[lane];
         best = s_b[lane];
         bi = s_i[lane];
-        for (int o = 16; o; o >>= 1) {
+        for (int o = 16; o != 0; o >>= 1) {
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
             const float ob = __shfl_xor_sync(0xffffffffu, best, o);
             const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
@@ -437,7 +437,7 @@ __global__ void __launch_bounds__(SAMPLE_THREADS) k_sample(const float* __restri
         sz += e * z;
     }
     __syncthreads();
-    for (int o = 16; o; o >>= 1) {
+    for (int o = 16; o != 0; o >>= 1) {
         se += __shfl_xor_sync(0xffffffffu, se, o);
         sz += __shfl_xor_sync(0xffffffffu, sz, o);
     }
@@ -488,7 +488,9 @@ void rmsnorm_bwd(const float* dxh,
                  int D,
                  bool accumulate,
                  cudaStream_t s) {
-    if (D % 32 || D > 1024) { fail("rmsnorm_bwd", "D must be a multiple of 32, at most 1024", __FILE__, __LINE__); }
+    if (((D % 32) != 0) || D > 1024) {
+        fail("rmsnorm_bwd", "D must be a multiple of 32, at most 1024", __FILE__, __LINE__);
+    }
     k_rmsnorm_bwd<<<(M + RMS_BWD_ROWS - 1) / RMS_BWD_ROWS, 256, 0, s>>>(dxh, xh, rstd, dh, dhb, colsum, M, D,
                                                                         accumulate ? 1 : 0);
     LBC_CUDA(cudaGetLastError());
@@ -616,7 +618,7 @@ void sample_rows(const float* logits,
 
 void copy_rows(void* buf, size_t bytes, const int2* pairs, int n, cudaStream_t s) {
     if (n <= 0) { return; }
-    if (bytes % 16) { fail("copy_rows", "row bytes must be a multiple of 16", __FILE__, __LINE__); }
+    if ((bytes % 16) != 0u) { fail("copy_rows", "row bytes must be a multiple of 16", __FILE__, __LINE__); }
     k_copy_rows<<<n, 256, 0, s>>>(static_cast<uint4*>(buf), bytes / 16, pairs);
     LBC_CUDA(cudaGetLastError());
 }

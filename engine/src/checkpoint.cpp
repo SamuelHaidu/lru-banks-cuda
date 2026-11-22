@@ -31,7 +31,7 @@ json::Value manifest(const Model& model) {
 
 struct Header {
     json::Value h;
-    size_t data_offset;
+    size_t data_offset = 0;
 };
 
 Header read_header(const std::string& path, std::ifstream& f) {
@@ -108,7 +108,7 @@ void load_checkpoint(const std::string& path, Model& model, cudaStream_t s) {
     if (!f) { throw std::runtime_error("cannot read " + path); }
     const Header hd = read_header(path, f);
     const json::Value* tensors = hd.h.find("tensors");
-    if (!tensors || *tensors != manifest(model)) {
+    if ((tensors == nullptr) || *tensors != manifest(model)) {
         throw std::runtime_error(path + ": its tensors (names, shapes, layout) differ from this model's");
     }
     const size_t n = model.num_params();
@@ -131,7 +131,7 @@ void load_weights(const std::string& path, Model& model, cudaStream_t s) {
     if (!f) { throw std::runtime_error("cannot read " + path); }
     const Header hd = read_header(path, f);
     const json::Value* tensors = hd.h.find("tensors");
-    if (!tensors || *tensors != manifest(model)) {
+    if ((tensors == nullptr) || *tensors != manifest(model)) {
         throw std::runtime_error(path + ": its tensors (names, shapes, layout) differ from this model's");
     }
     std::vector<float> buf(model.num_params());

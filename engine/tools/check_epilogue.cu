@@ -16,7 +16,7 @@ namespace {
 
 double gelu_tanh(double z) { return 0.5 * z * (1 + std::tanh(0.7978845608028654 * (z + 0.044715 * z * z * z))); }
 
-double gelu_erf(double z) { return 0.5 * z * (1 + std::erf(z / std::sqrt(2.0))); }
+double gelu_erf(double z) { return 0.5 * z * (1 + std::erf(z / std::numbers::sqrt2)); }
 
 double gelu_tanh_grad(double z) {
     const double t = std::tanh(0.7978845608028654 * (z + 0.044715 * z * z * z));
@@ -27,7 +27,7 @@ double bf(float x) { return double(__bfloat162float(__float2bfloat16(x))); }
 
 template <class T>
 T* dev(const std::vector<T>& h) {
-    T* d;
+    T* d = nullptr;
     LBC_CUDA(cudaMalloc(&d, h.size() * sizeof(T)));
     LBC_CUDA(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
     return d;
@@ -44,7 +44,7 @@ std::vector<T> host(const T* d, size_t n) {
 
 int main() {
     const int M = 256, N = 128, K = 64;
-    std::mt19937 rng(0);
+    std::mt19937 rng(0);  // NOLINT(cert-msc32-c,cert-msc51-cpp): a fixed seed, reproducible checks
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<bf16> A(size_t(M) * K), B(size_t(K) * N);
     std::vector<float> bias(N);
@@ -70,13 +70,13 @@ int main() {
     bf16 *dA = dev(A), *dB = dev(B);
     float* dbias = dev(bias);
     bf16* dbiasb = dev(biasb);
-    bf16 *dD, *daux;
+    bf16 *dD = nullptr, *daux = nullptr;
     LBC_CUDA(cudaMalloc(&dD, size_t(M) * N * sizeof(bf16)));
     LBC_CUDA(cudaMalloc(&daux, size_t(M) * N * sizeof(bf16)));
     bool ok = true;
 
     // 1. GeluAuxBias: aux = AB + bias, D = gelu(aux)
-    Epilogue e1{Epilogue::GeluAuxBias, dbiasb, nullptr, daux, N};
+    Epilogue const e1{Epilogue::GeluAuxBias, dbiasb, nullptr, daux, N};
     g.run(nullptr, false, false, M, N, K, dA, K, dB, N, dD, N, Out::BF16, 0.f, 1.f, e1);
     LBC_CUDA(cudaDeviceSynchronize());
     const auto D1 = host(dD, size_t(M) * N), aux = host(daux, size_t(M) * N);
@@ -92,9 +92,9 @@ int main() {
     ok &= e_aux < 2e-2 && e_tanh < 6e-2;
     // which GELU: an fp32 output (fp32 bias) resolves the tanh / erf difference (up to ~5e-4)
     {
-        float* dD32g;
+        float* dD32g = nullptr;
         LBC_CUDA(cudaMalloc(&dD32g, size_t(M) * N * sizeof(float)));
-        Epilogue eg{Epilogue::GeluBias, dbias, nullptr, nullptr, 0};
+        Epilogue const eg{Epilogue::GeluBias, dbias, nullptr, nullptr, 0};
         g.run(nullptr, false, false, M, N, K, dA, K, dB, N, dD32g, N, Out::F32, 0.f, 1.f, eg);
         LBC_CUDA(cudaDeviceSynchronize());
         const auto Dg = host(dD32g, size_t(M) * N);
@@ -110,9 +110,9 @@ int main() {
     }
 
     // 2. DGeluBgrad: D = AB * gelu'(aux), bias_grad[j] = sum_i D[i][j]
-    bf16* dbg;
+    bf16* dbg = nullptr;
     LBC_CUDA(cudaMalloc(&dbg, N * sizeof(bf16)));
-    Epilogue e2{Epilogue::DGeluBgrad, nullptr, dbg, daux, N};
+    Epilogue const e2{Epilogue::DGeluBgrad, nullptr, dbg, daux, N};
     g.run(nullptr, false, false, M, N, K, dA, K, dB, N, dD, N, Out::BF16, 0.f, 1.f, e2);
     LBC_CUDA(cudaDeviceSynchronize());
     const auto D2 = host(dD, size_t(M) * N);
@@ -135,7 +135,7 @@ int main() {
     std::vector<float> D0(size_t(M) * N);
     for (auto& x : D0) { x = nd(rng); }
     float* dD32 = dev(D0);
-    Epilogue e3{Epilogue::Bias, dbias, nullptr, nullptr, 0};
+    Epilogue const e3{Epilogue::Bias, dbias, nullptr, nullptr, 0};
     g.run(nullptr, false, false, M, N, K, dA, K, dB, N, dD32, N, Out::F32, 1.f, 1.f, e3);
     LBC_CUDA(cudaDeviceSynchronize());
     const auto D3 = host(dD32, size_t(M) * N);
