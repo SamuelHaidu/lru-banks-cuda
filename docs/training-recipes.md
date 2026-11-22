@@ -142,7 +142,9 @@ Comparison from the same start (`best-u1600`, 21.75% full test), all with the fi
 | RAFT | 20.8 / 22.8% | 1.7 (rising) | ~25 | explores but drifts; longer rollouts |
 | GRPO | 18.75 / - | 0.056 | ~480 | converges on one solution |
 | GRPO + novelty 0.5 | 21.0 / - | 0.062 | ~458 | stops the accuracy loss, not the convergence |
-| **GRPO + novelty 1.0** | 20.5 / 22.3%, best 23.70% at 950 | **0.25, stable** | **~5** | stable and exploring; ~2.1-2.4 s per update on the RTX 5090 |
+| **GRPO + novelty 1.0** | 20.5 / 22.3%; **26.76% at 2900** (3,150 updates) | **0.22-0.26, stable** | **0-6** | stable and exploring for 3,150 updates; ~2.6 s per update on the RTX 5090 |
+
+Result of the full run (`runs/rl-ab-nov10`, 3,150 updates, ~2.4 h on the RTX 5090): **26.76% on the full Calc-X test at update 2900** (`checkpoints/best.lbc`; SFT 10.15%), final 25.02%, pretraining val 2.1972, ARC-Easy 38.85 / 34.64 [T43].
 
 Checkpoints: `model.lbc` (latest, the resume point: raise `updates` in `grpo.json` and run `lbc grpo` again; it
 continues with the optimizer state), `checkpoints/best.lbc` (best full-test accuracy). Every eval writes
