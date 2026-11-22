@@ -19,6 +19,8 @@ THREE = {"gold": "18", "steps": [13.0, 9.0, 18.0], "qnums": [16.0, 3.0, 4.0, 2.0
 
 
 class TestStepCredit(unittest.TestCase):
+    @unittest.skipUnless((calcx.DATA / "test.docs.jsonl").exists(),
+                         "needs the Calc-X dataset: uv run --with pyarrow python datasets/build_calc_x.py --download")
     def test_reference_steps_are_read_from_the_document(self):
         items = calcx.load_questions(calcx.DATA / "test.docs.jsonl", ["svamp"], with_steps=True)
         dvd = next(it for it in items if it["id"] == "svamp__chal-1")
