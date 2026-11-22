@@ -168,8 +168,10 @@ __global__ void __launch_bounds__(256) k_scale_cols_bwd(const bf16* __restrict__
 __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logits, const int* __restrict__ y,
                                                  bf16* __restrict__ dlogits, float* __restrict__ loss_sum,
                                                  float* __restrict__ correct_sum, int V,
-                                                 const float* __restrict__ inv_n_ptr, float* __restrict__ row_loss) {
-    const float inv_n = *inv_n_ptr;
+                                                 const float* __restrict__ inv_n_ptr, float* __restrict__ row_loss,
+                                                 const float* __restrict__ w, const float* __restrict__ lp_old,
+                                                 float tis_cap, float clip_low, float clip_high) {
+    float inv_n = *inv_n_ptr;
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
     const float* l = logits + row * V;
@@ -196,6 +198,19 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
     s = block_sum(m > -INFINITY ? s * __expf(m - mb) : 0.f, sh);
     m = mb;
     const float inv = 1.f / s;
+    const float nll = logf(s) + m - l[target];
+    if (w) {  // per-token weight (an RL advantage), times the truncated importance ratio p_now / p_rollout
+        float wt = w[row];
+        if (lp_old) {
+            const float ratio = __expf(-nll - lp_old[row]);
+            // PPO clip (clip_high > 0): no gradient once the ratio left [1 - low, 1 + high] in the advantage's
+            // direction (DAPO's clip-higher: high > low)
+            if (clip_high > 0.f && ((wt > 0.f && ratio > 1.f + clip_high) || (wt < 0.f && ratio < 1.f - clip_low)))
+                wt = 0.f;
+            wt *= fminf(ratio, tis_cap);
+        }
+        inv_n *= wt;
+    }
     if (d)
         for (int j = threadIdx.x; j < V; j += blockDim.x) {
             float p = __expf(l[j] - m) * inv;
@@ -203,8 +218,8 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
             d[j] = __float2bfloat16(p * inv_n);
         }
     if (threadIdx.x == 0) {
-        atomicAdd(loss_sum, (logf(s) + m - l[target]) * inv_n);
-        if (row_loss) row_loss[row] = logf(s) + m - l[target];
+        atomicAdd(loss_sum, nll * inv_n);
+        if (row_loss) row_loss[row] = nll;
         if (l[target] >= m) atomicAdd(correct_sum, inv_n);  // the target is the row's (first) maximum
     }
 }
@@ -225,6 +240,7 @@ __global__ void k_adamw(float* __restrict__ p, const float* __restrict__ g, floa
     const float lr = schedule_lr(sched, *step - 1);  // *step counts this update already
     if (blockIdx.x == 0 && threadIdx.x == 0 && lr_out) *lr_out = lr;
     const float norm = sqrtf(*gsq);
+    if (!isfinite(norm)) return;  // a non-finite gradient: skip the update (weights and moments unchanged)
     const float scale = (clip > 0.f && norm > clip) ? clip / (norm + 1e-6f) : 1.f;
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         const float gi = g[i] * scale;
@@ -263,6 +279,120 @@ __global__ void k_unfold_grad(const float* __restrict__ dWp, const float* __rest
         acc = warp_sum(acc);
         if (lane == 0) dgain[row] += acc;
     }
+}
+
+__device__ __forceinline__ uint64_t mix64(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+constexpr int SAMPLE_THREADS = 1024;
+
+__global__ void __launch_bounds__(SAMPLE_THREADS) k_sample(const float* __restrict__ logits, int V, float temp,
+                                                         const uint64_t* __restrict__ key, int* __restrict__ tok,
+                                                         float* __restrict__ logp, float* __restrict__ ent) {
+    const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* x = logits + size_t(r) * V;
+    const bool greedy = temp <= 0.f;
+    const float it = greedy ? 1.f : 1.f / temp;
+    const uint64_t k = key ? key[r] : 0;
+    float mx = -INFINITY, best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int v = tid; v < V; v += SAMPLE_THREADS) {
+        const float z = x[v] * it;
+        mx = fmaxf(mx, z);
+        float score = z;
+        if (!greedy) {
+            const double u = (double(mix64(k ^ (uint64_t(v) * 0xD6E8FEB86659FD93ULL)) >> 11) + 0.5) * 0x1.0p-53;
+            score = z - logf(-logf(float(u)));
+        }
+        if (score > best || (score == best && v < bi)) {
+            best = score;
+            bi = v;
+        }
+    }
+    __shared__ float s_m[32], s_b[32];
+    __shared__ int s_i[32];
+    for (int o = 16; o; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ob > best || (ob == best && oi < bi)) {
+            best = ob;
+            bi = oi;
+        }
+    }
+    if (lane == 0) {
+        s_m[warp] = mx;
+        s_b[warp] = best;
+        s_i[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        mx = s_m[lane];
+        best = s_b[lane];
+        bi = s_i[lane];
+        for (int o = 16; o; o >>= 1) {
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ob > best || (ob == best && oi < bi)) {
+                best = ob;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            s_m[0] = mx;
+            s_i[0] = bi;
+        }
+    }
+    __syncthreads();
+    mx = s_m[0];
+    bi = s_i[0];
+    if (bi < 0 || bi >= V) {  // no finite candidate (NaN logits): report it as token -1
+        if (tid == 0) {
+            tok[r] = -1;
+            logp[r] = NAN;
+            ent[r] = NAN;
+        }
+        return;
+    }
+    float se = 0.f, sz = 0.f;
+    for (int v = tid; v < V; v += SAMPLE_THREADS) {
+        const float z = x[v] * it, e = __expf(z - mx);
+        se += e;
+        sz += e * z;
+    }
+    __syncthreads();
+    for (int o = 16; o; o >>= 1) {
+        se += __shfl_xor_sync(0xffffffffu, se, o);
+        sz += __shfl_xor_sync(0xffffffffu, sz, o);
+    }
+    if (lane == 0) {
+        s_m[warp] = se;
+        s_b[warp] = sz;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        se = sz = 0.f;
+        for (int i = 0; i < SAMPLE_THREADS / 32; ++i) {
+            se += s_m[i];
+            sz += s_b[i];
+        }
+        const float lse = mx + logf(se);
+        tok[r] = bi;
+        logp[r] = x[bi] * it - lse;
+        ent[r] = lse - sz / se;
+    }
+}
+
+__global__ void k_copy_rows(uint4* buf, size_t row_u4, const int2* pairs) {
+    const int2 p = pairs[blockIdx.x];
+    uint4* d = buf + size_t(p.x) * row_u4;
+    const uint4* s = buf + size_t(p.y) * row_u4;
+    for (size_t i = threadIdx.x; i < row_u4; i += blockDim.x) d[i] = s[i];
 }
 
 int blocks_for(size_t n, int threads = 256) {
@@ -326,8 +456,10 @@ void embed_scatter(const int* ids, const float* dx, float* dE, int M, int E0, cu
 }
 
 void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
-             const float* inv_n, cudaStream_t s, float* row_loss) {
-    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n, row_loss);
+             const float* inv_n, cudaStream_t s, float* row_loss, const float* w, const float* lp_old, float tis_cap,
+             float clip_low, float clip_high) {
+    k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n, row_loss, w, lp_old, tis_cap,
+                                   clip_low, clip_high);
     LBC_CUDA(cudaGetLastError());
 }
 
@@ -357,6 +489,20 @@ void prep_weight(const float* W, const float* gain, bf16* Wb, int rows, int cols
 void unfold_grad(const float* dWp, const float* W, const float* gain, float* dW, float* dgain, int rows, int cols,
                  cudaStream_t s) {
     k_unfold_grad<<<(rows + 7) / 8, 256, 0, s>>>(dWp, W, gain, dW, dgain, rows, cols);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void sample_rows(const float* logits, int R, int V, float temperature, const uint64_t* key, int* tok, float* logp,
+                 float* ent, cudaStream_t s) {
+    if (R <= 0) return;
+    k_sample<<<R, SAMPLE_THREADS, 0, s>>>(logits, V, temperature, key, tok, logp, ent);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void copy_rows(void* buf, size_t bytes, const int2* pairs, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    if (bytes % 16) fail("copy_rows", "row bytes must be a multiple of 16", __FILE__, __LINE__);
+    k_copy_rows<<<n, 256, 0, s>>>(static_cast<uint4*>(buf), bytes / 16, pairs);
     LBC_CUDA(cudaGetLastError());
 }
 

@@ -33,7 +33,11 @@ void scale_cols_bwd(const bf16* dy, const bf16* x, const float* g, float* dx, fl
 // inv_n (the accuracy); dlogits = (softmax - onehot) * inv_n, with inv_n = 1 / targets read from the device (the
 // step can be a CUDA graph). Rows with y < 0 add nothing. dlogits may be null (validation: no gradient).
 void ce_rows(const float* logits, const int* y, bf16* dlogits, float* loss_sum, float* correct_sum, int rows, int V,
-             const float* inv_n, cudaStream_t s, float* row_loss = nullptr);  // row_loss: per row (0 without target)
+             const float* inv_n, cudaStream_t s, float* row_loss = nullptr,  // row_loss: per row (0 without target)
+             const float* w = nullptr,       // per-row weight of the loss and gradient (null: 1)
+             const float* lp_old = nullptr,  // with w: the weight is w * min(p / exp(lp_old), tis_cap) (TIS)
+             float tis_cap = 2.f,
+             float clip_low = 0.f, float clip_high = 0.f);  // PPO clip of the ratio (clip_high 0: off)
 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 
@@ -45,12 +49,22 @@ struct Schedule {
     int warmup, decay_start, decay_steps;
     float min_ratio;
     int cosine = 0;
+    int cycles = 1;  // > 1: the decay repeats (warm restarts), each restart warming up from min_ratio over `warmup`
 };
 __host__ __device__ inline float schedule_lr(const Schedule& s, int step) {
     float frac = float(step + 1) / float(s.warmup > 1 ? s.warmup : 1);
     frac = frac < 1.f ? frac : 1.f;
     if (s.decay_steps > 0) {
-        float done = float(step - s.decay_start) / float(s.decay_steps);
+        int pos = step - s.decay_start;
+        const int k = pos > 0 ? pos / s.decay_steps : 0;  // the cycle
+        if (s.cycles > 1 && k >= 1 && k < s.cycles) {
+            pos -= k * s.decay_steps;
+            float w = float(pos + 1) / float(s.warmup > 1 ? s.warmup : 1);
+            frac = s.min_ratio + (1.f - s.min_ratio) * (w < 1.f ? w : 1.f);
+        }
+        float done = (s.cycles > 1 && k >= 1 && k < s.cycles) ? float(pos) / float(s.decay_steps)
+                                                              : float(step - s.decay_start) / float(s.decay_steps);
+        if (s.cycles > 1 && k >= s.cycles) done = 1.f;
         done = done < 0.f ? 0.f : (done > 1.f ? 1.f : done);
         const float shape = s.cosine ? 0.5f * (1.f + cosf(3.14159265358979f * done)) : 1.f - done;  // 1 -> 0
         frac *= s.min_ratio + (1.f - s.min_ratio) * shape;
@@ -105,6 +119,12 @@ struct AddrFwd {
     int dh = 32;                  // head size (32 or 64)
     int slots = SLOTS;            // the layer's bank size (2..SLOTS): routing picks among slots [0, slots); the
                                   // others are never written, so the reads never see them
+    // incremental decoding (one token per row, rows = active rollouts): the previous token's k_pre comes from
+    // Gprev[map[r]] (row stride ldGprev) instead of row r - 1, and the token's position from tpos[r]
+    const bf16* Gprev = nullptr;
+    int ldGprev = 0;
+    const int* map = nullptr;
+    const int* tpos = nullptr;
 };
 void addr_fwd(const AddrFwd& a, cudaStream_t s);
 
@@ -215,5 +235,25 @@ struct BankAdjoint {
     int* flags;               // [B][H][chunks] scratch
 };
 void bank_adjoint(const BankWrites& w, const BankAdjoint& a, cudaStream_t s);
+
+// -- incremental decoding (kernels_lru_addr.cu, kernels_bank.cu, kernels_basic.cu) --------------------------------
+// One token for each of R rows; row r's recurrent state lives in slot map[r] of the state buffers.
+// LRU: state [slots][2N] fp32 (h_{t-1}, updated in place), sb [R][2N] bf16 (the W_s GEMM's operand)
+void lru_step(const bf16* P, int ldp, const float* nu, const float* theta, const uint8_t* reset, const int* map,
+              float* state, bf16* sb, int R, int N, cudaStream_t st);
+// Gprev[map[r]][0, cols) = G[r][0, cols) (the keys' k_pre for the next token)
+void store_rows(const bf16* G, int ldG, int cols, const int* map, bf16* Gprev, int ldGprev, int R, cudaStream_t st);
+// the banks of one layer for one token: state [slots][H][ckpt_fields(dh)][SLOTS] (Kb, Vb, Zs, tm as bank_fwd);
+// write: apply the token's write (and reset) first, then the read r.gate_bit (2 hop 1, 8 hop 2) into r.o. w.B = R,
+// w.T = 1, the step words / k / v indexed by r; positions tpos[r].
+void bank_step(const BankWrites& w, const BankRead& r, const int* map, const int* tpos, float* state, bool write,
+               cudaStream_t s);
+// per row: sample from softmax(logits / temperature) (Gumbel-max with a counter-based hash of key[r] and the token
+// id; temperature <= 0: argmax), its log-probability under that distribution and the distribution's entropy
+void sample_rows(const float* logits, int R, int V, float temperature, const uint64_t* key, int* tok, float* logp,
+                 float* ent, cudaStream_t s);
+// copy rows of `bytes` (a multiple of 16) inside buf: dst row pairs[i].x <- src row pairs[i].y
+void copy_rows(void* buf, size_t bytes, const int2* pairs, int n, cudaStream_t s);
+
 
 }  // namespace lbc

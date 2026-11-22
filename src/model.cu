@@ -400,7 +400,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     // wrote dh (the next layer's norm1, or the final norm)
     if (two) {
         mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
-        mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32);
+        mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32, 1.f);
         tic(s, "bank_rewalk");
         bank_rewalk(bw, BankRead{a.q2, a.gr2, p(x.ltau2), 8, nullptr, dO2_, dq2_, dgr2_, coef2_, g(x.ltau2)}, s);
         toc(s);
@@ -419,7 +419,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     // FFN: h += W2 gelu(W1 rms(h) + b1) + b2; dZ = (dh W2^T) gelu'(Z) and b1's gradient from the GEMM epilogue
     mm(s, false, true, M, F, D, dhb_, D, w.W2, D, dZ_, F, Out::BF16, 0.f,
        Epilogue{Epilogue::DGeluBgrad, nullptr, db1b_, a.Z, F});
-    mm(s, true, false, F, D, M, a.U, F, dhb_, D, g(x.W2), D, Out::F32);
+    mm(s, true, false, F, D, M, a.U, F, dhb_, D, g(x.W2), D, Out::F32, 1.f);
     tic(s, "norm+elementwise");
     add_to_f32(db1b_, g(x.b1), F, s);
     toc(s);
@@ -431,7 +431,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     // hop 1: h += o1 Wo
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo, D, dO1_, HD, Out::F32);
-    mm(s, true, false, HD, D, M, a.o1, HD, dhb_, D, g(x.Wo), D, Out::F32);
+    mm(s, true, false, HD, D, M, a.o1, HD, dhb_, D, g(x.Wo), D, Out::F32, 1.f);
     tic(s, "bank_rewalk");
     bank_rewalk(bw, BankRead{a.q, a.gr, p(x.ltau), 2, nullptr, dO1_, dq1_, dgr1_, coef1_, g(x.ltau)}, s);
     toc(s);
@@ -452,7 +452,7 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
              s);
     toc(s);
     mm(s, false, true, M, S2, c_.ldG(), dG_, c_.ldG(), w.Ws, c_.ldG(), dS_, S2, Out::F32);
-    mm(s, true, false, S2, c_.ldG(), M, a.sb, S2, dG_, c_.ldG(), g(x.Ws), c_.ldG(), Out::F32);
+    mm(s, true, false, S2, c_.ldG(), M, a.sb, S2, dG_, c_.ldG(), g(x.Ws), c_.ldG(), Out::F32, 1.f);
     tic(s, "lru");
     lru_bwd(dS_, a.s, a.PV, c_.ldPV(), p(x.nu), p(x.theta), b.reset, dPV_, c_.ldPV(), g(x.nu), g(x.theta), c_.B,
             c_.T, c_.N, s);
@@ -495,7 +495,8 @@ void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
         mm(s, false, true, rows, V, E0, hr_ + size_t(r0) * E0, E0, Eo, E0, logits_, V, Out::F32);
         tic(s, "ce_softmax");
         ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s,
-                row_loss_ ? row_loss_ + r0 : nullptr);
+                row_loss_ ? row_loss_ + r0 : nullptr, b.w ? b.w + r0 : nullptr, b.lp_old ? b.lp_old + r0 : nullptr,
+                b.tis_cap, b.clip_low, b.clip_high);
         toc(s);
         if (!backward) continue;
         mm(s, false, false, rows, E0, V, dlog_, V, Eo, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
@@ -515,10 +516,12 @@ void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
     toc(s);
 }
 
-void Model::forward_backward(const Batch& b, cudaStream_t s) {
+void Model::forward_backward(const Batch& b, cudaStream_t s, bool accumulate) {
     const int M = c_.M(), D = c_.D, E0 = c_.E0;
-    LBC_CUDA(cudaMemsetAsync(G_, 0, n_ * sizeof(float), s));
-    LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));  // loss, accuracy, gate stats
+    if (!accumulate) {  // a new update: the gradient and the step's metrics (loss, accuracy, gate stats) restart
+        LBC_CUDA(cudaMemsetAsync(G_, 0, n_ * sizeof(float), s));
+        LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));
+    }
 
     embed_fwd(b, s);
     for (int n = 0; n < c_.L; ++n) layer_fwd(n, b, s);
@@ -526,7 +529,7 @@ void Model::forward_backward(const Batch& b, cudaStream_t s) {
     for (int n = c_.L - 1; n >= 0; --n) layer_bwd(n, b, s);
     if (c_.factorized) {
         mm(s, false, true, M, E0, D, dhb_, D, Winb_, D, dx0_, E0, Out::F32);
-        mm(s, true, false, E0, D, M, x0_, E0, dhb_, D, g(W_in_), D, Out::F32);
+        mm(s, true, false, E0, D, M, x0_, E0, dhb_, D, g(W_in_), D, Out::F32, 1.f);
     }
     tic(s, "embed");
     embed_scatter(b.ids, c_.factorized ? dx0_ : dh_, g(E_), M, E0, s);
@@ -587,7 +590,7 @@ StepMetrics Model::decode_metrics(const float* r) const {
     StepMetrics m{};
     m.loss = r[0];
     m.accuracy = r[1];
-    const float count = float(c_.M()) * c_.H;
+    const float count = float(c_.M()) * c_.H * float(accum_);  // gate stats summed over the update's micro-batches
     int twos = 0;
     for (int n = 0; n < c_.L; ++n) {
         const float* st = r + 2 + 6 * n;

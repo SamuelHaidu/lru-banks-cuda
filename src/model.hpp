@@ -46,6 +46,7 @@ struct Config {
     int warmup = 0, decay_start = 0, decay_steps = 0;  // the schedule (kernels.hpp: schedule_lr)
     float min_ratio = 0.1f;
     bool cosine = false;  // the decay's shape: half a cosine (else linear)
+    int cycles = 1;       // decay cycles (warm restarts)
     float tau = 8.f, lru_hl_min = 1.f, lru_hl_max = 16.f, slot_hl_min = 1.f, slot_hl_max = 1024.f;
     float gate_bias_w = 2.f, gate_bias_r = 2.f;  // initial gate logit biases (how many gates start open)
     float budget = 0.f, budget_target = 0.5f;
@@ -81,16 +82,23 @@ struct Batch {
     const int* y;
     const uint8_t* reset;
     const float* inv_n;
+    const float* w = nullptr;       // RL: per-token weight of the loss (the advantage); null: 1
+    const float* lp_old = nullptr;  // RL: the rollout's log-probability of each target (truncated importance weights)
+    float tis_cap = 2.f;
+    float clip_low = 0.f, clip_high = 0.f;  // RL: PPO clip of the ratio p / exp(lp_old) (clip_high 0: off)
 };
 
 class Model {
+    friend class Decoder;  // decode.hpp: incremental decoding with these weights
+
   public:
     explicit Model(const Config& c, uint64_t seed = 1);
     ~Model();
     Model(const Model&) = delete;
     Model& operator=(const Model&) = delete;
 
-    void forward_backward(const Batch& batch, cudaStream_t s);  // loss and every gradient (gradients zeroed first)
+    // loss and every gradient (gradients zeroed first, unless `accumulate`: added to the previous micro-batches')
+    void forward_backward(const Batch& batch, cudaStream_t s, bool accumulate = false);
     void optimizer_step(cudaStream_t s);                        // the step count lives on the device
     void forward_loss(const Batch& batch, cudaStream_t s);      // loss and accuracy only (validation)
 
@@ -100,6 +108,7 @@ class Model {
     const float* metrics_device() const { return metrics_; }
     int metrics_count() const { return 4 + 6 * c_.L; }
     StepMetrics decode_metrics(const float* record) const;
+    void set_accumulation(int micro_batches) { accum_ = micro_batches; }  // forward/backward passes per update (metrics)
     std::vector<float> gate_stats(cudaStream_t s);  // per layer: open fraction of [write, read 1, read 2]
     const Config& config() const { return c_; }
     const std::vector<Tensor>& tensors() const { return tensors_; }
@@ -177,8 +186,9 @@ class Model {
     void embed_fwd(const Batch& b, cudaStream_t s);
     void readout_loss(const Batch& b, bool backward, cudaStream_t s);
     float* b2_colsum(int n);  // layer n's b2 gradient when it is a 1-hop layer (else null)
+    int accum_ = 1;
     Schedule schedule() const {
-        return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0};
+        return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0, c_.cycles};
     }
     float* loga_;
 
