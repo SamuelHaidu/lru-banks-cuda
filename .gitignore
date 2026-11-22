@@ -19,10 +19,10 @@ dist/
 # Custom SYCL extensions (model/kernels/*.sycl), built by torch on first use
 .kernel_build/
 
-# Artifacts & Data
+# Artifacts & Data (dataset builders and tokenizer files are tracked: code and small, needed to reproduce)
 runs/
-datasets/
-tokenizers/
+datasets/*
+!datasets/*.py
 *.keras
 *.npy
 *.npz
