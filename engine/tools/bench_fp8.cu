@@ -44,7 +44,7 @@ Fp8Gemm make_fp8(cublasLtHandle_t lt, int M, int N, int K, const float* sa, cons
     cublasLtMatmulHeuristicResult_t res{};
     int found = 0;
     LBC_CUBLAS(cublasLtMatmulAlgoGetHeuristic(lt, g.op, g.a, g.b, g.d, g.d, pref, 1, &res, &found));
-    if (!found) fail("fp8 heuristic", "no algorithm", __FILE__, __LINE__);
+    if (!found) { fail("fp8 heuristic", "no algorithm", __FILE__, __LINE__); }
     g.algo = res.algo;
     cublasLtMatmulPreferenceDestroy(pref);
     return g;
@@ -52,16 +52,20 @@ Fp8Gemm make_fp8(cublasLtHandle_t lt, int M, int N, int K, const float* sa, cons
 
 __global__ void k_amax(const bf16* x, size_t n, float* amax) {
     float m = 0.f;
-    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         m = fmaxf(m, fabsf(__bfloat162float(x[i])));
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    if ((threadIdx.x & 31) == 0) atomicMax(reinterpret_cast<int*>(amax), __float_as_int(m));  // m >= 0
+    }
+    for (int o = 16; o; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o)); }
+    if ((threadIdx.x & 31) == 0) {
+        atomicMax(reinterpret_cast<int*>(amax), __float_as_int(m));  // m >= 0
+    }
 }
 
 __global__ void k_cast_fp8(const bf16* x, __nv_fp8_e4m3* y, size_t n, const float* amax) {
     const float scale = 448.f / fmaxf(*amax, 1e-12f);
-    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
         y[i] = __nv_fp8_e4m3(__bfloat162float(x[i]) * scale);
+    }
 }
 
 }  // namespace
@@ -84,7 +88,9 @@ int main() {
     struct Shape {
         const char* name;
         int M, N, K;
-    } shapes[] = {{"FFN up   (32768 x 512 -> 2048)", 32768, 2048, 512}, {"FFN down (32768 x 2048 -> 512)", 32768, 512, 2048}};
+    } shapes[] = {{"FFN up   (32768 x 512 -> 2048)", 32768, 2048, 512},
+                  {"FFN down (32768 x 2048 -> 512)", 32768, 512, 2048}};
+
     std::printf("%-34s %10s %10s %8s %12s\n", "shape", "bf16 ms", "fp8 ms", "speedup", "quantize ms");
     for (const auto& sh : shapes) {
         const size_t nx = size_t(sh.M) * sh.K, nw = size_t(sh.K) * sh.N, nd = size_t(sh.M) * sh.N;
@@ -105,23 +111,27 @@ int main() {
         LBC_CUDA(cudaMemset(Wt8, 0x30, nw));
         const double flops = 2.0 * sh.M * sh.N * sh.K;
         // bf16, the layout the model uses (W row-major K x N) and the TN layout (W^T) for a like-for-like comparison
-        const Stats sb = time_it([&](cudaStream_t st) {
-            bfg.run(st, false, false, sh.M, sh.N, sh.K, X, sh.K, W, sh.N, D, sh.N, Out::BF16);
-        }, s, 5, 30, &flush);
-        const Stats sbt = time_it([&](cudaStream_t st) {
-            bfg.run(st, false, true, sh.M, sh.N, sh.K, X, sh.K, Wt, sh.K, D, sh.N, Out::BF16);
-        }, s, 5, 30, &flush);
+        const Stats sb = time_it(
+            [&](cudaStream_t st) { bfg.run(st, false, false, sh.M, sh.N, sh.K, X, sh.K, W, sh.N, D, sh.N, Out::BF16); },
+            s, 5, 30, &flush);
+        const Stats sbt = time_it(
+            [&](cudaStream_t st) { bfg.run(st, false, true, sh.M, sh.N, sh.K, X, sh.K, Wt, sh.K, D, sh.N, Out::BF16); },
+            s, 5, 30, &flush);
         Fp8Gemm g = make_fp8(lt, sh.M, sh.N, sh.K, one, one, ws_bytes);
         const float alpha = 1.f, beta = 0.f;
-        const Stats s8 = time_it([&](cudaStream_t st) {
-            LBC_CUBLAS(cublasLtMatmul(lt, g.op, &alpha, Wt8, g.a, X8, g.b, &beta, D, g.d, D, g.d, &g.algo, ws,
-                                      ws_bytes, st));
-        }, s, 5, 30, &flush);
-        const Stats sq = time_it([&](cudaStream_t st) {
-            LBC_CUDA(cudaMemsetAsync(amax, 0, sizeof(float), st));
-            k_amax<<<1024, 256, 0, st>>>(X, nx, amax);
-            k_cast_fp8<<<1024, 256, 0, st>>>(X, X8, nx, amax);
-        }, s, 5, 30, &flush);
+        const Stats s8 = time_it(
+            [&](cudaStream_t st) {
+                LBC_CUBLAS(cublasLtMatmul(lt, g.op, &alpha, Wt8, g.a, X8, g.b, &beta, D, g.d, D, g.d, &g.algo, ws,
+                                          ws_bytes, st));
+            },
+            s, 5, 30, &flush);
+        const Stats sq = time_it(
+            [&](cudaStream_t st) {
+                LBC_CUDA(cudaMemsetAsync(amax, 0, sizeof(float), st));
+                k_amax<<<1024, 256, 0, st>>>(X, nx, amax);
+                k_cast_fp8<<<1024, 256, 0, st>>>(X, X8, nx, amax);
+            },
+            s, 5, 30, &flush);
         report((std::string(sh.name) + " bf16").c_str(), sb, flops);
         report((std::string(sh.name) + " bf16 TN").c_str(), sbt, flops);
         report((std::string(sh.name) + " fp8 TN").c_str(), s8, flops);

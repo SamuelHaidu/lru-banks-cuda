@@ -25,12 +25,25 @@ class Decoder {
     // One token for R rows (host arrays): ids, slot, position (0 at the row's first token), reset (the token is the
     // document marker: the state restarts). Leaves the next-token logits on the device (logits(), R x V, when
     // R <= logit_rows()) and, when `key` is given, samples: tok / logp / ent (host arrays of R).
-    void step(const int* ids, const int* slot, const int* tpos, const uint8_t* reset, int R, float temperature,
-              const uint64_t* key, int* tok, float* logp, float* ent, cudaStream_t s);
+    void step(const int* ids,
+              const int* slot,
+              const int* tpos,
+              const uint8_t* reset,
+              int R,
+              float temperature,
+              const uint64_t* key,
+              int* tok,
+              float* logp,
+              float* ent,
+              cudaStream_t s);
     void copy_slots(const std::vector<int2>& pairs, cudaStream_t s);  // slot pairs (dst, src)
+
     const float* logits() const { return logits_; }
+
     int logit_rows() const { return logit_rows_; }
+
     int slots() const { return slots_; }
+
     size_t state_bytes() const;
 
   private:

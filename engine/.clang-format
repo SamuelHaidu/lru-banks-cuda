@@ -1,6 +1,45 @@
+# One style for C++ and CUDA (.cpp, .hpp, .cu, .cuh), tuned for reading: 4-space indents, 120 columns, every
+# control statement braced (no goto-fail style bugs), one parameter per line when a signature does not fit, blank
+# lines between definitions. Apply with `cmake --build --preset lint --target format`; the gate checks it.
 BasedOnStyle: Google
-IndentWidth: 4
-AccessModifierOffset: -2
+Language: Cpp
+Standard: c++20
 ColumnLimit: 120
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -2
 DerivePointerAlignment: false
 PointerAlignment: Left
+ReferenceAlignment: Pointer
+
+# braces everywhere, short braced bodies may stay on one line: `if (!ok) { return; }`
+InsertBraces: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: All
+AllowShortLambdasOnASingleLine: All
+AllowShortCaseLabelsOnASingleLine: true
+
+# long signatures: one parameter per line; long calls stay packed (kernel launches have many arguments)
+BinPackParameters: OnePerLine
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignAfterOpenBracket: Align
+BreakBeforeBinaryOperators: NonAssignment
+BreakTemplateDeclarations: Yes
+
+SeparateDefinitionBlocks: Always
+MaxEmptyLinesToKeep: 1
+InsertNewlineAtEOF: true
+KeepEmptyLines:
+  AtStartOfBlock: false
+  AtStartOfFile: false
+
+AlignConsecutiveMacros: AcrossComments
+AlignTrailingComments:
+  Kind: Always
+SpacesBeforeTrailingComments: 2
+FixNamespaceComments: true
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive

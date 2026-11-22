@@ -52,27 +52,47 @@ Args parse(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (k == "--data") a.data = val();
-        else if (k == "--dump") a.dump = val();
-        else if (k == "--dump-after") a.dump_after = std::atoi(val());
-        else if (k == "--steps") a.steps = std::atoi(val());
-        else if (k == "--warmup") a.warmup = std::atoi(val());
-        else if (k == "--batch") a.batch = std::atoi(val());
-        else if (k == "--seq") a.seq = std::atoi(val());
-        else if (k == "--layers") a.layers = std::atoi(val());
-        else if (k == "--gate-w") a.gate_w = std::atof(val());
-        else if (k == "--gate-r") a.gate_r = std::atof(val());
-        else if (k == "--lr") a.lr = std::atof(val());
-        else if (k == "--budget") a.budget = std::atof(val());
-        else if (k == "--seed") a.seed = std::strtoull(val(), nullptr, 10);
-        else if (k == "--ce-chunk") a.ce_chunk = std::atoi(val());
-        else if (k == "--bank-chunk") a.bank_chunk = std::atoi(val());
-        else if (k == "--tiny") a.tiny = true;
-        else if (k == "--gate-report") a.gate_report = true;
-        else if (k == "--grad-report") a.grad_report = true;
-        else if (k == "--no-graph") a.graph = false;
-        else if (k == "--budget-target") a.budget_target = std::atof(val());
-        else if (k == "--set") {
+        if (k == "--data") {
+            a.data = val();
+        } else if (k == "--dump") {
+            a.dump = val();
+        } else if (k == "--dump-after") {
+            a.dump_after = std::atoi(val());
+        } else if (k == "--steps") {
+            a.steps = std::atoi(val());
+        } else if (k == "--warmup") {
+            a.warmup = std::atoi(val());
+        } else if (k == "--batch") {
+            a.batch = std::atoi(val());
+        } else if (k == "--seq") {
+            a.seq = std::atoi(val());
+        } else if (k == "--layers") {
+            a.layers = std::atoi(val());
+        } else if (k == "--gate-w") {
+            a.gate_w = std::atof(val());
+        } else if (k == "--gate-r") {
+            a.gate_r = std::atof(val());
+        } else if (k == "--lr") {
+            a.lr = std::atof(val());
+        } else if (k == "--budget") {
+            a.budget = std::atof(val());
+        } else if (k == "--seed") {
+            a.seed = std::strtoull(val(), nullptr, 10);
+        } else if (k == "--ce-chunk") {
+            a.ce_chunk = std::atoi(val());
+        } else if (k == "--bank-chunk") {
+            a.bank_chunk = std::atoi(val());
+        } else if (k == "--tiny") {
+            a.tiny = true;
+        } else if (k == "--gate-report") {
+            a.gate_report = true;
+        } else if (k == "--grad-report") {
+            a.grad_report = true;
+        } else if (k == "--no-graph") {
+            a.graph = false;
+        } else if (k == "--budget-target") {
+            a.budget_target = std::atof(val());
+        } else if (k == "--set") {
             const std::string kv = val();
             const size_t eq = kv.find('=');
             if (eq == std::string::npos) {
@@ -80,8 +100,7 @@ Args parse(int argc, char** argv) {
                 std::exit(2);
             }
             a.sets.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
-        }
-        else {
+        } else {
             std::fprintf(stderr, "unknown argument %s\n", k.c_str());
             std::exit(2);
         }
@@ -118,14 +137,14 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
           << c.ldPV() << "\nldG " << c.ldG() << "\nldG2 " << c.ldG2() << "\ntau " << c.tau << "\nslot_hl_min "
           << c.slot_hl_min << "\nslot_hl_max " << c.slot_hl_max << "\nbudget " << c.budget << "\nbudget_target "
           << c.budget_target << "\nfactorized " << int(c.factorized) << "\ntied " << int(c.tied) << "\nhops ";
-        for (int l = 0; l < c.L; ++l) f << (l ? "," : "") << c.hops_of(l);
+        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.hops_of(l); }
         f << "\nbank_slots ";
-        for (int l = 0; l < c.L; ++l) f << (l ? "," : "") << c.slots_of(l);
+        for (int l = 0; l < c.L; ++l) { f << (l ? "," : "") << c.slots_of(l); }
         f << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\n";
     }
     {
         std::ofstream f(dir + "/manifest.txt");
-        for (const auto& t : model.tensors()) f << t.name << " " << t.off << " " << t.rows << " " << t.cols << "\n";
+        for (const auto& t : model.tensors()) { f << t.name << " " << t.off << " " << t.rows << " " << t.cols << "\n"; }
     }
     write_bin(dir + "/params.bin", download(model.params(), model.num_params()).data(), model.num_params());
     write_bin(dir + "/grads.bin", download(model.grads(), model.num_params()).data(), model.num_params());
@@ -204,12 +223,12 @@ int main(int argc, char** argv) {
     size_t free_b = 0, total_b = 0;
     LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
     std::printf("model: %zu params, %d layers (hops", model.num_params(), c.L);
-    for (int l = 0; l < c.L; ++l) std::printf("%s%d", l ? "," : " ", c.hops_of(l));
+    for (int l = 0; l < c.L; ++l) { std::printf("%s%d", l ? "," : " ", c.hops_of(l)); }
     std::printf("), D %d, LRU %d complex, %d heads x %d, %d slots, FFN %d, vocab %d x %d (%s, %s)\n", c.D, c.N, c.H,
                 c.dh, SLOTS, c.F, c.V, c.E0, c.factorized ? "factorized" : "not factorized",
                 c.tied ? "tied" : "untied");
-    std::printf("batch %d x %d = %zu tokens per step; gate biases write %.2f read %.2f; %zu tokens on disk\n", c.B,
-                c.T, ntok, c.gate_bias_w, c.gate_bias_r, file.size());
+    std::printf("batch %d x %d = %zu tokens per step; gate biases write %.2f read %.2f; %zu tokens on disk\n", c.B, c.T,
+                ntok, c.gate_bias_w, c.gate_bias_r, file.size());
     std::printf("GPU memory in use after allocation: %.2f GiB of %.2f\n", (total_b - free_b) / 1073741824.0,
                 total_b / 1073741824.0);
 
@@ -288,15 +307,16 @@ int main(int argc, char** argv) {
     std::vector<float> hist(total);
     LBC_CUDA(cudaMemcpy(hist.data(), d_hist, total * sizeof(float), cudaMemcpyDeviceToHost));
     std::printf("loss by step:");
-    for (int i = 0; i < total; i += std::max(1, total / 12)) std::printf(" [%d] %.3f", i + 1, hist[i]);
+    for (int i = 0; i < total; i += std::max(1, total / 12)) { std::printf(" [%d] %.3f", i + 1, hist[i]); }
     std::printf(" [%d] %.3f\n", total, hist[total - 1]);
 
     const std::vector<float> g = model.gate_stats(s);
     std::printf("open gates (last step), per layer write / read 1 / read 2:");
-    for (int n = 0; n < c.L; ++n) std::printf("  L%d %.2f %.2f %.2f", n, g[3 * n], g[3 * n + 1], g[3 * n + 2]);
+    for (int n = 0; n < c.L; ++n) { std::printf("  L%d %.2f %.2f %.2f", n, g[3 * n], g[3 * n + 1], g[3 * n + 2]); }
     std::printf("\n");
 
-    if (a.gate_report) {  // the last step's read gates: how often all heads of a token are closed (rows a GEMM could skip)
+    if (a.gate_report) {  // the last step's read gates: how often all heads of a token are closed (rows a GEMM could
+                          // skip)
         std::printf("gate report (last step): per layer, hop: open reads, tokens with every head closed\n");
         for (int n = 0; n < c.L; ++n) {
             std::vector<uint8_t> ridx, gw, gr, gr2;
@@ -306,7 +326,7 @@ int main(int argc, char** argv) {
                 size_t open = 0, all_closed = 0;
                 for (size_t r = 0; r < ntok; ++r) {
                     int o = 0;
-                    for (int h = 0; h < c.H; ++h) o += g[r * c.H + h];
+                    for (int h = 0; h < c.H; ++h) { o += g[r * c.H + h]; }
                     open += o;
                     all_closed += o == 0;
                 }
@@ -333,26 +353,30 @@ int main(int argc, char** argv) {
         double total = 0;
         for (const auto& t : model.tensors()) {
             double ss = 0;
-            for (size_t i = 0; i < size_t(t.rows) * t.cols; ++i) ss += double(gh[t.off + i]) * gh[t.off + i];
+            for (size_t i = 0; i < size_t(t.rows) * t.cols; ++i) { ss += double(gh[t.off + i]) * gh[t.off + i]; }
             total += ss;
             norms.emplace_back(std::sqrt(ss), t.name);
         }
         std::sort(norms.rbegin(), norms.rend());
         std::printf("gradient norm (profiled step) %.4g; largest tensors:", std::sqrt(total));
-        for (size_t i = 0; i < std::min<size_t>(14, norms.size()); ++i)
+        for (size_t i = 0; i < std::min<size_t>(14, norms.size()); ++i) {
             std::printf(" %s %.3g", norms[i].second.c_str(), norms[i].first);
+        }
         std::printf("\n");
         // W_s's columns: [key (H*DH) | query (H*DH) | read gate (H) | write gate (H)]
         const int HD = c.H * c.dh;
         const int groups[5] = {0, HD, 2 * HD, 2 * HD + c.H, 2 * HD + 2 * c.H};
         const char* gname[4] = {"key", "query", "read gate", "write gate"};
         for (const auto& t : model.tensors()) {
-            if (t.name.size() < 3 || t.name.compare(t.name.size() - 3, 3, "_Ws") != 0) continue;
+            if (t.name.size() < 3 || t.name.compare(t.name.size() - 3, 3, "_Ws") != 0) { continue; }
             std::printf("  %s by columns:", t.name.c_str());
             for (int k = 0; k < 4; ++k) {
                 double ss = 0;
-                for (int r = 0; r < t.rows; ++r)
-                    for (int j = groups[k]; j < groups[k + 1]; ++j) ss += double(gh[t.off + size_t(r) * t.cols + j]) * gh[t.off + size_t(r) * t.cols + j];
+                for (int r = 0; r < t.rows; ++r) {
+                    for (int j = groups[k]; j < groups[k + 1]; ++j) {
+                        ss += double(gh[t.off + size_t(r) * t.cols + j]) * gh[t.off + size_t(r) * t.cols + j];
+                    }
+                }
                 std::printf(" %s %.3g", gname[k], std::sqrt(ss));
             }
             std::printf("\n");
@@ -360,9 +384,9 @@ int main(int argc, char** argv) {
     }
     float sum = 0.f;
     const auto prof = model.profile_ms();
-    for (const auto& [cat, t] : prof) sum += t;
+    for (const auto& [cat, t] : prof) { sum += t; }
     std::printf("GPU time by category (one profiled step, %.1f ms in kernels):\n", sum);
-    for (const auto& [cat, t] : prof) std::printf("  %-18s %8.2f ms  %5.1f%%\n", cat.c_str(), t, 100.f * t / sum);
+    for (const auto& [cat, t] : prof) { std::printf("  %-18s %8.2f ms  %5.1f%%\n", cat.c_str(), t, 100.f * t / sum); }
     LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
     std::printf("GPU memory in use: %.2f GiB\n", (total_b - free_b) / 1073741824.0);
     return 0;

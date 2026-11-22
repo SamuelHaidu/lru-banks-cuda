@@ -28,10 +28,14 @@ bool correct(const std::optional<std::string>& pred, const std::string& gold);
 bool is_choice(const std::string& gold);
 std::vector<double> step_values(const std::string& text);
 double step_credit(const std::string& output, int calls, const Question& q);
-double reward(const std::optional<std::string>& pred, const std::string& output, int calls, const Question& q,
+double reward(const std::optional<std::string>& pred,
+              const std::string& output,
+              int calls,
+              const Question& q,
               double partial);
 // `{split}.docs.jsonl`: sources (empty: all), multiple choice dropped when exclude_choice
-std::vector<Question> load_questions(const std::string& path, const std::vector<std::string>& sources = {},
+std::vector<Question> load_questions(const std::string& path,
+                                     const std::vector<std::string>& sources = {},
                                      bool exclude_choice = false);
 // the first `<call>calculator(expression="...")</call>` in a turn: the JSON-decoded expression; nullopt when there
 // is no call; throws std::runtime_error when the string does not decode ("Error: bad call")

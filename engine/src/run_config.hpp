@@ -17,19 +17,19 @@ namespace lbc {
 
 struct ArchCfg {
     int vocabulary_size = 32768;
-    int dim = 512;               // the residual stream
-    int embed_dim = 128;         // the factorized embedding's width (ignored when not factorized)
-    bool factorized = true;      // ids -> E (V x embed_dim) -> W_in -> dim; readout rms(h) W_out E^T. Not
-                                 // factorized: E is V x dim, no W_in / W_out
-    bool tied_embeddings = true; // the readout uses E, or its own table E_out
+    int dim = 512;                // the residual stream
+    int embed_dim = 128;          // the factorized embedding's width (ignored when not factorized)
+    bool factorized = true;       // ids -> E (V x embed_dim) -> W_in -> dim; readout rms(h) W_out E^T. Not
+                                  // factorized: E is V x dim, no W_in / W_out
+    bool tied_embeddings = true;  // the readout uses E, or its own table E_out
     int num_layers = 4;
-    std::vector<int> hops = {2, 2, 2, 2};  // per layer: 1 (read, FFN) or 2 (read, FFN, second read)
-    int lru_dim = 256;           // complex channels (state 2 x lru_dim)
-    int num_heads = 8;           // bank heads of head_dim (keys and values): 8 x 64 = 512 wide
-    double ffn_mult = 4.0;       // FFN width = ffn_mult x dim
+    std::vector<int> hops = {2, 2, 2, 2};                // per layer: 1 (read, FFN) or 2 (read, FFN, second read)
+    int lru_dim = 256;                                   // complex channels (state 2 x lru_dim)
+    int num_heads = 8;                                   // bank heads of head_dim (keys and values): 8 x 64 = 512 wide
+    double ffn_mult = 4.0;                               // FFN width = ffn_mult x dim
     std::vector<double> lru_half_life = {1.0, 16.0};     // LRU decays at init, log-spaced
     std::vector<double> slot_half_life = {1.0, 1024.0};  // fixed slot decays, log-spaced
-    double tau = 8.0;            // read temperature at init
+    double tau = 8.0;                                    // read temperature at init
     // initial gate logit biases. Measured (RESEARCH_LOG): trained write gates (2) learn as well as open ones; trained
     // read gates (2) collapse closed without a budget (a closed read gets no gradient), and with gate_budget 10 /
     // target 0.5 they trade loss for speed early on. Default: reads held open (20); read gating is gate_bias_read 2
@@ -44,12 +44,12 @@ struct ArchCfg {
 };
 
 struct DataCfg {
-    std::string dataset;         // directory with metadata.json and the split files
+    std::string dataset;  // directory with metadata.json and the split files
     int batch_size = 64;
-    int micro_batch_size = 0;    // rows per forward/backward (0: batch_size); fewer: gradient accumulation, the
-                                 // exact gradient of the whole batch (normalized by its target count)
-    double epoch_passes = 0.02;  // one epoch = this fraction of a pass over the train split (random windows)
-    int seed = 42;               // data order, validation rows and the initialization
+    int micro_batch_size = 0;        // rows per forward/backward (0: batch_size); fewer: gradient accumulation, the
+                                     // exact gradient of the whole batch (normalized by its target count)
+    double epoch_passes = 0.02;      // one epoch = this fraction of a pass over the train split (random windows)
+    int seed = 42;                   // data order, validation rows and the initialization
     std::string validation_dataset;  // val_loss on this dataset's validation split (the training dataset's own split
                                      // is then logged as val_data_loss): e.g. pretraining text during a fine-tune
     std::vector<std::string> mix_datasets;  // more training sources, each a fixed share of every batch's rows
@@ -59,23 +59,23 @@ struct DataCfg {
 
 struct TrainCfg {
     double learning_rate = 2e-3;
-    int warmup_steps = 100;      // linear warmup over the first updates
+    int warmup_steps = 100;                      // linear warmup over the first updates
     int lr_decay_start = 0, lr_decay_steps = 0;  // warmup-stable-decay: linear to lr_min_ratio x (0 steps: none)
     double lr_min_ratio = 0.1;
     std::string lr_decay_shape = "linear";  // "linear" or "cosine"
-    int lr_cycles = 1;           // > 1: the decay repeats lr_cycles times (each restart warms up over warmup_steps)
+    int lr_cycles = 1;  // > 1: the decay repeats lr_cycles times (each restart warms up over warmup_steps)
     double weight_decay = 0.1, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-7;
     double global_clipnorm = 1.0;  // 0 or null: off
     int epochs = 100;
-    int validation_steps = 50;   // batches of validation rows at every epoch end (0: no validation)
-    int checkpoint_every = 1;    // numbered checkpoints every N epochs (0: none); latest and best always
-    std::string init_from;       // a checkpoint whose weights start a new run (fresh optimizer, step 0; not on resume)
+    int validation_steps = 50;  // batches of validation rows at every epoch end (0: no validation)
+    int checkpoint_every = 1;   // numbered checkpoints every N epochs (0: none); latest and best always
+    std::string init_from;      // a checkpoint whose weights start a new run (fresh optimizer, step 0; not on resume)
 };
 
 struct RuntimeCfg {
-    int bank_chunk = 512;        // tokens per bank-walk block (longer rows walk in parallel chunks)
-    int ce_chunk = 256;          // loss rows per chunk (256 keeps a chunk's logits in the 4090's L2)
-    bool cuda_graph = true;      // the training step as one CUDA graph
+    int bank_chunk = 512;    // tokens per bank-walk block (longer rows walk in parallel chunks)
+    int ce_chunk = 256;      // loss rows per chunk (256 keeps a chunk's logits in the 4090's L2)
+    bool cuda_graph = true;  // the training step as one CUDA graph
 };
 
 struct RunConfig {
@@ -102,7 +102,7 @@ RunConfig with_keys(const RunConfig& rc, const std::vector<std::pair<std::string
 struct DatasetMeta {
     std::string dir, name;
     int vocabulary_size = 0, doc_token_id = 0;
-    std::string train_file, validation_file;     // full paths
+    std::string train_file, validation_file;                               // full paths
     double train_chars_per_token = 0.0, validation_chars_per_token = 0.0;  // 0: unknown (no bpc)
     int score_after_token = -1;  // >= 0: only targets after this token in a document are scored (synthetic tasks)
     int score_prev_token = -1;   // >= 0: only targets whose input follows this token are scored (recall queries)

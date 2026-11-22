@@ -31,7 +31,9 @@ class L2Flusher {
         bytes_ = static_cast<std::size_t>(l2) * 2;  // twice the L2: nothing of the operands survives
         LBC_CUDA(cudaMalloc(&buf_, bytes_));
     }
+
     ~L2Flusher() { cudaFree(buf_); }
+
     L2Flusher(const L2Flusher&) = delete;
     L2Flusher& operator=(const L2Flusher&) = delete;
 
@@ -45,14 +47,14 @@ class L2Flusher {
 // Runs `fn(stream)` `warmup` times, then `runs` timed times (one event pair each). `fn` launches work on `stream`.
 template <class Fn>
 Stats time_it(Fn&& fn, cudaStream_t stream, int warmup = 3, int runs = 20, L2Flusher* flusher = nullptr) {
-    for (int i = 0; i < warmup; ++i) fn(stream);
+    for (int i = 0; i < warmup; ++i) { fn(stream); }
     LBC_CUDA(cudaGetLastError());
     cudaEvent_t start, stop;
     LBC_CUDA(cudaEventCreate(&start));
     LBC_CUDA(cudaEventCreate(&stop));
     std::vector<double> ms(static_cast<std::size_t>(runs));
     for (auto& t : ms) {
-        if (flusher) flusher->flush(stream);
+        if (flusher) { flusher->flush(stream); }
         LBC_CUDA(cudaEventRecord(start, stream));
         fn(stream);
         LBC_CUDA(cudaEventRecord(stop, stream));
@@ -73,8 +75,8 @@ Stats time_it(Fn&& fn, cudaStream_t stream, int warmup = 3, int runs = 20, L2Flu
 // One result line: name, median and min time, and the rates when `flops` / `bytes` are given (0: not shown).
 inline void report(const char* name, const Stats& s, double flops = 0.0, double bytes = 0.0) {
     std::printf("%-40s median %9.4f ms  min %9.4f ms", name, s.median_ms, s.min_ms);
-    if (flops > 0) std::printf("  %7.1f TFLOPS", flops / (s.median_ms * 1e-3) / 1e12);
-    if (bytes > 0) std::printf("  %7.1f GB/s", bytes / (s.median_ms * 1e-3) / 1e9);
+    if (flops > 0) { std::printf("  %7.1f TFLOPS", flops / (s.median_ms * 1e-3) / 1e12); }
+    if (bytes > 0) { std::printf("  %7.1f GB/s", bytes / (s.median_ms * 1e-3) / 1e9); }
     std::printf("  (%d runs)\n", s.runs);
 }
 

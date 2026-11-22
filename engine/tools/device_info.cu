@@ -17,8 +17,8 @@ int main() {
     LBC_CUDA(cudaGetDeviceCount(&count));
     LBC_CUDA(cudaDriverGetVersion(&driver));
     LBC_CUDA(cudaRuntimeGetVersion(&runtime));
-    std::printf("CUDA driver %d.%d, runtime %d.%d, %d device(s)\n", driver / 1000, (driver % 1000) / 10,
-                runtime / 1000, (runtime % 1000) / 10, count);
+    std::printf("CUDA driver %d.%d, runtime %d.%d, %d device(s)\n", driver / 1000, (driver % 1000) / 10, runtime / 1000,
+                (runtime % 1000) / 10, count);
     for (int d = 0; d < count; ++d) {
         cudaDeviceProp p{};
         LBC_CUDA(cudaGetDeviceProperties(&p, d));

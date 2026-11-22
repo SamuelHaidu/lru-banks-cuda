@@ -70,8 +70,8 @@ Decoder::Decoder(Model& model, int slots, int max_rows) : m_(model), slots_(slot
 }
 
 Decoder::~Decoder() {
-    for (void* p : allocs_) cudaFree(p);
-    if (d_pairs_) cudaFree(d_pairs_);
+    for (void* p : allocs_) { cudaFree(p); }
+    if (d_pairs_) { cudaFree(d_pairs_); }
     cudaFreeHost(h_in_);
     cudaFreeHost(h_out_);
     cudaFreeHost(h_outf_);
@@ -83,7 +83,7 @@ size_t Decoder::state_bytes() const {
 }
 
 void Decoder::copy_slots(const std::vector<int2>& pairs, cudaStream_t s) {
-    if (pairs.empty()) return;
+    if (pairs.empty()) { return; }
     const Config& c = m_.c_;
     if (int(pairs.size()) > pairs_cap_) {
         if (d_pairs_) {
@@ -103,10 +103,19 @@ void Decoder::copy_slots(const std::vector<int2>& pairs, cudaStream_t s) {
     LBC_CUDA(cudaStreamSynchronize(s));  // the pairs buffer is reused by the next call
 }
 
-void Decoder::step(const int* ids, const int* slot, const int* tpos, const uint8_t* reset, int R, float temperature,
-                   const uint64_t* key, int* tok, float* logp, float* ent, cudaStream_t s) {
-    if (R <= 0) return;
-    if (R > max_rows_) fail("Decoder::step", "more rows than max_rows", __FILE__, __LINE__);
+void Decoder::step(const int* ids,
+                   const int* slot,
+                   const int* tpos,
+                   const uint8_t* reset,
+                   int R,
+                   float temperature,
+                   const uint64_t* key,
+                   int* tok,
+                   float* logp,
+                   float* ent,
+                   cudaStream_t s) {
+    if (R <= 0) { return; }
+    if (R > max_rows_) { fail("Decoder::step", "more rows than max_rows", __FILE__, __LINE__); }
     Model& m = m_;
     const Config& c = m.c_;
     LBC_CUDA(cudaStreamSynchronize(s));  // the pinned staging buffer is about to be rewritten
@@ -121,13 +130,14 @@ void Decoder::step(const int* ids, const int* slot, const int* tpos, const uint8
         reinterpret_cast<uint8_t*>(hi + 3 * Rp)[r] = real ? reset[r] : 1;
     }
     uint64_t* hk = reinterpret_cast<uint64_t*>(hi + 4 * Rp);
-    if (key)
-        for (int r = 0; r < Rp; ++r) hk[r] = r < R ? key[r] : 0;
+    if (key) {
+        for (int r = 0; r < Rp; ++r) { hk[r] = r < R ? key[r] : 0; }
+    }
     LBC_CUDA(cudaMemcpyAsync(d_ids_, hi, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
     LBC_CUDA(cudaMemcpyAsync(d_map_, hi + Rp, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
     LBC_CUDA(cudaMemcpyAsync(d_tpos_, hi + 2 * Rp, size_t(Rp) * 4, cudaMemcpyHostToDevice, s));
     LBC_CUDA(cudaMemcpyAsync(d_reset_, hi + 3 * Rp, size_t(Rp), cudaMemcpyHostToDevice, s));
-    if (key) LBC_CUDA(cudaMemcpyAsync(d_key_, hk, size_t(Rp) * 8, cudaMemcpyHostToDevice, s));
+    if (key) { LBC_CUDA(cudaMemcpyAsync(d_key_, hk, size_t(Rp) * 8, cudaMemcpyHostToDevice, s)); }
 
     const int D = c.D, HD = c.HD(), H = c.H, F = c.F, S2 = c.S2(), E0 = c.E0;
     if (c.factorized) {
@@ -143,17 +153,16 @@ void Decoder::step(const int* ids, const int* slot, const int* tpos, const uint8
         m.mm(s, false, false, Rp, c.ldPV(), D, xh_, D, w.Wa, c.ldPV(), PV_, c.ldPV(), Out::BF16);
         lru_step(PV_, c.ldPV(), m.p(x.nu), m.p(x.theta), d_reset_, d_map_, lru_[size_t(n)], sb_, Rp, c.N, s);
         m.mm(s, false, false, Rp, c.ldG(), S2, sb_, S2, w.Ws, c.ldG(), G_, c.ldG(), Out::BF16);
-        AddrFwd af{G_,  c.ldG(), m.p(x.bk), m.p(x.brg), m.p(x.bwg), m.p(x.R), d_reset_, k_,  q_, kn_,
-                   qn_, ridx_,   rp1_,      gw_,        gr_,        aw_,       ar_,     stats_, info_, Rp,
-                   1,   H,       c.dh,      c.slots_of(n)};
+        AddrFwd af{G_,  c.ldG(), m.p(x.bk), m.p(x.brg), m.p(x.bwg), m.p(x.R), d_reset_, k_,
+                   q_,  kn_,     qn_,       ridx_,      rp1_,       gw_,      gr_,      aw_,
+                   ar_, stats_,  info_,     Rp,         1,          H,        c.dh,     c.slots_of(n)};
         af.Gprev = gprev_[size_t(n)];
         af.ldGprev = HD;
         af.map = d_map_;
         af.tpos = d_tpos_;
         addr_fwd(af, s);
         store_rows(G_, c.ldG(), HD, d_map_, gprev_[size_t(n)], HD, Rp, s);  // after addr_fwd read the previous
-        const BankWrites bw{k_, PV_ + S2, c.ldPV(), info_, m.loga_ + size_t(n) * H * SLOTS, Rp, 1, H, 1, nullptr,
-                            c.dh};
+        const BankWrites bw{k_, PV_ + S2, c.ldPV(), info_, m.loga_ + size_t(n) * H * SLOTS, Rp, 1, H, 1, nullptr, c.dh};
         bank_step(bw, BankRead{q_, gr_, m.p(x.ltau), 2, o_, nullptr, nullptr, nullptr, nullptr, nullptr}, d_map_,
                   d_tpos_, bank_[size_t(n)], true, s);
         m.mm(s, false, false, Rp, D, HD, o_, HD, w.Wo, D, h_, D, Out::F32, 1.f);
@@ -161,7 +170,7 @@ void Decoder::step(const int* ids, const int* slot, const int* tpos, const uint8
         m.mm(s, false, false, Rp, F, D, xh_, D, w.W1, F, U_, F, Out::BF16, 0.f,
              Epilogue{Epilogue::GeluAuxBias, w.b1, nullptr, Z_, F});
         m.mm(s, false, false, Rp, D, F, U_, F, w.W2, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, m.p(x.b2)});
-        if (c.hops_of(n) == 1) continue;
+        if (c.hops_of(n) == 1) { continue; }
         rmsnorm_fwd(h_, xh_, rstd_, Rp, D, s);
         m.mm(s, false, false, Rp, c.ldG2(), D, xh_, D, w.Wq2, c.ldG2(), G2_, c.ldG2(), Out::BF16);
         q2_fwd(Q2Fwd{G2_, c.ldG2(), m.p(x.brg2), q2_, q2n_, ar2_, gr2_, stats_ + 4, info_, Rp, H, c.dh}, s);
@@ -170,23 +179,26 @@ void Decoder::step(const int* ids, const int* slot, const int* tpos, const uint8
         m.mm(s, false, false, Rp, D, HD, o_, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
     }
     rmsnorm_fwd(h_, xh_, rstd_, Rp, D, s);
-    if (c.factorized)
+    if (c.factorized) {
         m.mm(s, false, false, Rp, E0, D, xh_, D, m.Woutb_, E0, hr_, E0, Out::BF16);
-    else
+    } else {
         scale_cols(xh_, m.p(m.final_norm_), hr_, Rp, D, s);
+    }
     for (int r0 = 0; r0 < R; r0 += logit_rows_) {
         const int rows = std::min(logit_rows_, R - r0);
         m.mm(s, false, true, rows, c.V, E0, hr_ + size_t(r0) * E0, E0, m.readout_table(), E0, logits_, c.V, Out::F32);
-        if (key) sample_rows(logits_, rows, c.V, temperature, d_key_ + r0, d_tok_ + r0, d_logp_ + r0, d_ent_ + r0, s);
+        if (key) {
+            sample_rows(logits_, rows, c.V, temperature, d_key_ + r0, d_tok_ + r0, d_logp_ + r0, d_ent_ + r0, s);
+        }
     }
-    if (!key) return;
+    if (!key) { return; }
     LBC_CUDA(cudaMemcpyAsync(h_out_, d_tok_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(h_outf_, d_logp_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaMemcpyAsync(h_outf_ + R, d_ent_, size_t(R) * 4, cudaMemcpyDeviceToHost, s));
     LBC_CUDA(cudaStreamSynchronize(s));
     std::memcpy(tok, h_out_, size_t(R) * 4);
-    if (logp) std::memcpy(logp, h_outf_, size_t(R) * 4);
-    if (ent) std::memcpy(ent, h_outf_ + R, size_t(R) * 4);
+    if (logp) { std::memcpy(logp, h_outf_, size_t(R) * 4); }
+    if (ent) { std::memcpy(ent, h_outf_ + R, size_t(R) * 4); }
 }
 
 }  // namespace lbc

@@ -20,7 +20,11 @@ struct CheckpointInfo {
     json::Value config;         // the run config it was trained with
 };
 
-void save_checkpoint(const std::string& path, Model& model, const json::Value& config, int epoch, double best_val_loss,
+void save_checkpoint(const std::string& path,
+                     Model& model,
+                     const json::Value& config,
+                     int epoch,
+                     double best_val_loss,
                      cudaStream_t s);
 CheckpointInfo read_checkpoint_info(const std::string& path);
 // parameters, moments and step count into `model` (the tensor list must match), then the bf16 weight copies

@@ -41,7 +41,7 @@ struct Config {
     std::vector<int> slots;  // per layer bank size, 2..SLOTS (empty: SLOTS everywhere)
     int B = 64, T = 512;
     int bank_chunk = 512;  // tokens per bank-walk block (rows longer than this walk in parallel chunks)
-    int ce_chunk = 256;  // loss rows per chunk: 256 x V fp32 logits + bf16 gradients (50 MB) stay in the L2
+    int ce_chunk = 256;    // loss rows per chunk: 256 x V fp32 logits + bf16 gradients (50 MB) stay in the L2
     float lr = 2e-3f, wd = 0.1f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-7f, clip = 1.f;
     int warmup = 0, decay_start = 0, decay_steps = 0;  // the schedule (kernels.hpp: schedule_lr)
     float min_ratio = 0.1f;
@@ -52,13 +52,20 @@ struct Config {
     float budget = 0.f, budget_target = 0.5f;
 
     int M() const { return B * T; }
+
     int hops_of(int n) const { return hops.empty() ? 2 : hops[size_t(n)]; }
+
     int slots_of(int n) const { return slots.empty() ? SLOTS : slots[size_t(n)]; }
+
     int HD() const { return H * dh; }
+
     int S2() const { return 2 * N; }
+
     int ldPV() const { return 2 * N + H * dh; }
+
     // GEMM output strides rounded up to 8 columns (16-byte rows in bf16); the padding columns stay 0
     int ldG() const { return (2 * H * dh + 2 * H + 7) / 8 * 8; }
+
     int ldG2() const { return (H * dh + H + 7) / 8 * 8; }
 };
 
@@ -99,55 +106,80 @@ class Model {
 
     // loss and every gradient (gradients zeroed first, unless `accumulate`: added to the previous micro-batches')
     void forward_backward(const Batch& batch, cudaStream_t s, bool accumulate = false);
-    void optimizer_step(cudaStream_t s);                        // the step count lives on the device
-    void forward_loss(const Batch& batch, cudaStream_t s);      // loss and accuracy only (validation)
+    void optimizer_step(cudaStream_t s);                    // the step count lives on the device
+    void forward_loss(const Batch& batch, cudaStream_t s);  // loss and accuracy only (validation)
 
     const float* loss_device() const { return loss_; }
+
     // [loss, accuracy, gate stats (6 per layer), ||g||^2, lr]: one contiguous record, so a step's numbers reach the
     // host in one asynchronous copy. forward_backward / forward_loss write the first 2 + 6 L, optimizer_step the rest.
     const float* metrics_device() const { return metrics_; }
+
     int metrics_count() const { return 4 + 6 * c_.L; }
+
     StepMetrics decode_metrics(const float* record) const;
-    void set_accumulation(int micro_batches) { accum_ = micro_batches; }  // forward/backward passes per update (metrics)
+
+    void set_accumulation(int micro_batches) {
+        accum_ = micro_batches;
+    }  // forward/backward passes per update (metrics)
+
     std::vector<float> gate_stats(cudaStream_t s);  // per layer: open fraction of [write, read 1, read 2]
+
     const Config& config() const { return c_; }
+
     const std::vector<Tensor>& tensors() const { return tensors_; }
+
     size_t num_params() const { return n_; }
+
     float* params() { return P_; }
+
     float* grads() { return G_; }
+
     float* adam_m() { return M1_; }
+
     float* adam_v() { return M2_; }
+
     int* step_device() { return step_; }  // updates done (the Adam bias corrections and the schedule)
-    size_t embedding_params() const;      // E (and E_out)
+
+    size_t embedding_params() const;       // E (and E_out)
     void prepare_weights(cudaStream_t s);  // bf16 copies with folded gains (after any change of the parameters)
 
     // per-category GPU time of one step (events around every launch); off by default
     void set_profile(bool on) { profile_ = on; }
 
-    // analysis: silence[n] bit 1 / 2 / 4 drops layer n's hop-1 read / hop-2 read / FFN from the stream; per-token loss (rows with a
-    // target: lse - logit[y], else 0); the queries (0: hop 1, 1: hop 2), read outputs (2: hop 1, 3: hop 2) and keys (4) of
-    // layer n after a forward, [M][H*dh] bf16 (empty if the layer has no such read)
+    // analysis: silence[n] bit 1 / 2 / 4 drops layer n's hop-1 read / hop-2 read / FFN from the stream; per-token loss
+    // (rows with a target: lse - logit[y], else 0); the queries (0: hop 1, 1: hop 2), read outputs (2: hop 1, 3: hop 2)
+    // and keys (4) of layer n after a forward, [M][H*dh] bf16 (empty if the layer has no such read)
     void set_silence(std::vector<int> mask) { silence_ = std::move(mask); }
+
     void keep_row_loss();
     std::vector<float> row_loss(cudaStream_t s);
     std::vector<bf16> download_read(int n, int which, cudaStream_t s);
     // the readout input of token row r after a forward (E0 floats): logits = this . (E or E_out)^T
     std::vector<float> readout_input(int r, cudaStream_t s);
+
     const float* readout_table_params() { return p(c_.tied ? E_ : E_out_); }  // device, V x E0 (fp32)
+
     std::vector<std::pair<std::string, float>> profile_ms();
 
     // discrete decisions of layer n (tests replay them): ridx [M][H][2], gw, gr, gr2 [M][H]
-    void decisions(int n, std::vector<uint8_t>& ridx, std::vector<uint8_t>& gw, std::vector<uint8_t>& gr,
-                   std::vector<uint8_t>& gr2, cudaStream_t s);
+    void decisions(int n,
+                   std::vector<uint8_t>& ridx,
+                   std::vector<uint8_t>& gw,
+                   std::vector<uint8_t>& gr,
+                   std::vector<uint8_t>& gr2,
+                   cudaStream_t s);
 
   private:
     struct LayerIdx {  // tensor indices (-1: absent, the hop-2 tensors of a 1-hop layer)
         int norm1, Wa, nu, theta, Ws, bk, brg, bwg, R, ltau, ltau2 = -1, Wo, Wo2 = -1, ffn_norm, W1, b1, W2, b2,
-            q2_norm = -1, Wq2 = -1, brg2 = -1;
+                                                             q2_norm = -1, Wq2 = -1, brg2 = -1;
     };
+
     struct LayerW {  // bf16 GEMM weights (and the FFN's first bias: the GELU epilogue takes it in bf16)
         bf16 *Wa, *Ws, *Wo, *Wo2, *W1, *W2, *Wq2, *b1;
     };
+
     struct LayerA {  // what the backward needs
         bf16 *xh1, *PV, *sb, *k, *q, *o1, *xh2, *Z, *U, *xh3, *q2, *o2;
         float *rstd1, *s, *kn, *qn, *rp1, *aw, *ar, *rstd2, *rstd3, *q2n, *ar2;
@@ -158,15 +190,30 @@ class Model {
     };
 
     int add(const std::string& name, int rows, int cols, bool decay);
+
     float* p(int i) { return P_ + tensors_[i].off; }
+
     float* g(int i) { return G_ + tensors_[i].off; }
     template <class T>
     T* alloc(size_t n);
     void init(uint64_t seed);
     void layer_fwd(int n, const Batch& b, cudaStream_t s);
     void layer_bwd(int n, const Batch& b, cudaStream_t s);
-    void mm(cudaStream_t s, bool tA, bool tB, int M, int N, int K, const bf16* A, int lda, const bf16* B, int ldb,
-            void* D, int ldd, Out out, float beta = 0.f, const Epilogue& epi = {});
+    void mm(cudaStream_t s,
+            bool tA,
+            bool tB,
+            int M,
+            int N,
+            int K,
+            const bf16* A,
+            int lda,
+            const bf16* B,
+            int ldb,
+            void* D,
+            int ldd,
+            Out out,
+            float beta = 0.f,
+            const Epilogue& epi = {});
     struct BankWrites writes(int n, const Batch& b);
     void tic(cudaStream_t s, const char* cat);
     void toc(cudaStream_t s);
@@ -182,14 +229,18 @@ class Model {
     std::vector<LayerW> lw_;
     std::vector<LayerA> la_;
     bf16 *Eb_ = nullptr, *Eoutb_ = nullptr, *Winb_ = nullptr, *Woutb_ = nullptr;
+
     const bf16* readout_table() const { return c_.tied ? Eb_ : Eoutb_; }
+
     void embed_fwd(const Batch& b, cudaStream_t s);
     void readout_loss(const Batch& b, bool backward, cudaStream_t s);
     float* b2_colsum(int n);  // layer n's b2 gradient when it is a 1-hop layer (else null)
     int accum_ = 1;
+
     Schedule schedule() const {
         return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0, c_.cycles};
     }
+
     float* loga_;
 
     // forward buffers
@@ -210,10 +261,12 @@ class Model {
     bool profile_ = false;
     std::vector<int> silence_;
     float* row_loss_ = nullptr;
+
     struct Mark {
         std::string cat;
         cudaEvent_t a, b;
     };
+
     std::vector<Mark> marks_;
 };
 

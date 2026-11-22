@@ -24,7 +24,9 @@ class TokenFile {
     ~TokenFile();
     TokenFile(const TokenFile&) = delete;
     TokenFile& operator=(const TokenFile&) = delete;
+
     const uint16_t* data() const { return data_; }
+
     size_t size() const { return n_; }
 
   private:
@@ -53,18 +55,31 @@ class Loader {
     // score_prev >= 0: only targets whose input token follows that token (a query marker) are scored
     // aligned: the file is made of whole rows of T tokens (documents never cross a row boundary): every pass cuts the
     // windows at offset 0 instead of a random one
-    Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, uint64_t start_batch = 0,
-           int score_after = -1, int score_prev = -1, bool aligned = false, int slots = 3, Span span = {});
+    Loader(const TokenFile& file,
+           int B,
+           int T,
+           uint64_t seed,
+           int marker = 0,
+           uint64_t start_batch = 0,
+           int score_after = -1,
+           int score_prev = -1,
+           bool aligned = false,
+           int slots = 3,
+           Span span = {});
+
     // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
     static size_t steps_per_pass(size_t tokens, int B, int T) { return tokens > size_t(T) ? (tokens - T) / T / B : 0; }
+
     ~Loader();
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
 
-    HostBatch* next();                            // blocks until the next batch is ready
+    HostBatch* next();                                 // blocks until the next batch is ready
     void release(HostBatch* hb, cudaStream_t stream);  // call after queuing its copies on `stream`: refilled once done
-    double wait_ms() const { return wait_ms_; }   // total time next() has waited
-    double fill_ms() const { return fill_ms_; }   // total time spent filling (the loader thread)
+
+    double wait_ms() const { return wait_ms_; }  // total time next() has waited
+
+    double fill_ms() const { return fill_ms_; }  // total time spent filling (the loader thread)
 
   private:
     void run();
@@ -84,6 +99,7 @@ class Loader {
         cudaEvent_t done = nullptr;
         bool ready = false, pending = false;
     };
+
     std::vector<Slot> slots_;
     size_t produce_ = 0, consume_ = 0;
     std::mutex mu_;
@@ -102,8 +118,9 @@ class MixLoader {
     ~MixLoader();
     MixLoader(const MixLoader&) = delete;
     MixLoader& operator=(const MixLoader&) = delete;
-    HostBatch* next();                                  // blocks until every source's next batch is ready
-    void release(HostBatch* hb, cudaStream_t stream);   // after queuing its copies on `stream`
+    HostBatch* next();                                 // blocks until every source's next batch is ready
+    void release(HostBatch* hb, cudaStream_t stream);  // after queuing its copies on `stream`
+
     const std::vector<long long>& targets() const { return targets_; }  // scored targets per source so far
 
   private:
@@ -124,12 +141,22 @@ class MixLoader {
 class ValidationSet {
   public:
     // aligned: rows start at multiples of T (whole packed rows) instead of at random document starts
-    ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker = 0, int score_after = -1,
-                  int score_prev = -1, bool aligned = false, Span span = {});
+    ValidationSet(const TokenFile& file,
+                  int B,
+                  int T,
+                  int steps,
+                  uint64_t seed,
+                  int marker = 0,
+                  int score_after = -1,
+                  int score_prev = -1,
+                  bool aligned = false,
+                  Span span = {});
     ~ValidationSet();
     ValidationSet(const ValidationSet&) = delete;
     ValidationSet& operator=(const ValidationSet&) = delete;
+
     int steps() const { return int(batches_.size()); }
+
     const HostBatch& batch(int i) const { return batches_[size_t(i)]; }
 
   private:

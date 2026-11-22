@@ -39,16 +39,20 @@ Header read_header(const std::string& path, std::ifstream& f) {
     uint64_t len = 0;
     f.read(magic, 8);
     f.read(reinterpret_cast<char*>(&len), 8);
-    if (!f || std::memcmp(magic, MAGIC, 8) != 0) throw std::runtime_error(path + " is not an lbc checkpoint");
+    if (!f || std::memcmp(magic, MAGIC, 8) != 0) { throw std::runtime_error(path + " is not an lbc checkpoint"); }
     std::string text(len, '\0');
     f.read(text.data(), std::streamsize(len));
-    if (!f) throw std::runtime_error(path + ": truncated header");
+    if (!f) { throw std::runtime_error(path + ": truncated header"); }
     return {json::parse(text), (16 + len + ALIGN - 1) / ALIGN * ALIGN};
 }
 
 }  // namespace
 
-void save_checkpoint(const std::string& path, Model& model, const json::Value& config, int epoch, double best_val_loss,
+void save_checkpoint(const std::string& path,
+                     Model& model,
+                     const json::Value& config,
+                     int epoch,
+                     double best_val_loss,
                      cudaStream_t s) {
     const size_t n = model.num_params();
     int step = 0;
@@ -82,35 +86,36 @@ void save_checkpoint(const std::string& path, Model& model, const json::Value& c
         f.write(pad.data(), std::streamsize(pad.size()));
         f.write(reinterpret_cast<const char*>(buf.data()), std::streamsize(buf.size() * 4));
         f.flush();
-        if (!f) throw std::runtime_error("cannot write " + tmp);
+        if (!f) { throw std::runtime_error("cannot write " + tmp); }
     }
     std::filesystem::rename(tmp, path);
 }
 
 CheckpointInfo read_checkpoint_info(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot read " + path);
+    if (!f) { throw std::runtime_error("cannot read " + path); }
     const Header hd = read_header(path, f);
     CheckpointInfo info;
-    if (const json::Value* v = hd.h.find("epoch")) info.epoch = int(v->num);
-    if (const json::Value* v = hd.h.find("step")) info.step = static_cast<long long>(v->num);
-    if (const json::Value* v = hd.h.find("best_val_loss"); v && !v->is_null()) info.best_val_loss = v->num;
-    if (const json::Value* v = hd.h.find("config")) info.config = *v;
+    if (const json::Value* v = hd.h.find("epoch")) { info.epoch = int(v->num); }
+    if (const json::Value* v = hd.h.find("step")) { info.step = static_cast<long long>(v->num); }
+    if (const json::Value* v = hd.h.find("best_val_loss"); v && !v->is_null()) { info.best_val_loss = v->num; }
+    if (const json::Value* v = hd.h.find("config")) { info.config = *v; }
     return info;
 }
 
 void load_checkpoint(const std::string& path, Model& model, cudaStream_t s) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot read " + path);
+    if (!f) { throw std::runtime_error("cannot read " + path); }
     const Header hd = read_header(path, f);
     const json::Value* tensors = hd.h.find("tensors");
-    if (!tensors || *tensors != manifest(model))
+    if (!tensors || *tensors != manifest(model)) {
         throw std::runtime_error(path + ": its tensors (names, shapes, layout) differ from this model's");
+    }
     const size_t n = model.num_params();
     std::vector<float> buf(3 * n);
     f.seekg(std::streamoff(hd.data_offset));
     f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size() * 4));
-    if (!f) throw std::runtime_error(path + ": truncated data");
+    if (!f) { throw std::runtime_error(path + ": truncated data"); }
     const int step = int(hd.h.find("step") ? hd.h.find("step")->num : 0);
     LBC_CUDA(cudaStreamSynchronize(s));
     LBC_CUDA(cudaMemcpy(model.params(), buf.data(), n * 4, cudaMemcpyHostToDevice));
@@ -123,15 +128,16 @@ void load_checkpoint(const std::string& path, Model& model, cudaStream_t s) {
 
 void load_weights(const std::string& path, Model& model, cudaStream_t s) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot read " + path);
+    if (!f) { throw std::runtime_error("cannot read " + path); }
     const Header hd = read_header(path, f);
     const json::Value* tensors = hd.h.find("tensors");
-    if (!tensors || *tensors != manifest(model))
+    if (!tensors || *tensors != manifest(model)) {
         throw std::runtime_error(path + ": its tensors (names, shapes, layout) differ from this model's");
+    }
     std::vector<float> buf(model.num_params());
     f.seekg(std::streamoff(hd.data_offset));
     f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size() * 4));
-    if (!f) throw std::runtime_error(path + ": truncated data");
+    if (!f) { throw std::runtime_error(path + ": truncated data"); }
     LBC_CUDA(cudaStreamSynchronize(s));
     LBC_CUDA(cudaMemcpy(model.params(), buf.data(), buf.size() * 4, cudaMemcpyHostToDevice));
     model.prepare_weights(s);

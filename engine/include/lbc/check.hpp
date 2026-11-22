@@ -15,8 +15,8 @@ namespace lbc {
 
 }  // namespace lbc
 
-#define LBC_CUDA(call)                                                                                    \
-    do {                                                                                                  \
-        const cudaError_t lbc_err_ = (call);                                                              \
+#define LBC_CUDA(call)                                                                                     \
+    do {                                                                                                   \
+        const cudaError_t lbc_err_ = (call);                                                               \
         if (lbc_err_ != cudaSuccess) ::lbc::fail(#call, cudaGetErrorString(lbc_err_), __FILE__, __LINE__); \
     } while (0)

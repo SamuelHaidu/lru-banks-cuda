@@ -18,7 +18,8 @@ class Tokenizer {
     std::vector<int> encode(const std::string& text) const;  // added tokens (e.g. <call>) are recognized in the text
     std::string decode(const std::vector<int>& ids) const;   // special tokens included
     std::string decode(const int* ids, size_t n) const;
-    int id(const std::string& token) const;                  // -1 when unknown (added tokens and vocab entries)
+    int id(const std::string& token) const;  // -1 when unknown (added tokens and vocab entries)
+
     int vocab_size() const { return int(id_to_token_.size()); }
 
   private:

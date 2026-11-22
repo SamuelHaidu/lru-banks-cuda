@@ -14,40 +14,49 @@ namespace {
 }
 
 json::Value to_value(int x) { return json::Value(x); }
+
 json::Value to_value(double x) { return json::Value(x); }
+
 json::Value to_value(bool x) { return json::Value(x); }
+
 json::Value to_value(const std::string& x) { return json::Value(x); }
+
 template <class T>
 json::Value to_value(const std::vector<T>& xs) {
     json::Value a = json::Value::array();
-    for (const T& x : xs) a.push(to_value(x));
+    for (const T& x : xs) { a.push(to_value(x)); }
     return a;
 }
 
 void from_value(const json::Value& v, int& x, const std::string& key) {
-    if (v.type != json::Value::Number || v.num != std::floor(v.num) || std::fabs(v.num) > 2e9)
+    if (v.type != json::Value::Number || v.num != std::floor(v.num) || std::fabs(v.num) > 2e9) {
         bad(key, "must be an integer");
+    }
     x = int(v.num);
 }
+
 void from_value(const json::Value& v, double& x, const std::string& key) {
     if (v.is_null()) {  // e.g. global_clipnorm: null = off
         x = 0.0;
         return;
     }
-    if (v.type != json::Value::Number) bad(key, "must be a number");
+    if (v.type != json::Value::Number) { bad(key, "must be a number"); }
     x = v.num;
 }
+
 void from_value(const json::Value& v, bool& x, const std::string& key) {
-    if (v.type != json::Value::Bool) bad(key, "must be true or false");
+    if (v.type != json::Value::Bool) { bad(key, "must be true or false"); }
     x = v.b;
 }
+
 void from_value(const json::Value& v, std::string& x, const std::string& key) {
-    if (v.type != json::Value::String) bad(key, "must be a string");
+    if (v.type != json::Value::String) { bad(key, "must be a string"); }
     x = v.str;
 }
+
 template <class T>
 void from_value(const json::Value& v, std::vector<T>& xs, const std::string& key) {
-    if (v.type != json::Value::Array) bad(key, "must be a list");
+    if (v.type != json::Value::Array) { bad(key, "must be a list"); }
     xs.clear();
     for (size_t i = 0; i < v.arr.size(); ++i) {
         T x{};
@@ -59,44 +68,52 @@ void from_value(const json::Value& v, std::vector<T>& xs, const std::string& key
 struct Writer {
     json::Value root = json::Value::object();
     json::Value* cur = nullptr;
+
     void begin(const char* section) {
         root[section] = json::Value::object();
         cur = &root[section];
     }
+
     template <class T>
     void operator()(const char* key, const T& x) {
         (*cur)[key] = to_value(x);
     }
+
     void end() {}
 };
 
 struct Reader {
     explicit Reader(const json::Value& r) : root(r) {}
+
     const json::Value& root;
     const json::Value* cur = nullptr;
     std::string section;
     std::vector<std::string> seen, sections;
+
     void begin(const char* s) {
         section = s;
         sections.push_back(s);
         seen.clear();
         cur = root.find(s);
-        if (cur && !cur->is_object()) bad(section, "must be an object");
+        if (cur && !cur->is_object()) { bad(section, "must be an object"); }
     }
+
     template <class T>
     void operator()(const char* key, T& x) {
         seen.push_back(key);
-        if (!cur) return;
-        if (const json::Value* v = cur->find(key)) from_value(*v, x, section + "." + key);
+        if (!cur) { return; }
+        if (const json::Value* v = cur->find(key)) { from_value(*v, x, section + "." + key); }
     }
+
     void end() {
-        if (!cur) return;
-        for (const auto& [k, v] : cur->obj)
+        if (!cur) { return; }
+        for (const auto& [k, v] : cur->obj) {
             if (std::find(seen.begin(), seen.end(), k) == seen.end()) {
                 std::string allowed;
-                for (const auto& s : seen) allowed += (allowed.empty() ? "" : ", ") + s;
+                for (const auto& s : seen) { allowed += (allowed.empty() ? "" : ", ") + s; }
                 bad(section + "." + k, "is not a known key (known: " + allowed + ")");
             }
+        }
     }
 };
 
@@ -162,7 +179,7 @@ void visit(V& v, RC& c) {
 }
 
 void check(bool ok, const std::string& key, const std::string& what) {
-    if (!ok) bad(key, what);
+    if (!ok) { bad(key, what); }
 }
 
 }  // namespace
@@ -174,13 +191,15 @@ json::Value RunConfig::to_json() const {
 }
 
 RunConfig RunConfig::from_json(const json::Value& v) {
-    if (!v.is_object()) throw std::runtime_error("config: the top level must be an object");
+    if (!v.is_object()) { throw std::runtime_error("config: the top level must be an object"); }
     RunConfig rc;
     Reader r(v);
     visit(r, rc);
-    for (const auto& [k, x] : v.obj)
-        if (std::find(r.sections.begin(), r.sections.end(), k) == r.sections.end())
+    for (const auto& [k, x] : v.obj) {
+        if (std::find(r.sections.begin(), r.sections.end(), k) == r.sections.end()) {
             bad(k, "is not a known section (arch_params, data, training, runtime)");
+        }
+    }
     rc.validate();
     return rc;
 }
@@ -193,32 +212,36 @@ void RunConfig::validate() const {
           "arch_params.vocabulary_size", "must be a multiple of 8 in [8, 65536] (uint16 tokens)");
     check(a.dim >= 32 && a.dim <= 1024 && a.dim % 32 == 0, "arch_params.dim",
           "must be a multiple of 32 in [32, 1024] (the norm backward)");
-    if (a.factorized)
+    if (a.factorized) {
         check(a.embed_dim >= 8 && a.embed_dim % 8 == 0, "arch_params.embed_dim", "must be a positive multiple of 8");
+    }
     check(a.num_layers >= 1, "arch_params.num_layers", "must be at least 1");
     check(a.hops.empty() || int(a.hops.size()) == a.num_layers, "arch_params.hops",
           "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (2 everywhere)");
-    for (int h : a.hops) check(h == 1 || h == 2, "arch_params.hops", "entries must be 1 or 2");
+    for (int h : a.hops) { check(h == 1 || h == 2, "arch_params.hops", "entries must be 1 or 2"); }
     check(a.lru_dim >= 4 && a.lru_dim % 4 == 0, "arch_params.lru_dim", "must be a positive multiple of 4");
     check(a.num_heads >= 1, "arch_params.num_heads", "must be at least 1");
     check(ffn_dim() >= 8 && ffn_dim() % 8 == 0, "arch_params.ffn_mult", "x dim must be a positive multiple of 8");
-    for (const auto* hl : {&a.lru_half_life, &a.slot_half_life})
+    for (const auto* hl : {&a.lru_half_life, &a.slot_half_life}) {
         check(hl->size() == 2 && (*hl)[0] > 0 && (*hl)[0] <= (*hl)[1],
               hl == &a.lru_half_life ? "arch_params.lru_half_life" : "arch_params.slot_half_life",
               "must be [min, max] with 0 < min <= max");
+    }
     check(a.tau > 0, "arch_params.tau", "must be positive");
     check(a.gate_budget >= 0, "arch_params.gate_budget", "must be >= 0");
     check(a.window_size >= 8 && a.window_size % 8 == 0, "arch_params.window_size", "must be a positive multiple of 8");
     check(a.head_dim == 32 || a.head_dim == 64, "arch_params.head_dim", "must be 32 or 64 (the kernels' sizes)");
     check(a.bank_slots.empty() || int(a.bank_slots.size()) == a.num_layers, "arch_params.bank_slots",
           "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be [] (128 everywhere)");
-    for (int n : a.bank_slots)
+    for (int n : a.bank_slots) {
         check(n >= 2 && n <= SLOTS, "arch_params.bank_slots", "entries must be in [2, " + std::to_string(SLOTS) + "]");
+    }
     check(a.topk == 2, "arch_params.topk", "is fixed at 2 by the kernels");
     check(data.batch_size >= 1, "data.batch_size", "must be at least 1");
     check(data.micro_batch_size == 0 || (data.micro_batch_size >= 1 && data.batch_size % data.micro_batch_size == 0),
           "data.micro_batch_size", "must be 0 or divide data.batch_size");
-    check(data.mix_datasets.size() == data.mix_fractions.size(), "data.mix_fractions", "needs one entry per mix dataset");
+    check(data.mix_datasets.size() == data.mix_fractions.size(), "data.mix_fractions",
+          "needs one entry per mix dataset");
     {
         int mixed = 0;
         for (double f : data.mix_fractions) {
@@ -296,14 +319,13 @@ Config RunConfig::model_config() const {
 
 RunConfig load_run_config(const std::string& run_dir) {
     const std::string path = run_dir + "/config.json";
-    if (!std::filesystem::exists(path))
-        throw std::runtime_error("no config at " + path + ": create the run first (lbc create " + run_dir +
-                                 " --dataset DIR)");
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("no config at " + path + ": create the run first (lbc create " + run_dir
+                                 + " --dataset DIR)");
+    }
     try {
         return RunConfig::from_json(json::read_file(path));
-    } catch (const std::exception& e) {
-        throw std::runtime_error(path + ": " + e.what());
-    }
+    } catch (const std::exception& e) { throw std::runtime_error(path + ": " + e.what()); }
 }
 
 void save_run_config(const std::string& run_dir, const RunConfig& rc) {
@@ -315,7 +337,7 @@ void save_run_config(const std::string& run_dir, const RunConfig& rc) {
 RunConfig with_keys(const RunConfig& rc, const std::vector<std::pair<std::string, std::string>>& kv) {
     json::Value v = rc.to_json();
     for (const auto& [dotted, raw] : kv) {
-        if (!json::get(v, dotted)) throw std::runtime_error("config: no key " + dotted);
+        if (!json::get(v, dotted)) { throw std::runtime_error("config: no key " + dotted); }
         json::Value x;
         try {
             x = json::parse(raw);
@@ -339,24 +361,29 @@ DatasetMeta DatasetMeta::load(const std::string& dir) {
     d.name = name && name->type == json::Value::String ? name->str : std::filesystem::path(dir).filename().string();
     auto integer = [&](const char* key) {
         const json::Value* v = m.find(key);
-        if (!v || v->type != json::Value::Number) throw std::runtime_error(dir + "/metadata.json: no " + key);
+        if (!v || v->type != json::Value::Number) { throw std::runtime_error(dir + "/metadata.json: no " + key); }
         return int(v->num);
     };
     d.vocabulary_size = integer("vocabulary_size");
     d.doc_token_id = integer("doc_token_id");
-    if (const json::Value* sa = m.find("score_after_token"); sa && sa->type == json::Value::Number)
+    if (const json::Value* sa = m.find("score_after_token"); sa && sa->type == json::Value::Number) {
         d.score_after_token = int(sa->num);
-    if (const json::Value* sp = m.find("score_prev_token"); sp && sp->type == json::Value::Number)
+    }
+    if (const json::Value* sp = m.find("score_prev_token"); sp && sp->type == json::Value::Number) {
         d.score_prev_token = int(sp->num);
-    if (const json::Value* rl = m.find("row_length"); rl && rl->type == json::Value::Number) d.row_length = int(rl->num);
+    }
+    if (const json::Value* rl = m.find("row_length"); rl && rl->type == json::Value::Number) {
+        d.row_length = int(rl->num);
+    }
     if (const json::Value* ls = m.find("loss_spans"); ls && ls->type == json::Value::Array && !ls->arr.empty()) {
-        if (ls->arr.size() != 1 || ls->arr[0].type != json::Value::Array || ls->arr[0].arr.size() != 2)
+        if (ls->arr.size() != 1 || ls->arr[0].type != json::Value::Array || ls->arr[0].arr.size() != 2) {
             throw std::runtime_error(dir + "/metadata.json: loss_spans: one [open, close] pair is supported");
+        }
         d.span_open = int(ls->arr[0].arr[0].num);
         d.span_close = int(ls->arr[0].arr[1].num);
     }
     double avg = 0.0;
-    if (const json::Value* a = m.find("avg_chars_per_token"); a && a->type == json::Value::Number) avg = a->num;
+    if (const json::Value* a = m.find("avg_chars_per_token"); a && a->type == json::Value::Number) { avg = a->num; }
     auto split = [&](const char* s, std::string& file, double& cpt) {
         const json::Value* sp = m.find(s);
         const json::Value* f = sp ? sp->find("file") : nullptr;
