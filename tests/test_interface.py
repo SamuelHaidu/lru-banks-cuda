@@ -133,7 +133,14 @@ class TestArchContract(unittest.TestCase):
                 x = ops.convert_to_tensor(
                     np.random.randint(0, m.vocabulary_size, (4, m.context_length)).astype("int32")
                 )
-                loss = ops.mean(m(x, training=True) ** 2)
+                if type(m).compute_loss is not keras.Model.compute_loss:
+                    # the arch trains extra heads through its own loss (dual-sphere-dual-readout: a second readout
+                    # that `call()` does not return): take the gradient of that loss, the path training uses
+                    m.compile(optimizer="sgd")  # creates the loss tracker its compute_loss updates
+                    y = ops.convert_to_tensor(np.random.randint(0, m.vocabulary_size, (4,)).astype("int32"))
+                    loss = m.compute_loss(x=x, y=y, y_pred=m(x, training=True), training=True)
+                else:
+                    loss = ops.mean(m(x, training=True) ** 2)
                 grads = torch.autograd.grad(loss, [v.value for v in m.trainable_variables], allow_unused=True)
                 for var, grad in zip(m.trainable_variables, grads):
                     self.assertIsNotNone(grad, f"{name}: no gradient for {var.name}")
