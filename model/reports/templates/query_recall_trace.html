@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Query recall trace -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>How does Block 1 recall a name from context?</h1>
+    <div class="subtitle">Causal attention and the retrieval query, traced for in-context name recall</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">prompts <strong>{{ num_cases }}</strong></span>
+      <span class="tag">heads <strong>{{ num_heads }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Why this report</h2>
+    <p class="hint">
+      Each prompt introduces a name once, then reaches a point where the
+      trained model's own next-token prediction is that same name reappearing
+      -- a genuine in-context recall case, not a hand-picked target. For each
+      one this shows Block 1's causal self-attention (highlighting where the
+      final context position, which feeds the retrieval query, looks back
+      to) and the resulting 128-D query's cosine similarity against the big
+      table, i.e. what the softmax retrieval step actually sees. This is an
+      intermediate signal, not the final prediction: Block 2 and the FFN
+      readout still transform the retrieved vector before the actual next-
+      token logits are produced, so a name ranking poorly here does not by
+      itself mean the model fails to predict it.
+      <strong>Entropy ratio</strong> measures how uniform the retrieval
+      softmax is (1.0 = exactly uniform, i.e. retrieval ignores the query
+      entirely and always returns the same average-of-vocabulary vector; 0.0
+      = fully concentrated on one token). Cases are sorted below from least
+      to most uniform, so the prompts where retrieval is most
+      content-dependent come first. The ablation columns compare the real
+      next-token rank of the target name against its rank when the retrieved
+      vector is replaced by the exact uniform-softmax vector, using every
+      other weight unchanged -- this isolates what the retrieval step itself
+      is contributing.
+    </p>
+    <div class="stat-grid">
+      <div class="stat {{ 'good' if num_hits == num_cases else 'neutral' }}">
+        <div class="label">Exact top-1 recall</div>
+        <div class="value">{{ num_hits }} / {{ num_cases }}</div>
+      </div>
+      <div class="stat {{ 'bad' if mean_retrieval_invariance > 0.9 else ('good' if mean_retrieval_invariance < 0.5 else 'neutral') }}">
+        <div class="label">Mean retrieval invariance</div>
+        <div class="value">{{ "%.3f"|format(mean_retrieval_invariance) }}</div>
+      </div>
+      <div class="stat {{ 'bad' if mean_entropy_ratio > 0.9 else ('good' if mean_entropy_ratio < 0.5 else 'neutral') }}">
+        <div class="label">Mean entropy ratio</div>
+        <div class="value">{{ "%.3f"|format(mean_entropy_ratio) }}</div>
+      </div>
+      <div class="stat neutral">
+        <div class="label">Recall unaffected by ablation</div>
+        <div class="value">{{ unaffected_by_ablation }} / {{ num_cases }}</div>
+      </div>
+    </div>
+  </section>
+
+  {% for c in cases %}
+  <section class="card">
+    <h2>"{{ c.name }}" &middot;
+      <span class="badge {{ 'green' if c.is_top1 else 'grey' }}">
+        predicted "{{ c.predicted_token.strip() }}"{{ ' (top-1)' if c.is_top1 else '' }}
+      </span>
+      <span class="badge grey">entropy ratio {{ "%.3f"|format(c.entropy_ratio) }}</span>
+    </h2>
+    <p class="hint">
+      Prompt: <code class="inline">{{ c.prompt }}</code><br>
+      Target name rank in the big-table similarity ranking:
+      <strong>{{ c.target_rank }}</strong> (cosine similarity {{ "%.3f"|format(c.target_sim) }}).
+      The occurrence(s) of "{{ c.name }}" in the prompt are outlined in red below.
+    </p>
+
+    <h3>Retrieval softmax</h3>
+    <p class="hint">
+      Retrieval invariance {{ "%.3f"|format(c.retrieval_invariance) }} (cosine
+      similarity between this prompt's retrieved vector and the vector a
+      perfectly uniform softmax would produce; 1.0 = indistinguishable from
+      uniform). Ablation: with the real retrieved vector, "{{ c.name }}" ranks
+      <strong>{{ c.rank_with_real_retrieval }}</strong>; substituting the
+      exact uniform-softmax vector instead, it ranks
+      <strong>{{ c.rank_with_uniform_retrieval }}</strong>
+      (top prediction becomes "{{ c.predicted_with_uniform_retrieval.strip() }}").
+    </p>
+    <table class="data-table">
+      <thead><tr><th>rank</th><th>token</th><th>softmax weight</th><th>vs. uniform ({{ "%.1e"|format(c.uniform_weight) }})</th></tr></thead>
+      <tbody>
+        {% for token, w in c.top_weight_tokens %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td><span class="token-pill {{ 'big' if token.strip() != c.name else 'small' }}">{{ token }}</span></td>
+          <td>{{ "%.2e"|format(w) }}</td>
+          <td>{{ "%.1fx"|format(w / c.uniform_weight) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>Block 1 attention (final context position)</h3>
+    <div class="plot">{{ c.plots.last_row | safe }}</div>
+
+    <h3>Full attention matrix</h3>
+    <div class="two-col">
+      {% for head_plot in c.plots.heads %}
+      <div class="plot">{{ head_plot | safe }}</div>
+      {% endfor %}
+    </div>
+
+    <h3>Query vs. big table (cosine similarity, not retrieval weight)</h3>
+    <div class="plot">{{ c.plots.similarity | safe }}</div>
+    <table class="data-table">
+      <thead><tr><th>rank</th><th>token</th><th>cosine similarity</th></tr></thead>
+      <tbody>
+        {% for token, sim in c.top_tokens %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td><span class="token-pill {{ 'big' if token.strip() != c.name else 'small' }}">{{ token }}</span></td>
+          <td>{{ "%.3f"|format(sim) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model report query-recall-trace</code> &middot;
+    checkpoint <code class="inline">{{ checkpoint_path }}</code>
+  </footer>
+
+</div>
+</body>
+</html>

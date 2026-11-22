@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Retrieval behavior on real data -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>What does retrieval do on real training data?</h1>
+    <div class="subtitle">Hits vs. top-{{ 10 }} misses, sampled across short/medium/long context lengths</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">hit cases <strong>{{ num_hits }}</strong></span>
+      <span class="tag">miss cases <strong>{{ num_misses }}</strong></span>
+      <span class="tag">buckets <strong>{{ buckets | join(', ') }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Why this report</h2>
+    <p class="hint">
+      `query-recall-trace` used hand-crafted name-recall prompts and found
+      the softmax retrieval step near-uniform for every one of them. This
+      report samples real <code class="inline">(context, target)</code> pairs
+      directly from the training corpus -- the same random-document,
+      random-cut-point scheme the model was trained with -- across three
+      context-length buckets ({{ buckets | join(', ') }}), and separates
+      cases the model gets exactly right (target is its own top-1
+      prediction) from cases it gets badly wrong (target falls outside its
+      own top-10), so both successful and failing retrieval can be compared
+      on ordinary text, not just names.
+    </p>
+    <div class="stat-grid">
+      <div class="stat {{ 'bad' if mean_entropy_ratio > 0.9 else ('good' if mean_entropy_ratio < 0.5 else 'neutral') }}">
+        <div class="label">Mean entropy ratio (all cases)</div>
+        <div class="value">{{ "%.3f"|format(mean_entropy_ratio) }}</div>
+      </div>
+      <div class="stat {{ 'bad' if mean_retrieval_invariance > 0.9 else ('good' if mean_retrieval_invariance < 0.5 else 'neutral') }}">
+        <div class="label">Mean retrieval invariance</div>
+        <div class="value">{{ "%.3f"|format(mean_retrieval_invariance) }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Hit cases (target is the top-1 prediction)</h2>
+    <p class="hint">
+      Entropy ratio: 1.0 = retrieval softmax is exactly uniform (ignores the
+      query). Ablation rank: the target's rank when the retrieved vector is
+      replaced by the exact uniform-softmax vector, all else unchanged.
+    </p>
+    <table class="data-table">
+      <thead>
+        <tr><th>bucket</th><th>context length</th><th>target</th><th>entropy ratio</th><th>ablation rank</th></tr>
+      </thead>
+      <tbody>
+        {% for c in hits %}
+        <tr>
+          <td><span class="badge grey">{{ c.bucket }}</span></td>
+          <td>{{ c.context_length }}</td>
+          <td><span class="token-pill small">{{ c.target_token }}</span></td>
+          <td>{{ "%.3f"|format(c.entropy_ratio) }}</td>
+          <td>1 &rarr; {{ c.rank_with_uniform_retrieval }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% for c in hits %}
+    <h3>{{ c.bucket }} &middot; context length {{ c.context_length }} &middot; target "{{ c.target_token.strip() }}"</h3>
+    <p class="hint">
+      Context: <code class="inline">{{ c.prompt_text }}</code><br>
+      Predicted "{{ c.predicted_token.strip() }}" (target rank {{ c.target_rank }}).
+      Retrieval invariance {{ "%.3f"|format(c.retrieval_invariance) }}.
+      With the uniform-softmax vector substituted in, target rank becomes
+      <strong>{{ c.rank_with_uniform_retrieval }}</strong>
+      (top prediction "{{ c.predicted_with_uniform_retrieval.strip() }}").
+    </p>
+    <div class="two-col">
+      <div class="plot">{{ c.plots.last_row | safe }}</div>
+      <div class="plot">{{ c.plots.weights | safe }}</div>
+    </div>
+    <div class="plot">{{ c.plots.heatmap | safe }}</div>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <h2>Miss cases (target outside the model's own top-10)</h2>
+    <p class="hint">
+      Same diagnostics, for cases where the model fails badly. If retrieval
+      were doing real work, a miss might show a sharply concentrated softmax
+      pointing at the wrong content; if retrieval is inert here too, entropy
+      ratio and ablation rank should look just like the hit cases above.
+    </p>
+    <table class="data-table">
+      <thead>
+        <tr><th>bucket</th><th>context length</th><th>target</th><th>predicted</th><th>target rank</th><th>entropy ratio</th></tr>
+      </thead>
+      <tbody>
+        {% for c in misses %}
+        <tr>
+          <td><span class="badge grey">{{ c.bucket }}</span></td>
+          <td>{{ c.context_length }}</td>
+          <td><span class="token-pill small">{{ c.target_token }}</span></td>
+          <td><span class="token-pill big">{{ c.predicted_token }}</span></td>
+          <td>{{ c.target_rank }}</td>
+          <td>{{ "%.3f"|format(c.entropy_ratio) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {% for c in misses %}
+    <h3>{{ c.bucket }} &middot; context length {{ c.context_length }} &middot; target "{{ c.target_token.strip() }}" (missed)</h3>
+    <p class="hint">
+      Context: <code class="inline">{{ c.prompt_text }}</code><br>
+      Predicted "{{ c.predicted_token.strip() }}" instead; target rank
+      {{ c.target_rank }}. Top-10 predicted:
+      {% for t in c.top10_tokens %}<span class="token-pill big">{{ t }}</span>{% endfor %}<br>
+      Retrieval invariance {{ "%.3f"|format(c.retrieval_invariance) }}.
+      With the uniform-softmax vector substituted in, target rank becomes
+      <strong>{{ c.rank_with_uniform_retrieval }}</strong>
+      (top prediction "{{ c.predicted_with_uniform_retrieval.strip() }}").
+    </p>
+    <div class="two-col">
+      <div class="plot">{{ c.plots.last_row | safe }}</div>
+      <div class="plot">{{ c.plots.weights | safe }}</div>
+    </div>
+    <div class="plot">{{ c.plots.heatmap | safe }}</div>
+    {% endfor %}
+  </section>
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model report retrieval-behavior-trace</code> &middot;
+    checkpoint <code class="inline">{{ checkpoint_path }}</code>
+  </footer>
+
+</div>
+</body>
+</html>

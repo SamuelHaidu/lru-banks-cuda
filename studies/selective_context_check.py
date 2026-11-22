@@ -23,7 +23,7 @@ import sys
 import numpy as np
 
 sys.argv, _argv = sys.argv[:1], sys.argv  # keep model imports from parsing our flags
-from model.scripts._model_io import load_full_model, load_tokenizer  # noqa: E402
+from model.reports._model_io import load_full_model, load_tokenizer  # noqa: E402
 sys.argv = _argv
 
 FUNCTION = {"the", "a", "an", "to", "and", "was", "has", "had", "of", "in", "on", "at", "it", "is", "that", "with",

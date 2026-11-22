@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PGA of dual embeddings -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>Principal Geodesic Analysis: does the big table reduce to the small one?</h1>
+    <div class="subtitle">Tangent-space PCA on S^{{ dim_out - 1 }}, projected to {{ components }} components</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">components <strong>{{ components }}</strong></span>
+      <span class="tag">vocabulary <strong>{{ "{:,}".format(vocab_size) }}</strong></span>
+      <span class="tag">dim_in <strong>{{ dim_in }}</strong> / dim_out <strong>{{ dim_out }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Geodesic variance explained</h2>
+    <p class="hint">
+      Principal Geodesic Analysis is PCA performed in the tangent space at the
+      Karcher (geodesic) mean of the big table, then mapped back with the
+      exponential map. The bars show the fraction of tangent-space variance
+      each of the {{ components }} leading components captures.
+    </p>
+    <div class="stat-grid">
+      <div class="stat neutral">
+        <div class="label">Components</div>
+        <div class="value">{{ components }}</div>
+      </div>
+      <div class="stat {{ 'good' if cumulative_variance > 0.5 else ('bad' if cumulative_variance < 0.2 else 'neutral') }}">
+        <div class="label">Cumulative variance ({{ components }} comps)</div>
+        <div class="value">{{ "%.1f%%"|format(cumulative_variance * 100) }}</div>
+      </div>
+    </div>
+    <div class="plot">{{ plots.variance | safe }}</div>
+  </section>
+
+  {% if aligned_available %}
+  <section class="card">
+    <h2>Alignment with the small table</h2>
+    <p class="hint">
+      The {{ components }}-D PGA embedding of the big table lives in an
+      arbitrary rotation of its own tangent chart, so it is aligned to the
+      small table (same dimension, {{ dim_in }}) with the best orthogonal
+      (Procrustes) rotation before comparing. A high cosine similarity per
+      token after alignment means the small table already encodes most of
+      what an 8-component summary of the big table would give you.
+    </p>
+    <div class="stat-grid">
+      <div class="stat {{ 'good' if mean_cos_sim > 0.5 else ('bad' if mean_cos_sim < 0.15 else 'neutral') }}">
+        <div class="label">Mean cosine similarity</div>
+        <div class="value">{{ "%.3f"|format(mean_cos_sim) }}</div>
+      </div>
+      <div class="stat neutral">
+        <div class="label">Median cosine similarity</div>
+        <div class="value">{{ "%.3f"|format(median_cos_sim) }}</div>
+      </div>
+      <div class="stat {{ 'good' if frac_above_0_5 > 0.5 else ('bad' if frac_above_0_5 < 0.15 else 'neutral') }}">
+        <div class="label">Tokens with cos sim &gt; 0.5</div>
+        <div class="value">{{ "%.1f%%"|format(frac_above_0_5 * 100) }}</div>
+      </div>
+    </div>
+    <div class="plot">{{ plots.histogram | safe }}</div>
+
+    <div class="two-col">
+      <div>
+        <h3>Best-aligned tokens</h3>
+        <table class="data-table">
+          <thead><tr><th>token</th><th>cos sim</th></tr></thead>
+          <tbody>
+            {% for t in best_tokens %}
+            <tr><td><span class="token-pill small">{{ t.token }}</span></td><td>{{ "%.3f"|format(t.cos_sim) }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <h3>Worst-aligned tokens</h3>
+        <table class="data-table">
+          <thead><tr><th>token</th><th>cos sim</th></tr></thead>
+          <tbody>
+            {% for t in worst_tokens %}
+            <tr><td><span class="token-pill big">{{ t.token }}</span></td><td>{{ "%.3f"|format(t.cos_sim) }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  {% else %}
+  <section class="card">
+    <h2>Alignment with the small table</h2>
+    <p class="hint">
+      <span class="badge grey">skipped</span>
+      Alignment against the small table requires matching dimensions
+      (--components == dim_in == {{ dim_in }}); this run used
+      {{ components }} components, so no rotation-invariant comparison is
+      shown. Re-run with <code class="inline">--components {{ dim_in }}</code>
+      for the alignment section.
+    </p>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Leading geodesic axes</h2>
+    <p class="hint">
+      Big-table tokens projected onto their first two principal geodesics,
+      colored by position along the first axis.
+    </p>
+    <div class="plot">{{ plots.scatter_pga | safe }}</div>
+  </section>
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model report pga-dual-embeddings</code> &middot;
+    checkpoint <code class="inline">{{ checkpoint_path }}</code>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -151,7 +151,7 @@ readout. Embedding std 0.02. `num_layers` stacks layers. Runs saved before these
 saved `mlp_residual`.
 `uv run python ad_hoc_scripts/rsm_gate_retention.py --run-name X` reports the learned decays, bank use and the
 read gate; `rsm_name_recall.py` tests recall of rare multi-token names.
-`model scripts rsm-bank-stepper --run-name X [--text "..."] [--name " Roxy"]` writes an interactive page
+`model report rsm-bank-stepper --run-name X [--text "..."] [--name " Roxy"]` writes an interactive page
 (`reports/rsm_bank_stepper.html`, open at a step with `#doc=0&t=79&bank=71`): the read as exact attention over
 past tokens (a weighted average of values, so token j's weight is `sum_b r_tb (1-mu_b) mu_b^(t-j) w_jb / sum_b r_tb z_b`),
 each bank's write / read at the token, a banks x tokens heatmap, what the selected bank stores, and the state's token
@@ -897,14 +897,14 @@ the LRU input gate (layers >= `gate_from`), and every layer's gate at the select
 ## Scripts
 
 ```bash
-model scripts <name> --run-name baseline [args...]
+model report <name> --run-name baseline [args...]
 ```
 
 One-off analysis scripts, each writing an HTML report to
-`runs/<run-name>/reports/`. See `model scripts <name> --help` for arguments.
+`runs/<run-name>/reports/`. See `model report <name> --help` for arguments.
 
 - `pga-dual-embeddings` — Principal Geodesic Analysis of the big embedding table vs. the small one.
-- `spherical-k-means` — clusters both embedding tables and compares agreement.
+- `spherical-kmeans` — clusters both embedding tables and compares agreement.
 - `table-neighbor-agreement` — checks whether the small table's neighbor structure matches the big table's.
 - `query-recall-trace` — traces Block 1 attention and retrieval for hand-crafted name-recall prompts.
 - `retrieval-behavior-trace` — same trace, sampled from real training data (hits vs. top-10 misses).

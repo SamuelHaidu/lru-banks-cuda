@@ -182,20 +182,34 @@ def cmd_distill_train(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_scripts(args: argparse.Namespace) -> int:
-    import importlib
+def cmd_report(args: argparse.Namespace) -> int:
+    from model import reports as rep
 
-    from model.scripts import SCRIPTS
-
-    if args.script not in SCRIPTS:
-        print(f"Unknown script {args.script!r}. Available: {sorted(SCRIPTS)}", file=sys.stderr)
+    argv = list(args.report_args or [])
+    run = args.run_name or rep.run_name_of(argv)
+    if args.run_name:  # given before the report name: forward it to the report
+        argv = ["--run-name", args.run_name] + argv
+    arch = cfg_mod.load(run)["arch"] if run else None
+    if args.name is None:  # list
+        found = rep.for_arch(arch) if arch else list(rep.reports().values())
+        print(f"Reports for {run} ({arch}):" if arch else "Reports (model report <name> --run-name X):")
+        print("\n".join(rep.describe(r) for r in found) if found else "  none for this architecture")
+        return 0
+    all_reports = rep.reports()
+    if args.name not in all_reports:
+        print(f"Unknown report {args.name!r}. Available: {', '.join(sorted(all_reports))}", file=sys.stderr)
         return 1
-
-    module = importlib.import_module(SCRIPTS[args.script])
-    script_args = module.build_parser().parse_args(args.script_args or [])
-    if getattr(script_args, "run_name", None):  # cross-run scripts (e.g. compare-runs) take no run
-        _apply_device(script_args.run_name)
-    return module.main(args.script_args or [])
+    r = all_reports[args.name]
+    if r.needs_run and not run and "-h" not in argv and "--help" not in argv:
+        print(f"{r.name} needs --run-name", file=sys.stderr)
+        return 1
+    if arch and r.needs_run and not r.supports(arch):
+        others = ", ".join(x.name for x in rep.for_arch(arch)) or "none"
+        print(f"{r.name} is for {', '.join(r.archs)}; {run} is {arch} (its reports: {others})", file=sys.stderr)
+        return 1
+    if run:
+        _apply_device(run)
+    return r.load().main(argv)
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -344,14 +358,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_distill_train)
 
     p = sub.add_parser(
-        "scripts",
-        help="Run a one-off analysis script (see `model scripts <name> --help`).",
+        "report",
+        help="Analysis reports per architecture: list them, or write one as HTML under runs/<run>/reports/.",
+        description="model report: list every report; model report --run-name X: the reports for X's "
+        "architecture; model report <name> --run-name X [args]: write one (model report <name> --help).",
     )
-    from model.scripts import SCRIPTS
-
-    p.add_argument("script", choices=sorted(SCRIPTS), help="Name of the script to run.")
-    p.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments forwarded to the script.")
-    p.set_defaults(func=cmd_scripts)
+    p.add_argument("--run-name", default=None, help="The run (lists its architecture's reports without a name).")
+    p.add_argument("name", nargs="?", default=None, help="The report to write (omit to list).")
+    p.add_argument("report_args", nargs=argparse.REMAINDER, help="Arguments forwarded to the report.")
+    p.set_defaults(func=cmd_report)
 
     return parser
 

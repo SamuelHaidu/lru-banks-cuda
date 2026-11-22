@@ -24,7 +24,7 @@ import torch  # noqa: E402
 from model import config as cfg_mod  # noqa: E402
 import model.archs  # noqa: E402,F401
 from model.evaluate import load_checkpoint  # noqa: E402
-from model.scripts._model_io import load_tokenizer  # noqa: E402
+from model.reports._model_io import load_tokenizer  # noqa: E402
 
 STORY = ("Once upon a time, there was a little dog named{A}.{A} liked to run and play in the park every day. "
          "One day,{A} found a big red ball under a tree. The ball was shiny and new.{A} was very happy. "

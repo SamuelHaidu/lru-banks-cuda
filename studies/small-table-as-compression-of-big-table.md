@@ -54,10 +54,10 @@ a priori unrelated geometries.
 ## Method of data collection
 
 Three independent analyses, implemented as `keras.ops`-only scripts under
-`model/scripts/` and run against the trained checkpoint's small/big embedding
+`model/reports/` and run against the trained checkpoint's small/big embedding
 tables (both L2-normalized before analysis):
 
-1. **`model scripts pga-dual-embeddings --run-name transformer-alibi-retriver`**
+1. **`model report pga-dual-embeddings --run-name transformer-alibi-retriver`**
    Principal Geodesic Analysis (tangent-space PCA at the Karcher mean) of the
    big table, reduced to 8 components to match `dim_in`. The 8-D PGA
    embedding is aligned to the small table with the best single orthogonal
@@ -67,14 +67,14 @@ tables (both L2-normalized before analysis):
    - Only **27.2%** of tokens exceed 0.5 cosine similarity after the best
      possible single rotation.
 
-2. **`model scripts spherical-k-means --run-name transformer-alibi-retriver -k 32`**
+2. **`model report spherical-kmeans --run-name transformer-alibi-retriver -k 32`**
    Spherical k-means (k = 32) run independently on each table, then compared
    via Adjusted Rand Index and Normalized Mutual Information over the shared
    10,000 tokens.
    - ARI: **0.095**, NMI: **0.264** -- weak agreement between the two
      tables' induced partitions of the vocabulary.
 
-3. **`model scripts table-neighbor-agreement --run-name transformer-alibi-retriver`**
+3. **`model report table-neighbor-agreement --run-name transformer-alibi-retriver`**
    For every token, its 10 nearest neighbors (cosine similarity) are found
    independently in each table and intersected -- a rotation- and
    partition-invariant test of "are a token's neighbors preserved across

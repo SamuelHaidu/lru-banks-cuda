@@ -197,4 +197,6 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
 - **Web chat:** `uv run python webchat/server.py [--port 8000]`, at http://localhost:8000. Chat with tool execution,
   Complete for plain-text runs, Inspect (lru-banks: read weights over past positions). For the math models: clear the
   system prompt, tick only `calculator`.
-- **One-off analysis scripts:** `model scripts <name> --run-name X` (HTML reports under `runs/X/reports/`).
+- **Reports, per architecture** (`model/reports/`): `model report --run-name X` lists the reports for X's
+  architecture; `model report <name> --run-name X` writes one as HTML under `runs/X/reports/`. A report declares
+  `ARCHS` (architectures, a family such as `dual-tables`, `"any"` or `"no-run"`); add one by dropping a module there.

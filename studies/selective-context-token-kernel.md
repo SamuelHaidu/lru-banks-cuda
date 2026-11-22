@@ -2,8 +2,8 @@
 
 Run: `rope-token-kernel-osc8` (RoPE, 8-oscillator shared kernel, per-token prior `s`,
 forgetting `lambda`, BM25 saturation `kappa`, normalized weighted average; 10 x 50 steps,
-batch 512, window 128, dense). Tools: `model scripts token-kernel-stepper`,
-`model scripts token-kernel-report`, `studies/selective_context_check.py`.
+batch 512, window 128, dense). Tools: `model report token-kernel-stepper`,
+`model report token-kernel-report`, `studies/selective_context_check.py`.
 
 ## Observations (stepper, story "Roxy the rhinoceros")
 

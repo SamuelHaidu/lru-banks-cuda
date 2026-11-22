@@ -22,7 +22,7 @@ import torch  # noqa: E402
 from model import config as cfg_mod  # noqa: E402
 from model.evaluate import load_checkpoint  # noqa: E402
 from model.device import setup_device  # noqa: E402
-from model.scripts._model_io import load_tokenizer  # noqa: E402
+from model.reports._model_io import load_tokenizer  # noqa: E402
 
 
 def novelty_layer(m, gamma, mode):

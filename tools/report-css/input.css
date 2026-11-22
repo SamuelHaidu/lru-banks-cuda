@@ -1,7 +1,7 @@
 /* Tailwind input for the offline HTML reports. Build: `npm run build` (writes the minified CSS the scripts inline). */
 @import "tailwindcss";
-@source "../../model/scripts/templates/token_banks_clusters.html";
-@source "../../model/scripts/templates/token_banks_stepper.html";
-@source "../../model/scripts/templates/wave_field_stepper.html";
-@source "../../model/scripts/templates/wave_arrow_stepper.html";
-@source "../../model/scripts/templates/rsm_bank_stepper.html";
+@source "../../model/reports/templates/token_banks_clusters.html";
+@source "../../model/reports/templates/token_banks_stepper.html";
+@source "../../model/reports/templates/wave_field_stepper.html";
+@source "../../model/reports/templates/wave_arrow_stepper.html";
+@source "../../model/reports/templates/rsm_bank_stepper.html";

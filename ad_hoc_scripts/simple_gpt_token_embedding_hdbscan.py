@@ -29,7 +29,7 @@ from keras import ops  # noqa: E402
 from model import config as cfg_mod  # noqa: E402
 import model.archs  # noqa: E402,F401  (registers custom classes for keras.saving.load_model)
 from model.evaluate import load_checkpoint  # noqa: E402
-from model.scripts._report import token_labels  # noqa: E402
+from model.reports._report import token_labels  # noqa: E402
 
 RUN_NAME = "simple-gpt-baseline"
 CHECKPOINT = "latest"

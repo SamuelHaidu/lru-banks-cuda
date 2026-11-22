@@ -15,8 +15,8 @@ actually doing the retrieving, or whether recall happens some other way.
 
 ## Method
 
-`model scripts query-recall-trace --run-name transformer-alibi-retriver`
-(`model/scripts/query_recall_trace.py`) runs 20 prompts, each introducing a
+`model report query-recall-trace --run-name transformer-alibi-retriver`
+(`model/reports/query_recall_trace.py`) runs 20 prompts, each introducing a
 name once in context, selected so the *trained checkpoint's own* greedy
 next-token prediction is verified to already be that name reappearing (a
 genuine in-context recall case, not an assumed target). For each prompt it
@@ -106,8 +106,8 @@ generic function word "Let" it already favored, in nearly every case).
 The 20 prompts above were all hand-crafted name-recall cases. To check
 whether the retrieval collapse is an artifact of that (e.g. names being
 poorly represented, as the earlier compression study found), a second script,
-`model scripts retrieval-behavior-trace --run-name transformer-alibi-retriver`
-(`model/scripts/retrieval_behavior_trace.py`), samples real
+`model report retrieval-behavior-trace --run-name transformer-alibi-retriver`
+(`model/reports/retrieval_behavior_trace.py`), samples real
 `(context, target)` pairs directly from the training corpus using the exact
 same random-document, random-cut-point scheme `VariablePrefixDataset` uses
 for training -- no hand-crafted text at all -- across three context-length
@@ -148,7 +148,7 @@ which trained to **21.95** -- the stage that does discriminate sharply is
 the final readout, not retrieval). This is a plausible mechanistic cause of
 the near-uniform entropy ratio measured in Findings 2 and 4.
 
-`model scripts retrieval-ablation-loss --run-name transformer-alibi-retriver`
+`model report retrieval-ablation-loss --run-name transformer-alibi-retriver`
 makes the model-level, causal version of this claim: it re-scores 5,120
 real validation examples (20 batches of 256), replicating the exact trained
 forward pass, under four conditions for the retrieved vector spliced into
@@ -184,7 +184,7 @@ acting as a key-value memory over aggregate context content, indifferent to
 *where* that content sits. Nothing else in this architecture mixes
 information across sequence positions -- ALiBi's positional bias depends
 only on the absolute index gap, not token identity -- so this is a clean,
-weight-free test: `model scripts order-sensitivity-loss` re-scores the same
+weight-free test: `model report order-sensitivity-loss` re-scores the same
 5,120 real validation examples under two corruptions, unmodified weights:
 
 | condition | what it is | loss | &Delta; loss | &Delta; loss % | top-1 accuracy |
@@ -253,7 +253,7 @@ parameters.
 
 ## Finding 7: the model is not copying -- it falls back to whichever name is most frequent in training
 
-`model scripts name-swap-trace --run-name transformer-alibi-retriver`
+`model report name-swap-trace --run-name transformer-alibi-retriver`
 tests whether the model performs content-sensitive copying: each of the 20
 recall templates has its earlier name swapped for every name in the same
 20-name pool (position, length, and every other token held fixed), and the
@@ -321,7 +321,7 @@ mechanically different: its query is compared only against the tokens
 *already present in the context window* (`window_size` = 128 candidates, not
 10,000), and the resulting per-position softmax weights are scattered into a
 vocabulary-sized bucket by token id before pooling the big table (see
-`model/scripts/_alibi_token_retriever_trace.py::trace_block1`). A uniform
+`model/reports/_alibi_token_retriever_trace.py::trace_block1`). A uniform
 softmax here is bounded by however many distinct token ids actually occur in
 a given 128-token window, not by vocabulary size, so Finding 2's
 "near-uniform over the full vocabulary" framing does not directly transfer.

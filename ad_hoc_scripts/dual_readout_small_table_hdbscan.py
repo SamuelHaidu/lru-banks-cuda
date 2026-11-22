@@ -35,8 +35,8 @@ setup_backend()
 from keras import ops  # noqa: E402
 
 from model import config as cfg_mod  # noqa: E402
-from model.scripts._model_io import load_dual_embedding_tables, load_tokenizer  # noqa: E402
-from model.scripts._report import token_labels  # noqa: E402
+from model.reports._model_io import load_dual_embedding_tables, load_tokenizer  # noqa: E402
+from model.reports._report import token_labels  # noqa: E402
 
 RUN_NAME = "dual-sphere-dual-readout-baseline"
 CHECKPOINT = "latest"

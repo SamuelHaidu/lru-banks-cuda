@@ -102,7 +102,7 @@ Learned (lambda, prior) per bank. Lambda near 0 means `k^0 = 1`: a flat, never-f
 - Earlier, without memories (`rope-token-banks-4`), the same split appeared: one bank for dialogue and structure, one for verbs and adjectives, one for names.
 - The gains, initialized at 30, shrank to 0.4-1.4 once the RMSNorms existed: scale is now set by the norms.
 
-**k-means over (lambda, prior).** Script: `model scripts token-banks-clusters --run-name rope-token-banks-4-mem4-norm --k 8`. It writes `reports/token_banks_clusters.html`.
+**k-means over (lambda, prior).** Script: `model report token-banks-clusters --run-name rope-token-banks-4-mem4-norm --k 8`. It writes `reports/token_banks_clusters.html`.
 
 Setup:
 - 9,201 tokens seen at least 100 times in training.
@@ -138,11 +138,11 @@ Reading:
 
 - After "a bird named", the gen64-mlp model predicts bird-like names (Tweet, Chirpy). In other contexts it predicts common boy or girl names.
 - It is a context-conditioned prior over the vocabulary, ordered roughly by dataset frequency: "in this kind of context the next token is a name, of this kind".
-- Analysis: `model/scripts/token_banks_stepper.py` (votes panel, copy table).
+- Analysis: `model/reports/token_banks_stepper.py` (votes panel, copy table).
 
 ### Memories act as persistent slots
 
-Stepper: `model scripts token-banks-stepper --run-name rope-token-banks-4-mem4-norm`. It writes `runs/rope-token-banks-4-mem4-norm/reports/token_banks_stepper.html` (add `#260` to the URL for step 260).
+Stepper: `model report token-banks-stepper --run-name rope-token-banks-4-mem4-norm`. It writes `runs/rope-token-banks-4-mem4-norm/reports/token_banks_stepper.html` (add `#260` to the URL for step 260).
 
 Story: Roxy the rhinoceros and Billy the bird, steps 250-270.
 - **Memory 1 holds Billy.**
@@ -236,8 +236,8 @@ With an outer-product matrix memory `M` (D x D) and unit keys, `beta = 1` makes 
 
 - Arch: `model/archs/rope_token_banks.py`. Memory: `_build_memory`, `_memory_forward`, `memory_trace`. Fast band sums: `_band_matmul`.
 - Tests: `tests/test_dense_supervision.py` (`TestTokenBanksMemory`).
-- Clusters: `model/scripts/token_banks_clusters.py` (k-means of per-token lambda / prior, torch).
-- Report: `model/scripts/token_banks_stepper.py`, which shows banks, votes, the unbinding timeline, per-memory writes / gates / key match / stored kernels, and copy.
+- Clusters: `model/reports/token_banks_clusters.py` (k-means of per-token lambda / prior, torch).
+- Report: `model/reports/token_banks_stepper.py`, which shows banks, votes, the unbinding timeline, per-memory writes / gates / key match / stored kernels, and copy.
 - Training: `model/train.py` (warmup, clipping), `model/schedules.py`.
 - Related studies:
   - `studies/token_coefficient_kernel.html` (token prior and lambda design)
@@ -292,7 +292,7 @@ banks variant (with ~0.6M more parameters than it; an ablation of the three opti
 class half-lives (mean rate per class): 1.1 / 3.1 / 8.7 / 38.8 tokens, much shorter than the per-class init
 (1 .. 64) for the slow class.
 
-Stepper (`model scripts wave-field-stepper`, Cascade tab), story step "how -> she": stage 1 hears almost only the
+Stepper (`model report wave-field-stepper`, Cascade tab), story step "how -> she": stage 1 hears almost only the
 reader (95%); stage 2 hears "and how"; stage 3's filter turns to the characters ("Billy", "told", "asked",
 "Roxy?"); stage 4 hears the topic words of the whole story ("icy hill", "climb", "rocks", "cold"). The stages
 separate by range and by role, as the cascade intends. After stage 1 the query is no longer close to any single

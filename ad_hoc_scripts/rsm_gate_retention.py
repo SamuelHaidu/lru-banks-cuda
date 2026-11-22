@@ -26,7 +26,7 @@ import torch  # noqa: E402
 from model import config as cfg_mod  # noqa: E402
 import model.archs  # noqa: E402,F401
 from model.evaluate import load_checkpoint  # noqa: E402
-from model.scripts._model_io import load_tokenizer  # noqa: E402
+from model.reports._model_io import load_tokenizer  # noqa: E402
 
 
 def rows_from_validation(config, n_rows, length, seed=0):

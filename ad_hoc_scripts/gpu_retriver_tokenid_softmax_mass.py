@@ -4,12 +4,12 @@ softmax over real validation data for the `gpu-retriver-tokenid` run?
 `gpu-retriver-tokenid` (arch `alibi-token-retriever-sphere`, batch_size 73728,
 lr 0.01, GPU) scatters its per-position context softmax weights into a
 vocabulary-sized bucket by token id before pooling the big embedding table
-(see `model/scripts/_alibi_token_retriever_trace.py::trace_block1`). This
+(see `model/reports/_alibi_token_retriever_trace.py::trace_block1`). This
 script asks: for that scattered per-example distribution, how many distinct
 token ids does it take to cover 80% of the softmax mass?
 
 Sampled from real validation batches (not the hand-picked name/noun prompts
-used by `model scripts token-retrieval-trace`), so the number reflects
+used by `model report token-retrieval-trace`), so the number reflects
 ordinary behavior rather than curated recall cases.
 
 Usage:
@@ -30,7 +30,7 @@ from keras import ops  # noqa: E402
 from model import config as cfg_mod  # noqa: E402
 from model.data import build_full_eval_dataset  # noqa: E402
 from model.evaluate import load_checkpoint  # noqa: E402
-from model.scripts._alibi_token_retriever_trace import trace_block1  # noqa: E402
+from model.reports._alibi_token_retriever_trace import trace_block1  # noqa: E402
 
 
 def tokens_for_mass(sorted_weights: np.ndarray, target_mass: float) -> int:

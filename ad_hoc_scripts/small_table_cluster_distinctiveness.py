@@ -38,7 +38,7 @@ setup_backend()
 
 from keras import ops  # noqa: E402
 
-from model.scripts._model_io import load_dual_embedding_tables  # noqa: E402
+from model.reports._model_io import load_dual_embedding_tables  # noqa: E402
 
 OUT_DIR = Path(__file__).resolve().parent / "results"
 

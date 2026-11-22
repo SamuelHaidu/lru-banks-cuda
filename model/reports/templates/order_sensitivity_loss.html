@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Order sensitivity: attention routing vs. FFN memory -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>Does word order matter, or is the readout a bag-of-tokens lookup?</h1>
+    <div class="subtitle">Isolating attention's positional routing from the final FFN's content-based memory</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">examples <strong>{{ "{:,}".format(num_examples) }}</strong></span>
+      <span class="tag">batch size <strong>{{ batch_size }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Why this report</h2>
+    <p class="hint">
+      Retrieval was already shown to contribute almost nothing
+      query-specific (see <code class="inline">retrieval-ablation-loss</code>).
+      That leaves two candidates for how the model recalls context: the
+      attention blocks doing genuine positional routing, or the final
+      readout FFN (<code class="inline">dense1/2/3</code>, a fixed function
+      of one flattened vector) acting as a key-value memory over aggregate
+      context content, indifferent to word order. Nothing else in this
+      architecture mixes information across positions -- ALiBi's positional
+      bias depends only on the absolute index gap, not token identity -- so
+      this is a clean, weight-free test:
+    </p>
+    <table class="data-table">
+      <thead><tr><th>condition</th><th>what changes</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge grey">normal</span></td><td>the real forward pass, unmodified</td></tr>
+        <tr><td><span class="badge grey">shuffled_order</span></td><td>the valid (non-padded) context tokens are randomly permuted among themselves -- same tokens, same length, scrambled sequence</td></tr>
+        <tr><td><span class="badge grey">masked_target</span></td><td>every earlier context occurrence of the target token is replaced by a fixed placeholder ("{{ placeholder_token }}") at the same position -- identity changes, position and order do not</td></tr>
+      </tbody>
+    </table>
+
+    <div class="stat-grid">
+      <div class="stat neutral">
+        <div class="label">Normal loss</div>
+        <div class="value">{{ "%.4f"|format(results.normal.loss) }}</div>
+      </div>
+      <div class="stat {{ 'bad' if results.shuffled_order.loss_delta_pct > 20 else ('good' if results.shuffled_order.loss_delta_pct < 2 else 'neutral') }}">
+        <div class="label">Shuffled-order loss (&Delta;)</div>
+        <div class="value">{{ "%.4f"|format(results.shuffled_order.loss) }} ({{ "%+.1f%%"|format(results.shuffled_order.loss_delta_pct) }})</div>
+      </div>
+      <div class="stat {{ 'bad' if results.masked_target.loss_delta_pct > 20 else ('good' if results.masked_target.loss_delta_pct < 2 else 'neutral') }}">
+        <div class="label">Masked-target loss (&Delta;)</div>
+        <div class="value">{{ "%.4f"|format(results.masked_target.loss) }} ({{ "%+.1f%%"|format(results.masked_target.loss_delta_pct) }})</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Full results</h2>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>condition</th>
+          <th>loss</th>
+          <th>&Delta; loss</th>
+          <th>&Delta; loss %</th>
+          <th>perplexity</th>
+          <th>bpc</th>
+          <th>top-1 accuracy</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for name, r in results.items() %}
+        <tr>
+          <td><span class="badge {{ 'green' if name == 'normal' else 'grey' }}">{{ name }}</span></td>
+          <td>{{ "%.4f"|format(r.loss) }}</td>
+          <td>{{ "%+.4f"|format(r.loss_delta) }}</td>
+          <td>{{ "%+.2f%%"|format(r.loss_delta_pct) }}</td>
+          <td>{{ "%.3f"|format(r.perplexity) }}</td>
+          <td>{{ "%.4f"|format(r.bpc) }}</td>
+          <td>{{ "%.2f%%"|format(r.top1_accuracy * 100) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="hint">
+      A large &Delta; under <code class="inline">shuffled_order</code> means
+      sequence order matters -- and since nothing but attention can exploit
+      order in this architecture, that implicates the attention blocks doing
+      real positional work. A large &Delta; under
+      <code class="inline">masked_target</code> means the specific identity
+      of the earlier occurrence matters, not just something occupying that
+      slot. If both stay small, the final FFN is likely reading aggregate,
+      order-insensitive content from the flattened residual stream rather
+      than a routed, position-specific copy of the target.
+    </p>
+  </section>
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model report order-sensitivity-loss</code> &middot;
+    checkpoint <code class="inline">{{ checkpoint_path }}</code>
+  </footer>
+
+</div>
+</body>
+</html>
