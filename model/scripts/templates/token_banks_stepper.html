@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en" class="bg-slate-50">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token banks stepper - __TITLE__</title>
+<style>/*__CSS__*/</style>
+</head>
+<body class="text-slate-800 text-sm antialiased">
+<div id="tip" class="fixed z-50 hidden pointer-events-none bg-white border border-slate-300 rounded-md px-2 py-1 text-xs shadow-sm"></div>
+
+<header class="sticky top-0 z-20 bg-white border-b border-slate-200">
+  <div class="max-w-[1600px] mx-auto px-5 py-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+    <div class="mr-2">
+      <h1 class="text-base font-semibold text-slate-900">Token banks stepper</h1>
+      <p class="text-xs text-slate-500">__TITLE__</p>
+    </div>
+    <div class="flex items-center gap-1">
+      <button onclick="go(cur - 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="previous (left arrow)">&larr;</button>
+      <button onclick="go(cur + 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="next (right arrow)">&rarr;</button>
+      <button id="play" onclick="toggle()" class="border border-slate-300 rounded-md px-3 py-1 w-16 hover:bg-slate-100">play</button>
+    </div>
+    <input type="range" id="slider" min="0" value="0" class="flex-1 min-w-48 accent-slate-700" oninput="go(+this.value)">
+    <span id="stepl" class="text-xs text-slate-500 tabular-nums w-24 text-right"></span>
+  </div>
+</header>
+
+<main class="max-w-[1600px] mx-auto px-5 py-4 grid grid-cols-[25rem_1fr] gap-4 items-start">
+  <aside class="space-y-4 sticky top-20">
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-baseline justify-between">
+        <h2 class="font-semibold text-slate-900">This step</h2><span class="text-xs text-slate-500" id="nowpos"></span>
+      </div>
+      <div class="p-4 space-y-4">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500">read &rarr; next token</div>
+          <div class="mt-1 text-lg"><span id="nowread" class="font-mono"></span> <span class="text-slate-400">&rarr;</span> <span id="nowtgt" class="font-mono font-semibold"></span>
+            <span id="nowp" class="ml-1 text-sm text-slate-500 tabular-nums"></span></div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">top predictions</div>
+          <div id="toppred" class="space-y-1"></div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">router: bank mix</div>
+          <div id="router" class="space-y-1"></div>
+        </div>
+        <div id="memnow" class="hidden">
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">memory reads: effect on log p(next)</div>
+          <div id="memeff" class="space-y-1"></div>
+          <p class="text-xs text-slate-500 mt-1" id="memno"></p>
+        </div>
+      </div>
+    </section>
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-baseline justify-between">
+        <h2 class="font-semibold text-slate-900">Story</h2><span class="text-xs text-slate-500">click a word to jump</span>
+      </div>
+      <div id="story" class="px-4 py-3 max-h-[38vh] overflow-y-auto leading-7 text-[14px]"></div>
+    </section>
+  </aside>
+
+  <section class="bg-white border border-slate-200 rounded-md min-w-0">
+    <nav id="tabs" class="flex border-b border-slate-200 px-2"></nav>
+    <div class="p-4">
+
+      <div data-tab="overview" class="space-y-6">
+        <div>
+          <div class="flex items-baseline justify-between"><h3 class="font-semibold text-slate-900">Share of the final vector per context token</h3><span id="cpad" class="text-xs text-slate-500"></span></div>
+          <p class="text-xs text-slate-500 mb-2">Every state is a normalized weighted average times a learned gain, so each token's share of h = [general] + &Sigma; &pi;<sub>b</sub> bank<sub>b</sub> is exact; bars are stacked by the state it comes through.</p>
+          <div id="tc" class="leading-7 mb-2"></div>
+          <div id="lgc" class="mb-1"></div>
+          <canvas id="cc" class="w-full block"></canvas>
+        </div>
+        <div>
+          <h3 class="font-semibold text-slate-900">Votes: who pushed each prediction</h3>
+          <p class="text-xs text-slate-500 mb-2">The readout is linear, so each logit splits exactly into the votes of the general state, each routed bank and the MLP block (which includes the memory reads). Diamond = the logit.</p>
+          <div id="lgv" class="mb-1"></div>
+          <canvas id="votes" class="w-full block"></canvas>
+          <div class="mt-3 flex flex-wrap items-center gap-1"><span class="text-xs uppercase tracking-wide text-slate-500 mr-1">who voted for</span><span id="candbtns" class="flex flex-wrap gap-1"></span></div>
+          <div id="tvtext" class="leading-7 mt-2"></div>
+          <canvas id="tvchart" class="w-full block mt-1"></canvas>
+          <p class="text-xs text-slate-500 mt-1">Token votes go through the linear part (general + routed banks). Green = for, red = against.</p>
+        </div>
+      </div>
+
+      <div data-tab="banks" class="hidden space-y-6" id="banks"></div>
+
+      <div data-tab="memories" class="hidden space-y-6">
+        <p class="text-xs text-slate-500" id="memintro"></p>
+        <div>
+          <h3 class="font-semibold text-slate-900">Unbinding timeline</h3>
+          <p class="text-xs text-slate-500 mb-2">Steps around the current one (click a row to jump). Each cell: what the read decodes to (cosine) &larr; the write that supplied most of it (its token, how far back, share).
+            Cell color = that memory's effect on log p(next token), green helped, red hurt (mean ablation).</p>
+          <div class="overflow-x-auto border border-slate-200 rounded-md"><table id="tl" class="w-full text-left text-xs"></table></div>
+        </div>
+        <div id="mems" class="space-y-6"></div>
+        <div>
+          <h3 class="font-semibold text-slate-900">Whole story, one ribbon per memory</h3>
+          <p class="text-xs text-slate-500 mb-2">Each token colored by that memory's effect on predicting the token after it. Hover for what was unbound, click to jump.</p>
+          <div id="ribbons" class="space-y-3"></div>
+        </div>
+      </div>
+
+      <div data-tab="copy" class="hidden">
+        <h3 class="font-semibold text-slate-900">Copy, from the weights: does a token at distance k vote for itself?</h3>
+        <p class="text-xs text-slate-500 mb-3">For each token v: rank of v's own logit among all logits produced by R<sub>k</sub> e<sub>v</sub> through the readout (0 = it votes for itself more than for any other word).
+          Median rank / % of tokens whose own word is in their top 10.</p>
+        <div class="overflow-x-auto border border-slate-200 rounded-md"><table id="copytab" class="w-full text-left"></table></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const D = /*__DATA__*/null;
+const W = D.words, S = D.steps, NB = D.names.length, NM = D.nm;
+const COLORS = ["#64748b", "#e15759", "#f28e2b", "#4e79a7", "#59a14f"];
+const MCOLORS = ["#9c755f", "#b07aa1", "#2f8f8a", "#d4a72c", "#3b3b8f", "#6a8f2f"];
+const MLPC = "#8b5cf6";
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const pct = (v, d = 1) => (v * 100).toFixed(d) + "%";
+const sgn = v => (v >= 0 ? "+" : "") + v.toFixed(3);
+const short = s => s.split(" (")[0];
+function rgba(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${Math.min(1, Math.max(0, a)).toFixed(3)})`; }
+const signedBg = (v, m) => v >= 0 ? `rgba(5,150,105,${Math.min(1, v / m).toFixed(3)})` : `rgba(220,38,38,${Math.min(1, -v / m).toFixed(3)})`;
+const legend = (names, cols) => names.map((n, k) => `<span class="inline-flex items-center gap-1 mr-3 text-xs text-slate-600"><span class="w-2.5 h-2.5 rounded-sm" style="background:${cols[k]}"></span>${esc(n)}</span>`).join("");
+const tokSpan = (p, bg, title, extra = "") => `<span class="rounded-sm px-px ${p === cur ? "ring-2 ring-slate-900" : ""} ${extra}" style="background:${bg}" title="${esc(title)}">${esc(W[p])}</span>`;
+const hbar = (label, v, max, col, right) => `<div class="flex items-center gap-2"><div class="w-28 truncate font-mono text-xs">${label}</div>
+  <div class="flex-1 h-2 bg-slate-100 rounded-sm"><div class="h-2 rounded-sm" style="width:${Math.max(0, Math.min(1, v / max)) * 100}%;background:${col}"></div></div>
+  <div class="w-16 text-right text-xs tabular-nums">${right}</div></div>`;
+
+// ---- tiny canvas bar chart ----
+const tip = document.getElementById("tip");
+function bars(id, n, series, o) {
+  const cv = document.getElementById(id), h = o.h || 200, dpr = window.devicePixelRatio || 1, Wc = cv.clientWidth || 800;
+  cv.style.height = h + "px"; cv.width = Wc * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, Wc, h);
+  const showLab = o.labels && n <= 40, pL = 46, pT = 6, pB = showLab ? 44 : 6, ph = h - pT - pB, bw = (Wc - pL - 4) / Math.max(n, 1);
+  const top = new Array(n).fill(0), bot = new Array(n).fill(0);
+  for (let j = 0; j < n; j++) for (const s of series) { const v = s.y[j] || 0; if (o.stack) { if (v >= 0) top[j] += v; else bot[j] += v; } else { top[j] = Math.max(top[j], v); bot[j] = Math.min(bot[j], v); } }
+  let ymax = Math.max(0, ...top, ...(o.markers || [])), ymin = Math.min(0, ...bot, ...(o.markers || []));
+  if (o.ymax !== undefined) ymax = o.ymax; if (o.ymin !== undefined) ymin = o.ymin;
+  if (ymax - ymin < 1e-12) ymax = ymin + 1;
+  const Y = v => pT + (ymax - v) / (ymax - ymin) * ph, fmt = o.fmt || (v => v.toFixed(2));
+  g.font = "10px ui-sans-serif, system-ui"; g.fillStyle = "#64748b"; g.strokeStyle = "#e2e8f0"; g.textAlign = "right";
+  const ticks = [ymax, ymin, 0].filter((v, i, a) => a.findIndex(u => Math.abs(Y(u) - Y(v)) < 12) === i);  // drop labels that would overlap
+  for (const v of ticks) { g.fillText(fmt(v), pL - 6, Y(v) + 3); g.beginPath(); g.moveTo(pL, Y(v) + 0.5); g.lineTo(Wc, Y(v) + 0.5); g.stroke(); }
+  if (o.hl !== undefined && o.hl >= 0 && o.hl < n) { g.fillStyle = "rgba(15,23,42,0.06)"; g.fillRect(pL + o.hl * bw, pT, bw, ph); }
+  for (let j = 0; j < n; j++) {
+    let up = 0, dn = 0;
+    for (const s of series) {
+      const v = s.y[j] || 0; if (!v) continue;
+      g.fillStyle = typeof s.color === "function" ? s.color(v, j) : s.color;
+      const base = o.stack ? (v >= 0 ? up : dn) : 0, y0 = Y(base), y1 = Y(base + v);
+      g.fillRect(pL + j * bw + bw * 0.12, Math.min(y0, y1), Math.max(bw * 0.76, 0.8), Math.max(Math.abs(y1 - y0), 0.5));
+      if (o.stack) { if (v >= 0) up += v; else dn += v; }
+    }
+  }
+  if (o.markers) { g.fillStyle = "#0f172a"; o.markers.forEach((v, j) => { const cx = pL + (j + 0.5) * bw, cy = Y(v); g.beginPath(); g.moveTo(cx, cy - 5); g.lineTo(cx + 5, cy); g.lineTo(cx, cy + 5); g.lineTo(cx - 5, cy); g.fill(); }); }
+  if (showLab) { g.fillStyle = "#334155"; g.textAlign = "right"; o.labels.forEach((t, j) => { g.save(); g.translate(pL + (j + 0.6) * bw, h - pB + 12); g.rotate(-0.5); g.fillText(String(t).slice(0, 20), 0, 0); g.restore(); }); }
+  cv.onmousemove = e => { const j = Math.floor((e.offsetX - pL) / bw); if (j < 0 || j >= n || !o.tip) { tip.classList.add("hidden"); return; }
+    tip.innerHTML = o.tip(j); tip.classList.remove("hidden"); tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 14) + "px"; };
+  cv.onmouseleave = () => tip.classList.add("hidden");
+}
+
+// ---- static layout ----
+let cur = 0, timer = null, tab = "overview", candSel = 5, prevCur = -1, prevRib = -1;
+document.getElementById("slider").max = S.length - 1;
+const story = document.getElementById("story");
+const spans = W.map((w, i) => { const sp = document.createElement("span"); sp.textContent = w; sp.className = "cursor-pointer rounded-sm px-px hover:bg-slate-100";
+  sp.onclick = () => go(Math.max(0, i - 1)); story.appendChild(sp); return sp; });
+const TABS = [["overview", "Overview"], ["banks", "Banks"]].concat(NM ? [["memories", "Memories"]] : []).concat([["copy", "Copy"]]);
+document.getElementById("banks").innerHTML = D.names.map((name, b) => `<div>
+  <div class="flex items-baseline gap-2"><span class="w-3 h-3 rounded-sm self-center" style="background:${COLORS[b]}"></span><h3 class="font-semibold text-slate-900">${esc(short(name))}</h3>
+    <span class="text-xs text-slate-500">${esc(name.slice(short(name).length).replace(/^ \(|\)$/g, ""))}</span><span id="bh${b}" class="ml-auto text-xs text-slate-500"></span></div>
+  <div id="t${b}" class="leading-7 mt-1"></div><canvas id="c${b}" class="w-full block mt-1"></canvas></div>`).join("");
+if (NM) {
+  document.getElementById("memintro").innerHTML = `Each binder writes, at every position, a value (kernel-weighted recent tokens) bound to a write key, with a gate; a memory is the gate-weighted average of the last ${D.mwin} writes.
+    The unbinder's read key unbinds it: writes whose key matches come back as their value, the others as rotated noise. Share = each write's projection on the read (shares sum to 100%).`;
+  document.getElementById("mems").innerHTML = Array.from({ length: NM }, (_, n) => `<div class="border border-slate-200 rounded-md">
+    <div class="px-4 py-2 border-b border-slate-200 flex flex-wrap items-baseline gap-x-3"><span class="w-3 h-3 rounded-sm self-center" style="background:${MCOLORS[n % MCOLORS.length]}"></span>
+      <h3 class="font-semibold text-slate-900">Memory ${n + 1}</h3><span id="mh${n}" class="text-xs text-slate-500"></span></div>
+    <div class="p-4 grid grid-cols-1 gap-3">
+      <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">read decodes to <span class="normal-case">(cosine with a context token's stored form, best lag k)</span></div><div id="md${n}" class="flex flex-wrap gap-1"></div></div>
+      <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">writes in the window, shaded by share of this read</div><div id="mt${n}" class="leading-7"></div></div>
+      <div class="grid grid-cols-3 gap-4">
+        <div><div class="text-xs text-slate-500">share of the read per write</div><canvas id="ms${n}" class="w-full block"></canvas></div>
+        <div><div class="text-xs text-slate-500">write gate g</div><canvas id="mg${n}" class="w-full block"></canvas></div>
+        <div><div class="text-xs text-slate-500">key match cos(&phi;<sub>write</sub> &minus; &psi;<sub>read</sub>)</div><canvas id="mk${n}" class="w-full block"></canvas></div>
+      </div>
+      <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">what the top writes stored <span class="normal-case">(the last ${D.mrange} tokens before each write, shaded by the binder's value kernel)</span></div><div id="mw${n}" class="space-y-1"></div></div>
+    </div></div>`).join("");
+}
+const ribSpans = [];
+if (NM) {
+  const rb = document.getElementById("ribbons");
+  for (let n = 0; n < NM; n++) {
+    const div = document.createElement("div"); div.className = "leading-7";
+    div.innerHTML = `<span class="inline-block w-8 text-xs font-semibold" style="color:${MCOLORS[n % MCOLORS.length]}">m${n + 1}</span>`;
+    const row = [];
+    S.forEach((st, i) => {
+      const m = st.m.mem[n], sp = document.createElement("span"), tw = m.tw[0];
+      sp.textContent = W[i]; sp.className = "cursor-pointer rounded-sm px-px"; sp.style.background = signedBg(Math.max(-1, Math.min(1, m.eff)), 1);
+      sp.title = `step ${i + 1} -> ${st.tgt[0]}\neffect ${sgn(m.eff)} nats\nunbound: ${m.dec.slice(0, 3).map(d => d[0] + " " + d[1]).join(", ")}` +
+        (tw ? `\nmain write: ${W[tw[0]]} (${i - tw[0]} back, share ${pct(m.s[tw[0] - st.m.first] / 1000, 0)})` : "");
+      sp.onclick = () => go(i); div.appendChild(sp); row.push(sp);
+    });
+    ribSpans.push(row); rb.appendChild(div);
+  }
+}
+
+function setTab(t) {
+  tab = t;
+  document.getElementById("tabs").innerHTML = TABS.map(([id, name]) =>
+    `<button onclick="setTab('${id}')" class="px-3 py-2 -mb-px border-b-2 ${id === t ? "border-slate-800 text-slate-900 font-medium" : "border-transparent text-slate-500 hover:text-slate-800"}">${name}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(el => el.classList.toggle("hidden", el.dataset.tab !== t));
+  drawTab();
+}
+function drawTab() {
+  const st = S[cur];
+  if (tab === "overview") { drawCombined(st); drawVotes(st); }
+  if (tab === "banks") for (let b = 0; b < NB; b++) drawBank(b, st);
+  if (tab === "memories") { drawTimeline(); for (let n = 0; n < NM; n++) drawMem(n, st); }
+}
+function toggle() {
+  if (timer) { clearInterval(timer); timer = null; document.getElementById("play").textContent = "play"; return; }
+  timer = setInterval(() => { if (cur >= S.length - 1) toggle(); else go(cur + 1); }, 400);
+  document.getElementById("play").textContent = "pause";
+}
+document.addEventListener("keydown", e => { if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.key === "ArrowRight") { e.preventDefault(); go(cur + 1); } if (e.key === "ArrowLeft") { e.preventDefault(); go(cur - 1); } });
+
+function go(i) {
+  cur = Math.min(Math.max(i, 0), S.length - 1);
+  const st = S[cur];
+  document.getElementById("slider").value = cur;
+  document.getElementById("stepl").textContent = `step ${cur + 1} / ${S.length}`;
+  if (prevCur >= 0) { spans[prevCur].classList.remove("ring-2", "ring-slate-900"); if (spans[prevCur + 1]) spans[prevCur + 1].classList.remove("underline", "decoration-2", "decoration-emerald-600", "text-emerald-700"); }
+  spans[cur].classList.add("ring-2", "ring-slate-900"); if (spans[cur + 1]) spans[cur + 1].classList.add("underline", "decoration-2", "decoration-emerald-600", "text-emerald-700");
+  prevCur = cur;
+  const box = story.getBoundingClientRect(), r = spans[cur].getBoundingClientRect();
+  if (r.top < box.top || r.bottom > box.bottom) story.scrollTop += r.top - box.top - box.height / 2;
+  // this-step card
+  document.getElementById("nowpos").textContent = `token ${cur + 1}`;
+  document.getElementById("nowread").textContent = W[cur];
+  document.getElementById("nowtgt").textContent = st.tgt[0];
+  document.getElementById("nowp").textContent = `p ${st.tgt[1].toFixed(3)}`;
+  const pmax = st.top[0][1] || 1;
+  document.getElementById("toppred").innerHTML = st.top.map(([t, p]) => hbar(esc(t), p, pmax, t === st.tgt[0] ? "#059669" : "#94a3b8", pct(p))).join("");
+  document.getElementById("router").innerHTML = st.pi.map((v, b) => v === null ? "" : hbar(esc(short(D.names[b])), v, 1, COLORS[b], pct(v))).join("");
+  if (st.m) {
+    document.getElementById("memnow").classList.remove("hidden");
+    const emax = Math.max(0.5, ...st.m.mem.map(m => Math.abs(m.eff)), Math.abs(st.m.eff));
+    const ebar = (label, v, col) => `<div class="flex items-center gap-2"><div class="w-28 text-xs flex items-center gap-1.5"><span class="w-2 h-2 rounded-sm" style="background:${col}"></span>${label}</div>
+      <div class="flex-1 h-2 bg-slate-100 rounded-sm relative"><div class="absolute top-0 h-2 rounded-sm" style="${v >= 0 ? "left:50%" : `right:50%`};width:${Math.min(1, Math.abs(v) / emax) * 50}%;background:${v >= 0 ? "#059669" : "#dc2626"}"></div>
+      <div class="absolute top-[-2px] left-1/2 w-px h-3 bg-slate-400"></div></div><div class="w-16 text-right text-xs tabular-nums ${v >= 0 ? "text-emerald-700" : "text-red-700"}">${sgn(v)}</div></div>`;
+    document.getElementById("memeff").innerHTML = ebar("all reads", st.m.eff, "#0f172a") + st.m.mem.map((m, n) => ebar(`memory ${n + 1}`, m.eff, MCOLORS[n % MCOLORS.length])).join("");
+    document.getElementById("memno").innerHTML = `Mean ablation (reads replaced by their story average). Top-1 without the reads: <span class="font-mono">${esc(st.m.no)}</span>`;
+    if (prevRib >= 0) ribSpans.forEach(r => r[prevRib].classList.remove("ring-2", "ring-slate-900")); ribSpans.forEach(r => r[cur].classList.add("ring-2", "ring-slate-900")); prevRib = cur;
+  }
+  drawTab();
+}
+
+function drawCombined(st) {
+  const n = st.e[0].length, pos = Array.from({ length: n }, (_, j) => st.first + j);
+  const c = st.c.map(a => a.map(v => v / 1e4));
+  const tot = pos.map((_, j) => c.reduce((a, cb) => a + cb[j], 0)), tmax = Math.max(...tot);
+  document.getElementById("cpad").textContent = st.cpad > 0.001 ? `padding ${pct(st.cpad)}` : "";
+  document.getElementById("tc").innerHTML = pos.map((p, j) => tokSpan(p, `rgba(109,40,217,${(0.85 * tot[j] / tmax).toFixed(3)})`, `share ${pct(tot[j], 2)}, k=${cur + 1 - p}`)).join("");
+  document.getElementById("lgc").innerHTML = legend(D.names.map(short), COLORS);
+  bars("cc", n, c.map((y, b) => ({ y, color: COLORS[b] })), { stack: true, h: 220, fmt: v => pct(v, 0), hl: n - 1,
+    tip: j => `<b>${esc(W[pos[j]])}</b> (k=${cur + 1 - pos[j]})<br>` + c.map((cb, b) => `${esc(short(D.names[b]))}: ${pct(cb[j], 2)}`).join("<br>") });
+}
+function drawBank(b, st) {
+  const e = st.e[b].map(v => v / 1e4), n = e.length, emax = Math.max(...e) || 1, pos = Array.from({ length: n }, (_, j) => st.first + j);
+  const lam = j => (b > 0 ? `, lambda ${D.lam[b - 1][pos[j]]}` : "");
+  document.getElementById(`bh${b}`).innerHTML = (st.pi[b] === null ? "router input" : `router weight <span class="font-semibold text-slate-800">${pct(st.pi[b])}</span>`) +
+    (st.pad[b] > 0.001 ? ` &middot; padding ${pct(st.pad[b])}` : "");
+  document.getElementById(`t${b}`).innerHTML = pos.map((p, j) => tokSpan(p, rgba(COLORS[b], 0.9 * e[j] / emax), `energy ${pct(e[j], 2)}, k=${cur + 1 - p}${lam(j)}`)).join("");
+  bars(`c${b}`, n, [{ y: e, color: COLORS[b] }], { h: 150, fmt: v => pct(v, 1), hl: n - 1,
+    tip: j => `<b>${esc(W[pos[j]])}</b> (k=${cur + 1 - pos[j]})<br>energy ${pct(e[j], 2)}${lam(j)}` });
+}
+function drawMem(n, st) {
+  const M = st.m, m = M.mem[n], col = MCOLORS[n % MCOLORS.length];
+  const nw = m.s.length, pos = Array.from({ length: nw }, (_, j) => M.first + j);
+  const s = m.s.map(v => v / 1000), g = m.g.map(v => v / 1000), k = m.k.map(v => v / 100);
+  document.getElementById(`mh${n}`).innerHTML = `effect on the target <span class="font-semibold ${m.eff >= 0 ? "text-emerald-700" : "text-red-700"}">${sgn(m.eff)} nats</span>
+    &middot; unbinder mix ${m.pu.map((v, b) => `b${b + 1} ${pct(v, 0)}`).join(", ")}`;
+  document.getElementById(`md${n}`).innerHTML = m.dec.map(([t, c, l]) => `<span class="inline-flex items-baseline gap-1 border border-slate-200 rounded px-1.5 py-0.5 font-mono text-xs" title="cosine ${c}, stored at lag ${l}">${esc(t)}<span class="text-slate-400">${c.toFixed(2)} k=${l}</span></span>`).join("");
+  const smax = Math.max(...s.map(Math.abs)) || 1;
+  document.getElementById(`mt${n}`).innerHTML = pos.map((p, j) => tokSpan(p, signedBg(s[j], smax), `share ${pct(s[j], 1)}, gate ${g[j].toFixed(3)}, key match ${k[j].toFixed(2)}`)).join("");
+  const tipf = j => `<b>${esc(W[pos[j]])}</b> (written ${cur - pos[j]} back)<br>share ${pct(s[j], 1)}<br>gate ${g[j].toFixed(3)}<br>key match ${k[j].toFixed(2)}`;
+  bars(`ms${n}`, nw, [{ y: s, color: v => (v >= 0 ? "#059669" : "#dc2626") }], { h: 110, fmt: v => pct(v, 0), hl: nw - 1, tip: tipf });
+  bars(`mg${n}`, nw, [{ y: g, color: col }], { h: 110, ymin: 0, fmt: v => v.toFixed(2), hl: nw - 1, tip: tipf });
+  bars(`mk${n}`, nw, [{ y: k, color: v => (v >= 0 ? "#4e79a7" : "#e15759") }], { h: 110, ymin: -1, ymax: 1, fmt: v => v.toFixed(1), hl: nw - 1, tip: tipf });
+  document.getElementById(`mw${n}`).innerHTML = m.tw.map(([p, kern, pb]) => {
+    const kk = kern.map(v => v / 100), km = Math.max(...kk.map(Math.abs)) || 1, j = p - M.first;
+    const toks = kk.map((v, lag) => p - lag >= 0 ? `<span class="rounded-sm px-px" style="background:${signedBg(v, km)}" title="lag ${lag}: kernel ${pct(v, 1)}">${esc(W[p - lag])}</span>` : "").reverse().join("");
+    return `<div class="flex gap-3 items-baseline"><div class="w-64 shrink-0 text-xs text-slate-500">write at <span class="font-mono text-slate-800">${esc(W[p])}</span> (${cur - p} back) &middot; share ${pct(s[j], 1)} &middot; gate ${g[j].toFixed(2)}</div>
+      <div class="leading-7">${toks}</div></div>`;
+  }).join("");
+}
+function drawTimeline() {
+  const lo = Math.max(0, cur - 10), hi = Math.min(S.length - 1, cur + 10);
+  let html = `<thead class="bg-slate-50 text-slate-500 uppercase tracking-wide"><tr><th class="px-2 py-1.5">step</th><th class="px-2 py-1.5">read &rarr; next</th>` +
+    Array.from({ length: NM }, (_, n) => `<th class="px-2 py-1.5" style="color:${MCOLORS[n % MCOLORS.length]}">memory ${n + 1}</th>`).join("") + `</tr></thead><tbody class="divide-y divide-slate-100">`;
+  for (let i = lo; i <= hi; i++) {
+    const st = S[i];
+    html += `<tr class="cursor-pointer ${i === cur ? "outline outline-2 outline-slate-900" : "hover:bg-slate-50"}" onclick="go(${i})"><td class="px-2 py-1 tabular-nums text-slate-500">${i + 1}</td>
+      <td class="px-2 py-1 font-mono">${esc(W[i])} <span class="text-slate-400">&rarr;</span> ${esc(st.tgt[0])}</td>` +
+      st.m.mem.map(m => {
+        const tw = m.tw[0], d = m.dec[0];
+        const src = tw ? ` <span class="text-slate-400">&larr;</span> <span class="font-mono">${esc(W[tw[0]])}</span> <span class="text-slate-500">(${i - tw[0]} back, ${pct(m.s[tw[0] - st.m.first] / 1000, 0)})</span>` : "";
+        return `<td class="px-2 py-1" style="background:${signedBg(Math.max(-1, Math.min(1, m.eff)), 1.5)}" title="effect ${m.eff.toFixed(3)} nats">${d ? `<span class="font-mono font-semibold">${esc(d[0])}</span> <span class="text-slate-500">${d[1].toFixed(2)}</span>` : ""}${src}</td>`;
+      }).join("") + "</tr>";
+  }
+  document.getElementById("tl").innerHTML = html + "</tbody>";
+}
+function drawVotes(st) {
+  const comp = D.comp, cands = st.cand.map((t, c) => (c === 5 ? "target: " : "") + t);
+  const vcol = k => (k < COLORS.length ? COLORS[k] : MLPC);
+  document.getElementById("lgv").innerHTML = legend(comp, comp.map((_, k) => vcol(k))) + `<span class="text-xs text-slate-600">&#9670; logit</span>`;
+  bars("votes", cands.length, comp.map((_, k) => ({ y: st.cv.map(v => v[k]), color: vcol(k) })),
+    { stack: true, h: 250, labels: cands, markers: st.cv.map(v => v.reduce((a, b) => a + b, 0)),
+      tip: j => `<b>${esc(cands[j])}</b><br>` + comp.map((nm, k) => `${esc(nm)}: ${st.cv[j][k].toFixed(2)}`).join("<br>") + `<br>logit ${st.cv[j].reduce((a, b) => a + b, 0).toFixed(2)}` });
+  document.getElementById("candbtns").innerHTML = st.cand.map((t, c) =>
+    `<button onclick="candSel=${c};drawVotes(S[cur])" class="border rounded-md px-2 py-0.5 font-mono text-xs ${c === candSel ? "bg-slate-800 text-white border-slate-800" : "bg-white border-slate-300 hover:bg-slate-100"}">${c === 5 ? "target " : ""}${esc(t)}</button>`).join("");
+  const tv = st.tv[candSel], pos = tv.map((_, j) => st.first + j), m = Math.max(...tv.map(Math.abs)) || 1;
+  document.getElementById("tvtext").innerHTML = pos.map((p, j) => tokSpan(p, signedBg(tv[j], m), `vote ${tv[j].toFixed(2)}`)).join("");
+  bars("tvchart", tv.length, [{ y: tv, color: v => (v >= 0 ? "#059669" : "#dc2626") }], { h: 160, hl: tv.length - 1, tip: j => `<b>${esc(W[pos[j]])}</b>: ${tv[j].toFixed(2)}` });
+}
+(function copyTable() {
+  const g = D.copy.groups;
+  document.getElementById("copytab").innerHTML = `<thead class="bg-slate-50 text-xs uppercase tracking-wide text-slate-500"><tr><th class="px-3 py-1.5">k</th>` +
+    g.map(x => `<th class="px-3 py-1.5">${esc(x)}</th>`).join("") + `</tr></thead><tbody class="divide-y divide-slate-100">` +
+    D.copy.rows.map(r => `<tr><td class="px-3 py-1 tabular-nums">${r.k}</td>` + g.map(x => `<td class="px-3 py-1 tabular-nums">${r[x][0]} <span class="text-slate-400">/</span> ${r[x][1]}%</td>`).join("") + "</tr>").join("") + "</tbody>";
+})();
+window.addEventListener("resize", () => drawTab());
+// Deep links: #step=200&tab=memories (or just #200)
+const H = Object.fromEntries(location.hash.slice(1).split("&").filter(Boolean).map(kv => kv.includes("=") ? kv.split("=").map(decodeURIComponent) : ["step", kv]));
+setTab(TABS.some(t => t[0] === H.tab) ? H.tab : "overview");
+go(+H.step || 0);
+</script>
+</body>
+</html>

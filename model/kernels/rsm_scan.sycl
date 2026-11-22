@@ -1,0 +1,866 @@
+// Sequential scan kernels for `rope-state-memory` (Intel XPU, SYCL).
+//
+// Both recurrences are run in their recurrent form: every input is read from DRAM once, every output written
+// once, and the state lives in registers for the whole row. Nothing quadratic in the chunk length is ever
+// materialized (the chunked torch path builds (t x t) decay / document masks, forward and backward).
+//
+// rot_scan     z_t = lam R(z_{t-1}) keep_t + in_scale x_t,  out_t = out_scale z_t
+//              per RoPE pair (p, p + D/2); R turns by +theta_p (sign = +1) or -theta_p (sign = -1).
+//              Forward: keep_t = 1 - reset_t. Reverse (time runs N-1 .. 0): keep_t = 1 - reset_{t+1}.
+// outer_scan   Z_t = dec * Z_{t-1} keep_t + alpha_t beta_t^T  (A x C),  out_t = scale Z_t^T gamma_t  (C)
+//              the decayed memory, with a decay per row (dec (A,), ROWS) or per column (dec (C,)): one scalar for
+//              the linear memory, one per bank for the bank memory. With the roles of alpha / beta / gamma permuted
+//              and time reversed it is also every gradient of itself (see model/kernels/rsm_scan.py).
+//
+// Scalars (lam, scales, mu) are read from a device array, so launching never syncs with the host.
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace {
+
+constexpr int SG = 16;  // sub-group size: one sub-group spans the A axis of the memory
+
+// ---------------------------------------------------------------------------------------------------------
+// rot_scan: one work-item per (row b, RoPE pair p); U steps of inputs are loaded before they are used, so
+// the loads of the next steps are in flight while the dependent chain of the current ones runs.
+
+template <int U>
+struct RotScan {
+  const float *x, *cs, *sn, *scal, *z0;
+  const uint8_t* reset;
+  float *out, *zend;
+  int B, N, D;
+  bool reverse;
+  float sign;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const int half = D / 2;
+    const size_t gid = it.get_global_id(0);
+    if (gid >= (size_t)B * half) return;
+    const int b = gid / half, p = gid % half;
+    const float lam = scal[0], in_scale = scal[1], out_scale = scal[2];
+    const float c = cs[p], s = sign * sn[p];
+    float z1 = 0.f, z2 = 0.f;
+    if (z0) {
+      z1 = z0[(size_t)b * D + p];
+      z2 = z0[(size_t)b * D + p + half];
+    }
+    const float* xb = x + (size_t)b * N * D;
+    float* ob = out + (size_t)b * N * D;
+    const uint8_t* rb = reset + (size_t)b * N;
+    for (int k0 = 0; k0 < N; k0 += U) {
+      float x1[U], x2[U], keep[U];
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int k = k0 + u;
+        if (k < N) {
+          const int t = reverse ? N - 1 - k : k;
+          x1[u] = xb[(size_t)t * D + p];
+          x2[u] = xb[(size_t)t * D + p + half];
+          const int tk = reverse ? t + 1 : t;
+          keep[u] = (tk < N && rb[tk]) ? 0.f : lam;
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int k = k0 + u;
+        if (k < N) {
+          const int t = reverse ? N - 1 - k : k;
+          const float r1 = keep[u] * (c * z1 - s * z2) + in_scale * x1[u];
+          const float r2 = keep[u] * (s * z1 + c * z2) + in_scale * x2[u];
+          z1 = r1;
+          z2 = r2;
+          ob[(size_t)t * D + p] = out_scale * z1;
+          ob[(size_t)t * D + p + half] = out_scale * z2;
+        }
+      }
+    }
+    if (zend) {
+      zend[(size_t)b * D + p] = z1;
+      zend[(size_t)b * D + p + half] = z2;
+    }
+  }
+};
+
+template <int U>
+void rot_scan_impl(const float* x, const uint8_t* reset, const float* cs, const float* sn, const float* scal,
+                   const float* z0, float* out, float* zend, int B, int N, int D, bool reverse, float sign) {
+  const size_t lanes = (size_t)B * (D / 2);
+  const size_t wg = 64;
+  const size_t global = (lanes + wg - 1) / wg * wg;
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  RotScan<U> k{x, cs, sn, scal, z0, reset, out, zend, B, N, D, reverse, sign};
+  q.parallel_for(sycl::nd_range<1>(global, wg), k);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// outer_scan: a work-group per (row b, block of columns). Lane l of a sub-group owns rows a = i * SG + l
+// (i < AB) of Z for CB columns, so a sub-group holds whole columns and the read-out sum over a is one
+// sub-group reduction. alpha, gamma (A wide) and beta (C wide) of S steps are staged in shared local memory
+// once per work-group: every lane reads them from SLM instead of DRAM / L3.
+
+template <int AB, int CB, int S, bool ROWS>
+struct OuterScan {
+  static constexpr int A = AB * SG;
+  const float *alpha, *beta, *gamma, *dec, *scal, *z0;
+  const uint8_t* reset;
+  float *out, *zend;
+  int N, C, wg, sg_per_wg, wgs_per_b;
+  bool reverse;
+  sycl::local_accessor<float, 1> sa, sgm, sb, sk;
+
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int g = it.get_group(0);
+    const int b = g / wgs_per_b;
+    const int lid = it.get_local_id(0);
+    const int lane = lid % SG;
+    const int c0 = ((g % wgs_per_b) * sg_per_wg + lid / SG) * CB;
+    const int WC = sg_per_wg * CB, cw0 = (g % wgs_per_b) * WC;  // the work-group's columns: only these are staged
+    const int cl = (lid / SG) * CB;  // this sub-group's first column inside them
+    auto sgrp = it.get_sub_group();
+    const float scale = scal[0];
+    float dr[ROWS ? AB : 1], dc[ROWS ? 1 : CB];  // this lane's row decays, or its columns'
+    if constexpr (ROWS) {
+#pragma unroll
+      for (int i = 0; i < AB; ++i) dr[i] = dec[i * SG + lane];
+    } else {
+#pragma unroll
+      for (int j = 0; j < CB; ++j) dc[j] = dec[c0 + j];
+    }
+    float Z[AB][CB];
+#pragma unroll
+    for (int i = 0; i < AB; ++i)
+#pragma unroll
+      for (int j = 0; j < CB; ++j)
+        Z[i][j] = z0 ? z0[((size_t)b * A + i * SG + lane) * C + c0 + j] : 0.f;
+    const float* ab = alpha + (size_t)b * N * A;
+    const float* gb = gamma + (size_t)b * N * A;
+    const float* bb = beta + (size_t)b * N * C;
+    const uint8_t* rb = reset + (size_t)b * N;
+    float* ob = out + (size_t)b * N * C;
+    for (int k0 = 0; k0 < N; k0 += S) {
+      const int steps = (N - k0) < S ? (N - k0) : S;
+      sycl::group_barrier(it.get_group());
+      for (int i = lid; i < steps * A; i += wg) {
+        const int s = i / A, a = i % A;
+        const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+        // lane-major in SLM: row a = j * SG + l is owned by lane l, stored at l * AB + j, so each lane's rows are
+        // contiguous and arrive as vector reads into separate registers (iga64 showed the strided sub-group
+        // load becoming a chain of dependent 2-register gathers)
+        const int slot = s * A + (a % SG) * AB + a / SG;
+        sa[slot] = ab[(size_t)t * A + a];
+        sgm[slot] = gb[(size_t)t * A + a];
+      }
+      for (int i = lid; i < steps * WC; i += wg) {
+        const int s = i / WC, c = i % WC;
+        const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+        sb[i] = bb[(size_t)t * C + cw0 + c];
+      }
+      for (int i = lid; i < steps; i += wg) {
+        const int t = reverse ? N - 1 - (k0 + i) : k0 + i;
+        const int tk = reverse ? t + 1 : t;
+        sk[i] = (tk < N && rb[tk]) ? 0.f : 1.f;
+      }
+      sycl::group_barrier(it.get_group());
+      // U = SG / CB steps at a time (fully unrolled): their U x CB sub-group reductions are independent, so they
+      // overlap instead of chaining step after step, and each lane then stores one of the U x CB totals
+      constexpr int U = SG / CB;
+      for (int s0 = 0; s0 < steps; s0 += U) {
+        float part[U][CB];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int s = s0 + u < steps ? s0 + u : steps - 1;  // past the end: recompute the last step, unused
+          const bool live = s0 + u < steps;
+          const float kf = sk[s];  // 0 at a document reset
+          float bv[CB], mc[ROWS ? 1 : CB];
+          if constexpr (!ROWS) {
+#pragma unroll
+            for (int j = 0; j < CB; ++j) mc[j] = kf * dc[j];
+          }
+#pragma unroll
+          for (int j = 0; j < CB; ++j) {
+            bv[j] = sb[s * WC + cl + j];  // the same address in every lane: one broadcast read
+            part[u][j] = 0.f;
+          }
+#pragma unroll
+          for (int i = 0; i < AB; ++i) {
+            const float a = sa[s * A + lane * AB + i], g = sgm[s * A + lane * AB + i];
+            float mr = 0.f;
+            if constexpr (ROWS) mr = kf * dr[i];
+#pragma unroll
+            for (int j = 0; j < CB; ++j) {
+              const float z = (ROWS ? mr : mc[j]) * Z[i][j] + a * bv[j];
+              if (live) Z[i][j] = z;
+              part[u][j] += z * g;
+            }
+          }
+        }
+        float mine = 0.f;
+#pragma unroll
+        for (int u = 0; u < U; ++u)
+#pragma unroll
+          for (int j = 0; j < CB; ++j) {
+            const float tot = sycl::reduce_over_group(sgrp, part[u][j], sycl::plus<float>());
+            if (lane == u * CB + j) mine = tot;
+          }
+        const int s = s0 + lane / CB;  // lane l: step l / CB, column l % CB
+        if (s < steps) {
+          const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+          ob[(size_t)t * C + c0 + lane % CB] = scale * mine;
+        }
+      }
+    }
+    if (zend) {
+#pragma unroll
+      for (int i = 0; i < AB; ++i)
+#pragma unroll
+        for (int j = 0; j < CB; ++j) zend[((size_t)b * A + i * SG + lane) * C + c0 + j] = Z[i][j];
+    }
+  }
+};
+
+template <int AB, int CB, int S, bool ROWS>
+void outer_scan_impl(const float* alpha, const float* beta, const float* gamma, const uint8_t* reset,
+                     const float* dec, const float* scal, const float* z0, float* out, float* zend, int B, int N,
+                     int C, bool reverse) {
+  constexpr int A = AB * SG;
+  const int cgroups = C / CB;
+  int sg_per_wg = cgroups < 32 ? cgroups : 32;  // up to 512 work-items
+  while (cgroups % sg_per_wg) --sg_per_wg;
+  const int wg = sg_per_wg * SG;
+  const int wgs_per_b = cgroups / sg_per_wg;
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  q.submit([&](sycl::handler& h) {
+    OuterScan<AB, CB, S, ROWS> k{alpha, beta, gamma, dec, scal, z0, reset, out, zend, N, C, wg, sg_per_wg, wgs_per_b,
+                           reverse, sycl::local_accessor<float, 1>(S * A, h), sycl::local_accessor<float, 1>(S * A, h),
+                           sycl::local_accessor<float, 1>(S * wg / SG * (C / cgroups), h), sycl::local_accessor<float, 1>(S, h)};
+    h.parallel_for(sycl::nd_range<1>((size_t)B * wgs_per_b * wg, wg), k);
+  });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// outer_scan_cols: the same memory, Z_t = dec_a Z_{t-1} keep_t + alpha_t beta_t^T (A x C, a decay per row a), read
+// out over the columns instead: out_t = scale Z_t gamma_t (A wide, gamma C wide). It is how the memory's dq and dk
+// run when the value width C is too wide for the rows of `outer_scan` (dq_t = M_t do_t with M the forward memory;
+// dk_j = G_j v_j with G the reverse memory of q do^T), so the banks (A) stay on the register-tiled axis.
+// Same tiling as `outer_scan` (lane l owns rows i * SG + l of CB columns); each lane's partial over its own columns
+// goes to shared local memory, and once per S steps the work-group sums its sub-groups' partials. Every work-group
+// covers sg_per_wg * CB columns, so the output leaves as one partial per work-group, summed on the host.
+
+template <int AB, int CB, int S>
+struct OuterScanCols {
+  static constexpr int A = AB * SG;
+  const float *alpha, *beta, *gamma, *dec, *scal;
+  const uint8_t* reset;
+  float* part;  // (B, wgs_per_b, N, A)
+  float* zend;  // (B, A, C) or null: the memory after the last step
+  int N, C, wg, sg_per_wg, wgs_per_b;
+  bool reverse;
+  sycl::local_accessor<float, 1> sa, sb, sgm, sk, sred;
+
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int g = it.get_group(0);
+    const int b = g / wgs_per_b, wgi = g % wgs_per_b;
+    const int lid = it.get_local_id(0);
+    const int lane = lid % SG, sgi = lid / SG;
+    const int WC = sg_per_wg * CB, cw0 = wgi * WC, cl = sgi * CB;  // only the work-group's columns are staged
+    const float scale = scal[0];
+    float dr[AB];
+#pragma unroll
+    for (int i = 0; i < AB; ++i) dr[i] = dec[i * SG + lane];
+    float Z[AB][CB];
+#pragma unroll
+    for (int i = 0; i < AB; ++i)
+#pragma unroll
+      for (int j = 0; j < CB; ++j) Z[i][j] = 0.f;
+    const float* ab = alpha + (size_t)b * N * A;
+    const float* bb = beta + (size_t)b * N * C;
+    const float* gb = gamma + (size_t)b * N * C;
+    const uint8_t* rb = reset + (size_t)b * N;
+    float* pb = part + ((size_t)b * wgs_per_b + wgi) * N * A;
+    for (int k0 = 0; k0 < N; k0 += S) {
+      const int steps = (N - k0) < S ? (N - k0) : S;
+      sycl::group_barrier(it.get_group());
+      for (int i = lid; i < steps * A; i += wg) {
+        const int s = i / A, a = i % A;
+        const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+        sa[s * A + (a % SG) * AB + a / SG] = ab[(size_t)t * A + a];  // lane-major, as in outer_scan
+      }
+      for (int i = lid; i < steps * WC; i += wg) {
+        const int s = i / WC, c = i % WC;
+        const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+        sb[i] = bb[(size_t)t * C + cw0 + c];
+        sgm[i] = gb[(size_t)t * C + cw0 + c];
+      }
+      for (int i = lid; i < steps; i += wg) {
+        const int t = reverse ? N - 1 - (k0 + i) : k0 + i;
+        const int tk = reverse ? t + 1 : t;
+        sk[i] = (tk < N && rb[tk]) ? 0.f : 1.f;
+      }
+      sycl::group_barrier(it.get_group());
+      for (int s = 0; s < steps; ++s) {
+        const float kf = sk[s];
+        float bv[CB], gv[CB];
+#pragma unroll
+        for (int j = 0; j < CB; ++j) {
+          bv[j] = sb[s * WC + cl + j];
+          gv[j] = sgm[s * WC + cl + j];
+        }
+#pragma unroll
+        for (int i = 0; i < AB; ++i) {
+          const float a = sa[s * A + lane * AB + i], mr = kf * dr[i];
+          float p = 0.f;
+#pragma unroll
+          for (int j = 0; j < CB; ++j) {
+            Z[i][j] = mr * Z[i][j] + a * bv[j];
+            p += Z[i][j] * gv[j];
+          }
+          sred[(s * sg_per_wg + sgi) * A + i * SG + lane] = p;
+        }
+      }
+      sycl::group_barrier(it.get_group());
+      for (int i = lid; i < steps * A; i += wg) {
+        const int s = i / A, a = i % A;
+        float tot = 0.f;
+        for (int q = 0; q < sg_per_wg; ++q) tot += sred[(s * sg_per_wg + q) * A + a];
+        const int t = reverse ? N - 1 - (k0 + s) : k0 + s;
+        pb[(size_t)t * A + a] = scale * tot;
+      }
+    }
+    if (zend) {
+#pragma unroll
+      for (int i = 0; i < AB; ++i)
+#pragma unroll
+        for (int j = 0; j < CB; ++j) zend[((size_t)b * A + i * SG + lane) * C + cw0 + cl + j] = Z[i][j];
+    }
+  }
+};
+
+template <int AB, int CB, int S>
+torch::Tensor outer_scan_cols_impl(const torch::Tensor& alpha, const torch::Tensor& beta, const torch::Tensor& gamma,
+                                   const torch::Tensor& reset, const torch::Tensor& dec, const torch::Tensor& scal,
+                                   bool reverse, float* zend) {
+  constexpr int A = AB * SG;
+  const int B = alpha.size(0), N = alpha.size(1), C = beta.size(2);
+  const int cgroups = C / CB;
+  int sg_per_wg = cgroups < 32 ? cgroups : 32;
+  while (cgroups % sg_per_wg) --sg_per_wg;
+  const int wg = sg_per_wg * SG;
+  const int wgs_per_b = cgroups / sg_per_wg;
+  auto part = torch::empty({B, wgs_per_b, N, A}, alpha.options());
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  q.submit([&](sycl::handler& h) {
+    OuterScanCols<AB, CB, S> k{alpha.data_ptr<float>(), beta.data_ptr<float>(), gamma.data_ptr<float>(),
+                               dec.data_ptr<float>(), scal.data_ptr<float>(), reset.data_ptr<uint8_t>(),
+                               part.data_ptr<float>(), zend, N, C, wg, sg_per_wg, wgs_per_b, reverse,
+                               sycl::local_accessor<float, 1>(S * A, h), sycl::local_accessor<float, 1>(S * sg_per_wg * CB, h),
+                               sycl::local_accessor<float, 1>(S * sg_per_wg * CB, h), sycl::local_accessor<float, 1>(S, h),
+                               sycl::local_accessor<float, 1>(S * sg_per_wg * A, h)};
+    h.parallel_for(sycl::nd_range<1>((size_t)B * wgs_per_b * wg, wg), k);
+  });
+  return wgs_per_b == 1 ? part.select(1, 0) : part.sum(1);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// MLP epilogues. The MLP's matmuls stay in oneDNN (near peak on these shapes); what these kernels remove is
+// the extra passes over the (rows x hidden) activations, which are DRAM-bound: a bias post-op and a separate
+// GELU in the forward; a GELU recompute, gelu_backward and a column sum (db1) in the backward. Each kernel
+// reads the hidden-sized tensors once and writes them once. tanh GELU, as `torch.nn.functional.gelu(approximate="tanh")`.
+
+constexpr float kGeluK = 0.7978845608028654f;  // sqrt(2 / pi)
+constexpr float kGeluC = 0.044715f;
+
+inline float gelu_tanh(float x) {
+  return 0.5f * x * (1.f + sycl::tanh(kGeluK * (x + kGeluC * x * x * x)));
+}
+
+// out <- gelu(pre + b1) (out may be pre: in place). One work-item per 4 consecutive columns of `rows_per_item` rows.
+struct BiasGelu {
+  float* pre;
+  float* out;
+  const float* b1;
+  int R, H4, rows_per_item;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const size_t gid = it.get_global_id(0);
+    const int c4 = gid % H4;
+    const int r0 = (gid / H4) * rows_per_item;
+    if (r0 >= R) return;
+    const sycl::float4 b = reinterpret_cast<const sycl::float4*>(b1)[c4];
+    const sycl::float4* p = reinterpret_cast<const sycl::float4*>(pre);
+    sycl::float4* o = reinterpret_cast<sycl::float4*>(out);
+    const int r1 = sycl::min(R, r0 + rows_per_item);
+    for (int r = r0; r < r1; ++r) {
+      sycl::float4 v = p[(size_t)r * H4 + c4] + b;
+      o[(size_t)r * H4 + c4] = sycl::float4(gelu_tanh(v.x()), gelu_tanh(v.y()), gelu_tanh(v.z()), gelu_tanh(v.w()));
+    }
+  }
+};
+
+// With x = pre + b1: pre <- gelu(x), dh <- gelu'(x) dh, part[block] = column sums of the new dh (db1 partials).
+struct GeluBackward {
+  float *pre, *dh, *part;
+  const float* b1;
+  int R, H4, rows_per_item;
+
+  void operator()(sycl::nd_item<1> it) const {
+    const size_t gid = it.get_global_id(0);
+    const int c4 = gid % H4;
+    const int blk = gid / H4;
+    const int r0 = blk * rows_per_item;
+    if (r0 >= R) return;
+    const sycl::float4 b = reinterpret_cast<const sycl::float4*>(b1)[c4];
+    sycl::float4* p = reinterpret_cast<sycl::float4*>(pre);
+    sycl::float4* d = reinterpret_cast<sycl::float4*>(dh);
+    sycl::float4 acc(0.f);
+    const int r1 = sycl::min(R, r0 + rows_per_item);
+    for (int r = r0; r < r1; ++r) {
+      const size_t i = (size_t)r * H4 + c4;
+      const sycl::float4 x = p[i] + b;
+      const sycl::float4 g = d[i];
+      sycl::float4 h, dp;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float xe = x[e];
+        const float t = sycl::tanh(kGeluK * (xe + kGeluC * xe * xe * xe));
+        h[e] = 0.5f * xe * (1.f + t);
+        dp[e] = g[e] * (0.5f * (1.f + t) + 0.5f * xe * (1.f - t * t) * kGeluK * (1.f + 3.f * kGeluC * xe * xe));
+      }
+      p[i] = h;
+      d[i] = dp;
+      acc += dp;
+    }
+    reinterpret_cast<sycl::float4*>(part)[(size_t)blk * H4 + c4] = acc;
+  }
+};
+
+// ---------------------------------------------------------------------------------------------------------
+// Row norms (D % 64 == 0): one sub-group per row, each lane holding D / 16 elements as float4s, rows_per_sg
+// rows per sub-group. Each pass reads its inputs once and writes once; per-row statistics (1 float per row) are
+// kept for the backward pass, and the weight gradients leave as per-sub-group column partials (summed in torch).
+//
+// rms     y = x inv w,  inv = (mean x^2 + eps)^(-1/2)
+//         dx = inv g - x inv^3 (sum_d g_d x_d) / D,  g = dy w;   dw = sum_rows dy x inv
+// l2n     u = x + b,  y = u / max(|u|, eps),  n = 1 / max(|u|, eps)
+//         du = n (dy - y (y . dy));   db = sum_rows du
+
+template <int V>  // float4s per lane: D = 64 V
+struct RowNorm {
+  const float *x, *w, *dy, *stat_in;
+  float *y, *stat, *dx, *part;
+  int R, rows_per_sg, mode;  // mode 0: rms fwd, 1: rms bwd, 2: l2n fwd, 3: l2n bwd
+  float eps;
+
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    constexpr int D4 = V * SG, D = 4 * D4;
+    auto sg = it.get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const size_t sgid = it.get_global_id(0) / SG;
+    const int r0 = sgid * rows_per_sg;
+    if (r0 >= R) return;
+    const int r1 = sycl::min(R, r0 + rows_per_sg);
+    const sycl::float4* X = reinterpret_cast<const sycl::float4*>(x);
+    const sycl::float4* W = reinterpret_cast<const sycl::float4*>(w);
+    const sycl::float4* DY = reinterpret_cast<const sycl::float4*>(dy);
+    sycl::float4* Y = reinterpret_cast<sycl::float4*>(y);
+    sycl::float4* DX = reinterpret_cast<sycl::float4*>(dx);
+    sycl::float4 wv[V], acc[V];
+#pragma unroll
+    for (int v = 0; v < V; ++v) {
+      wv[v] = W[v * SG + lane];
+      acc[v] = sycl::float4(0.f);
+    }
+    for (int r = r0; r < r1; ++r) {
+      const size_t base = (size_t)r * D4;
+      sycl::float4 xv[V];
+#pragma unroll
+      for (int v = 0; v < V; ++v) xv[v] = X[base + v * SG + lane];
+      if (mode == 0) {  // rms forward
+        float ss = 0.f;
+#pragma unroll
+        for (int v = 0; v < V; ++v) ss += sycl::dot(xv[v], xv[v]);
+        const float inv = sycl::rsqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / D + eps);
+#pragma unroll
+        for (int v = 0; v < V; ++v) Y[base + v * SG + lane] = xv[v] * inv * wv[v];
+        if (lane == 0) stat[r] = inv;
+      } else if (mode == 1) {  // rms backward
+        const float inv = stat_in[r];
+        sycl::float4 g[V];
+        float gx = 0.f;
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+          const sycl::float4 d = DY[base + v * SG + lane];
+          g[v] = d * wv[v];
+          gx += sycl::dot(g[v], xv[v]);
+          acc[v] += d * xv[v] * inv;
+        }
+        const float c = sycl::reduce_over_group(sg, gx, sycl::plus<float>()) * inv * inv * inv / D;
+#pragma unroll
+        for (int v = 0; v < V; ++v) DX[base + v * SG + lane] = inv * g[v] - c * xv[v];
+      } else if (mode == 2) {  // l2n forward (w = bias)
+        float ss = 0.f;
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+          xv[v] += wv[v];
+          ss += sycl::dot(xv[v], xv[v]);
+        }
+        const float n = 1.f / sycl::max(sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>())), eps);
+#pragma unroll
+        for (int v = 0; v < V; ++v) Y[base + v * SG + lane] = xv[v] * n;
+        if (lane == 0) stat[r] = n;
+      } else {  // l2n backward: x = y (the normalized output)
+        const float n = stat_in[r];
+        sycl::float4 d[V];
+        float yd = 0.f;
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+          d[v] = DY[base + v * SG + lane];
+          yd += sycl::dot(xv[v], d[v]);
+        }
+        const float c = sycl::reduce_over_group(sg, yd, sycl::plus<float>());
+#pragma unroll
+        for (int v = 0; v < V; ++v) {
+          const sycl::float4 du = n * (d[v] - c * xv[v]);
+          DX[base + v * SG + lane] = du;
+          acc[v] += du;
+        }
+      }
+    }
+    if (mode == 1 || mode == 3) {
+      sycl::float4* P = reinterpret_cast<sycl::float4*>(part);
+#pragma unroll
+      for (int v = 0; v < V; ++v) P[sgid * D4 + v * SG + lane] = acc[v];
+    }
+  }
+};
+
+// The same four passes for wide rows (D % 64 == 0, D > 256), where a lane cannot hold its share of a row in
+// registers: per sub-group of RB rows, a first sweep gets each row's statistic (a sub-group reduction), a second
+// sweep goes over the columns (one float4 per lane at a time, the rows re-read from cache) writing the outputs and
+// the column partials of the weight gradient.
+constexpr int RB = 8;
+
+struct RowNormWide {
+  const float *x, *w, *dy, *stat_in;
+  float *y, *stat, *dx, *part;
+  int R, D, mode;
+  float eps;
+
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    const int D4 = D / 4, V = D4 / SG;
+    auto sg = it.get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const size_t sgid = it.get_global_id(0) / SG;
+    const int r0 = sgid * RB;
+    if (r0 >= R) return;
+    const int nr = sycl::min(R - r0, RB);
+    const sycl::float4* X = reinterpret_cast<const sycl::float4*>(x);
+    const sycl::float4* W = reinterpret_cast<const sycl::float4*>(w);
+    const sycl::float4* DY = reinterpret_cast<const sycl::float4*>(dy);
+    sycl::float4* Y = reinterpret_cast<sycl::float4*>(y);
+    sycl::float4* DX = reinterpret_cast<sycl::float4*>(dx);
+    float st[RB], c[RB];
+    for (int k = 0; k < nr; ++k) {  // sweep 1: the row statistic
+      const size_t base = (size_t)(r0 + k) * D4;
+      float acc = 0.f;
+      for (int v = 0; v < V; ++v) {
+        sycl::float4 xv = X[base + v * SG + lane];
+        if (mode == 0) acc += sycl::dot(xv, xv);
+        else if (mode == 1) acc += sycl::dot(DY[base + v * SG + lane] * W[v * SG + lane], xv);
+        else if (mode == 2) { xv += W[v * SG + lane]; acc += sycl::dot(xv, xv); }
+        else acc += sycl::dot(xv, DY[base + v * SG + lane]);
+      }
+      const float tot = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+      if (mode == 0) { st[k] = sycl::rsqrt(tot / D + eps); if (lane == 0) stat[r0 + k] = st[k]; }
+      else if (mode == 2) { st[k] = 1.f / sycl::max(sycl::sqrt(tot), eps); if (lane == 0) stat[r0 + k] = st[k]; }
+      else if (mode == 1) { st[k] = stat_in[r0 + k]; c[k] = tot * st[k] * st[k] * st[k] / D; }
+      else { st[k] = stat_in[r0 + k]; c[k] = tot; }
+    }
+    for (int v = 0; v < V; ++v) {  // sweep 2: outputs, and the weight-gradient partials of these rows
+      const sycl::float4 wv = W[v * SG + lane];
+      sycl::float4 acc(0.f);
+      for (int k = 0; k < nr; ++k) {
+        const size_t i = (size_t)(r0 + k) * D4 + v * SG + lane;
+        const sycl::float4 xv = X[i];
+        if (mode == 0) Y[i] = xv * st[k] * wv;
+        else if (mode == 2) Y[i] = (xv + wv) * st[k];
+        else if (mode == 1) {
+          const sycl::float4 d = DY[i];
+          DX[i] = st[k] * (d * wv) - c[k] * xv;
+          acc += d * xv * st[k];
+        } else {
+          const sycl::float4 du = st[k] * (DY[i] - c[k] * xv);
+          DX[i] = du;
+          acc += du;
+        }
+      }
+      if (mode == 1 || mode == 3) reinterpret_cast<sycl::float4*>(part)[sgid * D4 + v * SG + lane] = acc;
+    }
+  }
+};
+
+// The bank memory's read joined to the state, per row (one sub-group per row, float4 sweeps over D):
+//     h = a s + g o,   o = m[:D] / max(m[D], 1e-12)     (m the scan's output: the values' sum, then the mass z)
+// a = 1 when `a` is null (read_mix "add"). Backward, with dg = dh . o and da = dh . s:
+//     ds = a dh,  dm[:D] = g dh / z,  dm[D] = -g dg / z (0 when z is clamped),  dm[D+1:] = 0.
+struct JoinRead {
+  const float *s, *m, *g, *a, *dh;
+  float *h, *ds, *dm, *dg, *da;
+  int R, D, M;  // M = the width of m (D + 16)
+  bool backward;
+
+  [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+    auto sg = it.get_sub_group();
+    const int lane = sg.get_local_linear_id();
+    const size_t r = it.get_global_id(0) / SG;
+    if (r >= (size_t)R) return;
+    const int D4 = D / 4, M4 = M / 4;
+    const sycl::float4* S4 = reinterpret_cast<const sycl::float4*>(s) + r * D4;
+    const sycl::float4* Mv = reinterpret_cast<const sycl::float4*>(m) + r * M4;
+    const float zr = m[r * M + D];
+    const float z = sycl::max(zr, 1e-12f), iz = 1.f / z, gr = g[r], ar = a ? a[r] : 1.f;
+    if (!backward) {
+      sycl::float4* H = reinterpret_cast<sycl::float4*>(h) + r * D4;
+      for (int v = lane; v < D4; v += SG) H[v] = ar * S4[v] + (gr * iz) * Mv[v];
+      return;
+    }
+    const sycl::float4* DH = reinterpret_cast<const sycl::float4*>(dh) + r * D4;
+    sycl::float4* DM = reinterpret_cast<sycl::float4*>(dm) + r * M4;
+    sycl::float4* DS = reinterpret_cast<sycl::float4*>(ds) + r * D4;
+    float pg = 0.f, pa = 0.f;
+    for (int v = lane; v < D4; v += SG) {
+      const sycl::float4 d = DH[v];
+      pg += sycl::dot(d, Mv[v]);
+      if (a) {
+        pa += sycl::dot(d, S4[v]);
+        DS[v] = ar * d;
+      }
+      DM[v] = (gr * iz) * d;
+    }
+    const float tg = sycl::reduce_over_group(sg, pg, sycl::plus<float>()) * iz;  // dh . o
+    const float ta = a ? sycl::reduce_over_group(sg, pa, sycl::plus<float>()) : 0.f;  // `a` is the same in every lane
+    if (lane == 0) {
+      dg[r] = tg;
+      if (a) da[r] = ta;
+    }
+    for (int v = D4 + lane; v < M4; v += SG) DM[v] = sycl::float4(0.f);
+    if (lane == 0) dm[r * M + D] = zr > 1e-12f ? -gr * tg * iz : 0.f;
+  }
+};
+
+void check(const torch::Tensor& t, int dim, const char* name) {
+  TORCH_CHECK(t.is_xpu() && t.scalar_type() == torch::kFloat32 && t.is_contiguous() && t.dim() == dim,
+              name, " must be a contiguous float32 XPU tensor of rank ", dim);
+}
+
+}  // namespace
+
+// x (B, N, D), reset (B, N) uint8, cos / sin (D/2), scal (3) = [lam, in_scale, out_scale], z0 (B, D) or empty
+std::vector<torch::Tensor> rot_scan(torch::Tensor x, torch::Tensor reset, torch::Tensor cs, torch::Tensor sn,
+                                    torch::Tensor scal, torch::Tensor z0, bool reverse, double sign) {
+  check(x, 3, "x");
+  const int B = x.size(0), N = x.size(1), D = x.size(2);
+  TORCH_CHECK(D % 2 == 0, "D must be even");
+  auto out = torch::empty_like(x);
+  auto zend = torch::empty({B, D}, x.options());
+  rot_scan_impl<8>(x.data_ptr<float>(), reset.data_ptr<uint8_t>(), cs.data_ptr<float>(), sn.data_ptr<float>(),
+                   scal.data_ptr<float>(), z0.numel() ? z0.data_ptr<float>() : nullptr, out.data_ptr<float>(),
+                   zend.data_ptr<float>(), B, N, D, reverse, (float)sign);
+  return {out, zend};
+}
+
+// alpha, gamma (B, N, A), beta (B, N, C), reset (B, N) uint8, dec (A,) if dec_rows else (C,), scale (1,),
+// z0 (B, A, C) or empty
+std::vector<torch::Tensor> outer_scan(torch::Tensor alpha, torch::Tensor beta, torch::Tensor gamma,
+                                      torch::Tensor reset, torch::Tensor dec, torch::Tensor scale, torch::Tensor z0,
+                                      bool reverse, bool want_end, bool dec_rows) {
+  check(alpha, 3, "alpha");
+  check(beta, 3, "beta");
+  check(gamma, 3, "gamma");
+  const int B = alpha.size(0), N = alpha.size(1), A = alpha.size(2), C = beta.size(2);
+  TORCH_CHECK(dec.is_contiguous() && dec.numel() == (dec_rows ? A : C), "outer_scan: dec size");
+  auto out = torch::empty({B, N, C}, alpha.options());
+  auto zend = want_end ? torch::empty({B, A, C}, alpha.options()) : torch::Tensor();
+  const float* z = z0.numel() ? z0.data_ptr<float>() : nullptr;
+  float* ze = want_end ? zend.data_ptr<float>() : nullptr;
+  auto args = std::make_tuple(alpha.data_ptr<float>(), beta.data_ptr<float>(), gamma.data_ptr<float>(),
+                              reset.data_ptr<uint8_t>(), dec.data_ptr<float>(), scale.data_ptr<float>(), z,
+                              out.data_ptr<float>(), ze);
+  auto run = [&](auto impl) {
+    std::apply([&](auto... a) { impl(a..., B, N, C, reverse); }, args);
+  };
+  TORCH_CHECK(C % 2 == 0, "C must be even");
+  const bool four = C % 4 == 0;
+// steps staged per barrier pair: 64 where shared local memory allows (A <= 32), 16 for the wider row blocks
+#define RSM_DISPATCH(AB_)                                                                   \
+  constexpr int S_ = AB_ <= 2 ? 64 : 16;                                                    \
+  if (dec_rows) four ? run(outer_scan_impl<AB_, 4, S_, true>) : run(outer_scan_impl<AB_, 2, S_, true>); \
+  else four ? run(outer_scan_impl<AB_, 4, S_, false>) : run(outer_scan_impl<AB_, 2, S_, false>);
+// rows that are not a power of two (the bank memory's values padded with a ones column: dim + 16) hold 2 columns
+// per lane, so the larger AB stays within the register file
+#define RSM_DISPATCH2(AB_)                                                                  \
+  if (dec_rows) run(outer_scan_impl<AB_, 2, 16, true>); else run(outer_scan_impl<AB_, 2, 16, false>);
+  if (A == 128) { RSM_DISPATCH(8) }
+  else if (A == 64) { RSM_DISPATCH(4) }
+  else if (A == 32) { RSM_DISPATCH(2) }
+  else if (A == 16) { RSM_DISPATCH(1) }
+  else if (A == 144) { RSM_DISPATCH2(9) }
+  else if (A == 80) { RSM_DISPATCH2(5) }
+  else if (A == 48) { RSM_DISPATCH2(3) }
+  else TORCH_CHECK(false, "outer_scan: A must be 16, 32, 48, 64, 80, 128 or 144, got ", A);
+#undef RSM_DISPATCH
+#undef RSM_DISPATCH2
+  return {out, want_end ? zend : torch::empty({0}, alpha.options())};
+}
+
+// alpha (B, N, A), beta / gamma (B, N, C), reset (B, N) uint8, dec (A,) (a decay per row), scale (1,):
+// out (B, N, A) = scale Z_t gamma_t, Z_t = dec Z_{t-1} keep_t + alpha_t beta_t^T, from Z = 0
+std::vector<torch::Tensor> outer_scan_cols(torch::Tensor alpha, torch::Tensor beta, torch::Tensor gamma,
+                                           torch::Tensor reset, torch::Tensor dec, torch::Tensor scale, bool reverse,
+                                           bool want_end) {
+  check(alpha, 3, "alpha");
+  check(beta, 3, "beta");
+  check(gamma, 3, "gamma");
+  const int A = alpha.size(2), C = beta.size(2);
+  TORCH_CHECK(dec.is_contiguous() && dec.numel() == A, "outer_scan_cols: dec size");
+  TORCH_CHECK(gamma.size(2) == C && C % 2 == 0, "outer_scan_cols: gamma width / C must be even");
+  const bool four = C % 4 == 0;
+  auto zend = want_end ? torch::empty({alpha.size(0), A, C}, alpha.options()) : torch::empty({0}, alpha.options());
+  float* ze = want_end ? zend.data_ptr<float>() : nullptr;
+#define RSM_COLS(AB_) return {four ? outer_scan_cols_impl<AB_, 4, 4>(alpha, beta, gamma, reset, dec, scale, reverse, ze) \
+                               : outer_scan_cols_impl<AB_, 2, 4>(alpha, beta, gamma, reset, dec, scale, reverse, ze), zend};
+  if (A == 128) { RSM_COLS(8) }
+  if (A == 64) { RSM_COLS(4) }
+  if (A == 32) { RSM_COLS(2) }
+  if (A == 16) { RSM_COLS(1) }
+#undef RSM_COLS
+  TORCH_CHECK(false, "outer_scan_cols: A must be 16, 32, 64 or 128, got ", A);
+}
+
+constexpr int kRowsPerItem = 64;
+
+// pre (R, H) <- gelu_tanh(pre + b1), in place
+void bias_gelu_(torch::Tensor pre, torch::Tensor b1) {
+  check(pre, 2, "pre");
+  const int R = pre.size(0), H = pre.size(1);
+  TORCH_CHECK(H % 4 == 0 && b1.numel() == H, "bias_gelu_: H % 4 and b1 size");
+  const int H4 = H / 4;
+  const size_t items = (size_t)((R + kRowsPerItem - 1) / kRowsPerItem) * H4;
+  const size_t wg = 128, global = (items + wg - 1) / wg * wg;
+  BiasGelu k{pre.data_ptr<float>(), pre.data_ptr<float>(), b1.data_ptr<float>(), R, H4, kRowsPerItem};
+  c10::xpu::getCurrentXPUStream().queue().parallel_for(sycl::nd_range<1>(global, wg), k);
+}
+
+// gelu_tanh(pre + b1) into a new tensor (pre kept: the backward pass can start from it instead of recomputing it)
+torch::Tensor bias_gelu(torch::Tensor pre, torch::Tensor b1) {
+  check(pre, 2, "pre");
+  const int R = pre.size(0), H = pre.size(1);
+  TORCH_CHECK(H % 4 == 0 && b1.numel() == H, "bias_gelu: H % 4 and b1 size");
+  auto out = torch::empty_like(pre);
+  const int H4 = H / 4;
+  const size_t items = (size_t)((R + kRowsPerItem - 1) / kRowsPerItem) * H4;
+  const size_t wg = 128, global = (items + wg - 1) / wg * wg;
+  BiasGelu k{pre.data_ptr<float>(), out.data_ptr<float>(), b1.data_ptr<float>(), R, H4, kRowsPerItem};
+  c10::xpu::getCurrentXPUStream().queue().parallel_for(sycl::nd_range<1>(global, wg), k);
+  return out;
+}
+
+// pre <- gelu(pre + b1), dh <- gelu'(pre + b1) * dh (both in place); returns db1 (H,)
+torch::Tensor gelu_backward_(torch::Tensor pre, torch::Tensor dh, torch::Tensor b1) {
+  check(pre, 2, "pre");
+  check(dh, 2, "dh");
+  const int R = pre.size(0), H = pre.size(1);
+  TORCH_CHECK(H % 4 == 0 && b1.numel() == H && dh.size(0) == R && dh.size(1) == H, "gelu_backward_: shapes");
+  const int H4 = H / 4, blocks = (R + kRowsPerItem - 1) / kRowsPerItem;
+  auto part = torch::empty({blocks, H}, pre.options());
+  const size_t items = (size_t)blocks * H4;
+  const size_t wg = 128, global = (items + wg - 1) / wg * wg;
+  GeluBackward k{pre.data_ptr<float>(), dh.data_ptr<float>(), part.data_ptr<float>(), b1.data_ptr<float>(), R, H4,
+                 kRowsPerItem};
+  c10::xpu::getCurrentXPUStream().queue().parallel_for(sycl::nd_range<1>(global, wg), k);
+  return part.sum(0);
+}
+
+constexpr int kNormRows = 32;
+
+// mode 0 rms fwd (x, w) -> (y, inv); 1 rms bwd (x, w, dy, inv) -> (dx, dw); 2 l2n fwd (x, b) -> (y, n);
+// 3 l2n bwd (y, -, dy, n) -> (dx, db)
+std::vector<torch::Tensor> row_norm(int64_t mode, torch::Tensor x, torch::Tensor w, torch::Tensor dy,
+                                    torch::Tensor stat_in, double eps) {
+  check(x, 2, "x");
+  const int R = x.size(0), D = x.size(1);
+  TORCH_CHECK(D % 64 == 0, "row_norm: D must be a multiple of 64, got ", D);
+  if (mode == 1 || mode == 3) {
+    check(dy, 2, "dy");
+    TORCH_CHECK(stat_in.numel() == R, "row_norm: stat");
+  }
+  auto wc = w.contiguous();
+  const bool wide = D > 256;
+  const int sgs = (R + (wide ? RB : kNormRows) - 1) / (wide ? RB : kNormRows);
+  auto out = torch::empty_like(x);
+  auto stat = (mode == 0 || mode == 2) ? torch::empty({R}, x.options()) : torch::empty({0}, x.options());
+  auto part = (mode == 1 || mode == 3) ? torch::empty({sgs, D}, x.options()) : torch::empty({0}, x.options());
+  const float* dyp = (mode == 1 || mode == 3) ? dy.data_ptr<float>() : nullptr;
+  const float* sip = (mode == 1 || mode == 3) ? stat_in.data_ptr<float>() : nullptr;
+  float* yp = (mode == 0 || mode == 2) ? out.data_ptr<float>() : nullptr;
+  float* dxp = (mode == 1 || mode == 3) ? out.data_ptr<float>() : nullptr;
+  float* sp = stat.numel() ? stat.data_ptr<float>() : nullptr;
+  float* pp = part.numel() ? part.data_ptr<float>() : nullptr;
+  const size_t wg = 128, global = ((size_t)sgs * SG + wg - 1) / wg * wg;
+  auto& q = c10::xpu::getCurrentXPUStream().queue();
+  auto go = [&](auto k) { q.parallel_for(sycl::nd_range<1>(global, wg), k); };
+  const int V = D / 64;
+  if (wide) go(RowNormWide{x.data_ptr<float>(), wc.data_ptr<float>(), dyp, sip, yp, sp, dxp, pp, R, D, (int)mode, (float)eps});
+  else if (V == 1) go(RowNorm<1>{x.data_ptr<float>(), wc.data_ptr<float>(), dyp, sip, yp, sp, dxp, pp, R, kNormRows, (int)mode, (float)eps});
+  else if (V == 2) go(RowNorm<2>{x.data_ptr<float>(), wc.data_ptr<float>(), dyp, sip, yp, sp, dxp, pp, R, kNormRows, (int)mode, (float)eps});
+  else if (V == 3) go(RowNorm<3>{x.data_ptr<float>(), wc.data_ptr<float>(), dyp, sip, yp, sp, dxp, pp, R, kNormRows, (int)mode, (float)eps});
+  else go(RowNorm<4>{x.data_ptr<float>(), wc.data_ptr<float>(), dyp, sip, yp, sp, dxp, pp, R, kNormRows, (int)mode, (float)eps});
+  if (mode == 0 || mode == 2) return {out, stat};
+  return {out, part.sum(0)};
+}
+
+// h = a s + g m[:D] / max(m[D], 1e-12): s (R, D), m (R, M), g (R,), a (R,) or empty (a = 1)
+torch::Tensor join_read(torch::Tensor s, torch::Tensor m, torch::Tensor g, torch::Tensor a) {
+  check(s, 2, "s");
+  check(m, 2, "m");
+  const int R = s.size(0), D = s.size(1), M = m.size(1);
+  TORCH_CHECK(D % 4 == 0 && M % 4 == 0 && M > D && m.size(0) == R && g.numel() == R, "join_read: shapes");
+  auto h = torch::empty_like(s);
+  const size_t wg = 128, global = ((size_t)R * SG + wg - 1) / wg * wg;
+  JoinRead k{s.data_ptr<float>(), m.data_ptr<float>(), g.data_ptr<float>(), a.numel() ? a.data_ptr<float>() : nullptr,
+             nullptr, h.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr, R, D, M, false};
+  c10::xpu::getCurrentXPUStream().queue().parallel_for(sycl::nd_range<1>(global, wg), k);
+  return h;
+}
+
+// backward of join_read: (ds or empty when a = 1, dm, dg, da or empty)
+std::vector<torch::Tensor> join_read_backward(torch::Tensor s, torch::Tensor m, torch::Tensor g, torch::Tensor a,
+                                              torch::Tensor dh) {
+  check(dh, 2, "dh");
+  const int R = s.size(0), D = s.size(1), M = m.size(1);
+  const bool has_a = a.numel() > 0;
+  auto ds = has_a ? torch::empty_like(s) : torch::empty({0}, s.options());
+  auto dm = torch::empty_like(m);
+  auto dg = torch::empty({R}, s.options());
+  auto da = has_a ? torch::empty({R}, s.options()) : torch::empty({0}, s.options());
+  const size_t wg = 128, global = ((size_t)R * SG + wg - 1) / wg * wg;
+  JoinRead k{s.data_ptr<float>(), m.data_ptr<float>(), g.data_ptr<float>(), has_a ? a.data_ptr<float>() : nullptr,
+             dh.data_ptr<float>(), nullptr, has_a ? ds.data_ptr<float>() : nullptr, dm.data_ptr<float>(),
+             dg.data_ptr<float>(), has_a ? da.data_ptr<float>() : nullptr, R, D, M, true};
+  c10::xpu::getCurrentXPUStream().queue().parallel_for(sycl::nd_range<1>(global, wg), k);
+  return {ds, dm, dg, da};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("join_read", &join_read);
+  m.def("join_read_backward", &join_read_backward);
+  m.def("rot_scan", &rot_scan);
+  m.def("outer_scan", &outer_scan);
+  m.def("outer_scan_cols", &outer_scan_cols);
+  m.def("bias_gelu_", &bias_gelu_);
+  m.def("bias_gelu", &bias_gelu);
+  m.def("gelu_backward_", &gelu_backward_);
+  m.def("row_norm", &row_norm);
+}

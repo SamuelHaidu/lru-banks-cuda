@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Log-Gaussian kernel trace -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+<style>
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ctx { font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>Which distances does the adaptive kernel weight?</h1>
+    <div class="subtitle">Static a_k + per-input sum of log-Gaussians w_k(x), read from {{ "{:,}".format(num_samples) }} validation windows</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">samples <strong>{{ "{:,}".format(num_samples) }}</strong> ({{ "{:,}".format(num_full) }} full windows)</span>
+      <span class="tag">long context = k &gt; <strong>{{ long_k }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>What the input dependence is worth</h2>
+    <table class="data-table">
+      <thead><tr><th>condition</th><th>what the second pass uses</th><th>val loss</th><th>&Delta;</th></tr></thead>
+      <tbody>
+        <tr><td>per-input amplitudes</td><td>the real model: alpha from the MLP for each input</td><td class="num"><strong>{{ "%.4f"|format(loss.per_input) }}</strong></td><td></td></tr>
+        <tr><td>dataset-mean amplitudes</td><td>one fixed kernel: alpha averaged over all inputs</td><td class="num">{{ "%.4f"|format(loss.mean_alpha) }}</td><td class="num">{{ "%+.4f"|format(loss.mean_alpha - loss.per_input) }}</td></tr>
+        <tr><td>static only</td><td>no second pass (w = 0)</td><td class="num">{{ "%.4f"|format(loss.static_only) }}</td><td class="num">{{ "%+.4f"|format(loss.static_only - loss.per_input) }}</td></tr>
+      </tbody>
+    </table>
+    <p class="hint">The gap between the first two rows is the value of adapting the kernel per input; the gap to the last row also includes the extra (fixed) kernel mass.</p>
+  </section>
+
+  <section class="card">
+    <h2>Kernels</h2>
+    <p class="hint">
+      Combined kernel = a_k + w_k(x). Mean long-context share {{ "%.3f"|format(long_share_mean) }}
+      (p10 {{ "%.3f"|format(long_share_p10) }}, p90 {{ "%.3f"|format(long_share_p90) }}); median half-mass distance k50 = {{ "%.0f"|format(k50_median) }};
+      the adaptive part carries {{ "%.1f"|format(100 * adaptive_share) }}% of the kernel mass on average.
+    </p>
+    {{ figs.kernels | safe }}
+  </section>
+
+  <section class="card">
+    <h2>Amplitude per basis function ({{ kernel_basis }})</h2>
+    <p class="hint">Coefficient of variation (std / mean) across inputs: high means that distance band is switched on and off per input.</p>
+    <table class="data-table">
+      <thead><tr>{% for c in cv %}<th>{{ c.center }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        <tr>{% for c in cv %}<td class="num">mean {{ "%.4f"|format(c.mean) }}<br>CV {{ "%.2f"|format(c.cv) }}</td>{% endfor %}</tr>
+      </tbody>
+    </table>
+    {{ figs.alpha | safe }}
+  </section>
+
+  <section class="card">
+    <h2>Long-context share across inputs</h2>
+    {{ figs.hist | safe }}
+  </section>
+
+  <section class="card">
+    <h2>By prefix length</h2>
+    <p class="hint">Windows near a document start are left-padded; the kernel still weights the padding positions.</p>
+    <table class="data-table">
+      <thead><tr><th>real context tokens</th><th>inputs</th><th>mean long share</th><th>median k50</th></tr></thead>
+      <tbody>{% for b in by_prefix %}<tr><td>{{ b.label }}</td><td class="num">{{ "{:,}".format(b.n) }}</td><td class="num">{{ "%.3f"|format(b.long) }}</td><td class="num">{{ "%.0f"|format(b.k50) }}</td></tr>{% endfor %}</tbody>
+    </table>
+    {{ figs.prefix | safe }}
+  </section>
+
+  <section class="card">
+    <h2>By n-1 token (full windows only, n &ge; {{ min_count }})</h2>
+    <div class="two-col">
+      <div>
+        <h3>Shortest reach</h3>
+        <table class="data-table">
+          <thead><tr><th>n-1 token</th><th>n</th><th>long share</th><th>k50</th></tr></thead>
+          <tbody>{% for r in shortest %}<tr><td><span class="token-pill small">{{ r.token }}</span></td><td class="num">{{ r.n }}</td><td class="num">{{ "%.3f"|format(r.long) }}</td><td class="num">{{ "%.0f"|format(r.k50) }}</td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+      <div>
+        <h3>Longest reach</h3>
+        <table class="data-table">
+          <thead><tr><th>n-1 token</th><th>n</th><th>long share</th><th>k50</th></tr></thead>
+          <tbody>{% for r in longest %}<tr><td><span class="token-pill small">{{ r.token }}</span></td><td class="num">{{ r.n }}</td><td class="num">{{ "%.3f"|format(r.long) }}</td><td class="num">{{ "%.0f"|format(r.k50) }}</td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Does it reach further when the target is copyable?</h2>
+    <table class="data-table">
+      <thead><tr><th>condition (full windows)</th><th>inputs</th><th>mean long share</th></tr></thead>
+      <tbody>{% for c in copy_rows %}<tr><td>{{ c.label }}</td><td class="num">{{ "{:,}".format(c.n) }}</td><td class="num">{{ "%.3f"|format(c.long) }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Extreme examples</h2>
+    <p class="hint">Normalized kernels of the 4 longest-reaching (red) and 4 shortest-reaching (blue) full windows; last 32 context tokens shown.</p>
+    {{ figs.examples | safe }}
+    <div class="two-col">
+      <div>
+        <h3>Longest reach</h3>
+        {% for e in examples_long %}<p class="ctx">[long {{ "%.2f"|format(e.long) }}, k50 {{ e.k50 }}] ...{{ e.text }} &rarr; <strong>{{ e.target }}</strong></p>{% endfor %}
+      </div>
+      <div>
+        <h3>Shortest reach</h3>
+        {% for e in examples_short %}<p class="ctx">[long {{ "%.2f"|format(e.long) }}, k50 {{ e.k50 }}] ...{{ e.text }} &rarr; <strong>{{ e.target }}</strong></p>{% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model scripts log-gaussian-kernel-trace</code>
+  </footer>
+
+</div>
+</body>
+</html>

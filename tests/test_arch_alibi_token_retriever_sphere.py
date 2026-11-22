@@ -1,0 +1,226 @@
+"""Properties specific to `AlibiTokenRetrieverSphereLM`."""
+
+import unittest
+
+from tests.helpers import VOCAB, tiny_arch_params
+
+import numpy as np
+from keras import ops
+
+from model.archs.alibi_token_retriever_sphere import AlibiTokenRetrieverSphereLM
+
+
+def _model(**overrides) -> AlibiTokenRetrieverSphereLM:
+    params = tiny_arch_params("alibi-token-retriever-sphere")
+    params.update(overrides)
+    return AlibiTokenRetrieverSphereLM(**params)
+
+
+class TestAlibiTokenRetrieverSphericalInvariants(unittest.TestCase):
+    def test_both_tables_are_exactly_unit_norm_after_projection(self):
+        m = _model()
+        for table in (m.normalized_input_embeddings(), m.normalized_target_embeddings()):
+            norms = np.linalg.norm(ops.convert_to_numpy(table), axis=-1)
+            np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+
+    def test_logits_are_bounded_by_tau(self):
+        tau = 4.0
+        m = _model(initial_tau=tau)
+        x = np.random.randint(0, VOCAB, (8, m.context_length)).astype("int32")
+        logits = ops.convert_to_numpy(m(x))
+        self.assertLessEqual(float(np.abs(logits).max()), tau + 1e-4)
+
+    def test_query_is_on_the_unit_sphere(self):
+        m = _model(initial_tau=1.0)
+        x = np.random.randint(0, VOCAB, (8, m.context_length)).astype("int32")
+        logits = ops.convert_to_numpy(m(x))
+        self.assertLessEqual(float(logits.max()), 1.0 + 1e-5)
+        self.assertGreaterEqual(float(logits.min()), -1.0 - 1e-5)
+
+
+class TestAlibiTokenRetrieverParameterization(unittest.TestCase):
+    def test_no_bias_parameters_anywhere(self):
+        m = _model()
+        for var in m.weights:
+            self.assertNotIn("bias", var.name.lower(), f"unexpected bias parameter: {var.name}")
+
+    def test_parameter_count_matches_the_analytic_formula(self):
+        v, di, do, w, h, nh = 200, 8, 16, 32, 64, 2
+        hd = di // nh
+        qk = do // di
+        m = AlibiTokenRetrieverSphereLM(
+            vocabulary_size=v,
+            dim_in=di,
+            dim_out=do,
+            window_size=w,
+            hidden_dim=h,
+            num_heads=nh,
+        )
+        # Embeddings:
+        expected_emb = v * di + v * do
+        # Taus: tau (1) + retriever_tau (1)
+        taus = 2
+        # Block 1 (MHA + MLP):
+        mha = 3 * (di * (nh * hd)) + (nh * hd) * di
+        mlp = di * (4 * di) + (4 * di) * di
+        block1 = mha + mlp
+        # Query projection: (window_size * dim_in) -> dim_in
+        query_proj = (w * di) * di
+        # Block 2 (MHA + MLP):
+        block2 = mha + mlp
+        # Sequence projection:
+        seq_proj = (w + qk) * w
+        # Readout FFN:
+        ffn = (w * di) * h + h * (h // 2) + (h // 2) * do
+
+        expected_total = expected_emb + taus + block1 + query_proj + block2 + seq_proj + ffn
+
+        self.assertEqual(m.parameter_breakdown()["total"], expected_total)
+        self.assertEqual(m.parameter_breakdown()["embeddings"], expected_emb)
+        self.assertEqual(m.parameter_breakdown()["mechanism"], expected_total - expected_emb)
+
+    def test_learnable_tau_toggles_trainability(self):
+        for learnable in (True, False):
+            with self.subTest(learnable=learnable):
+                m = _model(learnable_tau=learnable)
+                names = [v.name for v in m.trainable_variables]
+                self.assertEqual("tau" in names, learnable)
+                self.assertEqual("retriever_tau" in names, learnable)
+
+    def test_context_length_equals_window_size(self):
+        m = _model(window_size=11)
+        self.assertEqual(m.context_length, 11)
+
+    def test_activation_selection(self):
+        for act in ("gelu", "tanh"):
+            m = _model(activation=act)
+            self.assertEqual(m.activation, act)
+            self.assertEqual(m.get_config()["activation"], act)
+        with self.assertRaises(ValueError):
+            _model(activation="relu")
+
+    def test_invalid_arguments_are_rejected(self):
+        for bad in (
+            {"vocabulary_size": 0},
+            {"dim_in": 0},
+            {"dim_out": -1},
+            {"window_size": 0},
+            {"dim_out": 13, "dim_in": 4},
+            {"dim_out": 64, "dim_in": 4, "window_size": 8},
+            {"hidden_dim": 1},
+            {"num_heads": 0},
+            {"dim_in": 7, "num_heads": 2},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _model(**bad)
+
+
+class TestAlibiTokenRetrieverPaddingBehaviour(unittest.TestCase):
+    def test_all_padding_window_produces_finite_logits_and_gradients(self):
+        import torch
+
+        m = _model()
+        x = ops.convert_to_tensor(np.zeros((2, m.context_length), dtype="int32"))
+        logits = m(x, training=True)
+        self.assertTrue(bool(torch.isfinite(logits).all()))
+
+        loss = ops.mean(logits**2)
+        grads = torch.autograd.grad(loss, [v.value for v in m.trainable_variables], allow_unused=True)
+        for var, grad in zip(m.trainable_variables, grads):
+            if grad is not None:
+                self.assertTrue(bool(torch.isfinite(grad).all()), f"non-finite grad for {var.name}")
+
+    def test_padding_changes_the_prediction(self):
+        m = _model()
+        rng = np.random.default_rng(0)
+        full = rng.integers(1, VOCAB, (1, m.context_length)).astype("int32")
+        padded = full.copy()
+        padded[0, : m.context_length // 2] = 0
+        self.assertFalse(
+            np.allclose(ops.convert_to_numpy(m(full)), ops.convert_to_numpy(m(padded))),
+            "left padding must affect the output",
+        )
+
+
+class TestTokenIdScatter(unittest.TestCase):
+    """Locks in the batch-offset `segment_sum` scatter semantics against regression.
+
+    Positions sharing a token id must accumulate their softmax weight into
+    that id's bucket of the vocabulary-sized vector, the result must sum to 1
+    since it is just a regrouping of a distribution that already does, and
+    batch rows must not leak into each other's buckets. Implemented with
+    `segment_sum` rather than a dense one-hot: a `(B, window_size,
+    vocabulary_size)` one-hot tensor is several GiB at real batch/window/vocab
+    sizes and was observed to exhaust device memory (see `AlibiTokenRetrieverSphereLM.call`).
+    """
+
+    def _scatter(self, token_ids: np.ndarray, weights: np.ndarray, vocab_size: int) -> np.ndarray:
+        token_ids_t = ops.convert_to_tensor(token_ids.astype("int32"))
+        weights_t = ops.convert_to_tensor(weights.astype("float32"))
+        batch_size = token_ids_t.shape[0]
+
+        batch_idx = ops.reshape(ops.arange(batch_size, dtype="int32"), (batch_size, 1))
+        offset_ids = token_ids_t + batch_idx * vocab_size
+        flat_ids = ops.reshape(offset_ids, (-1,))
+        flat_weights = ops.reshape(weights_t, (-1,))
+        bucket = ops.segment_sum(flat_weights, flat_ids, num_segments=batch_size * vocab_size)
+        return ops.convert_to_numpy(ops.reshape(bucket, (batch_size, vocab_size)))
+
+    def test_scatter_matches_worked_example(self):
+        vocab_size = 5
+        token_ids = np.array([[1, 1, 1, 2, 2, 3]])
+        weights = np.array([[0.1, 0.1, 0.1, 0.25, 0.25, 0.2]])
+
+        bucket_np = self._scatter(token_ids, weights, vocab_size)[0]
+
+        expected = np.zeros(vocab_size, dtype="float32")
+        expected[1] = 0.3
+        expected[2] = 0.5
+        expected[3] = 0.2
+        np.testing.assert_allclose(bucket_np, expected, atol=1e-6)
+        np.testing.assert_allclose(bucket_np.sum(), 1.0, atol=1e-6)
+
+    def test_scatter_does_not_leak_across_batch_rows(self):
+        vocab_size = 5
+        token_ids = np.array(
+            [
+                [1, 1, 1, 2, 2, 3],
+                [0, 0, 4, 4, 4, 1],
+            ]
+        )
+        weights = np.array(
+            [
+                [0.1, 0.1, 0.1, 0.25, 0.25, 0.2],
+                [0.2, 0.2, 0.2, 0.2, 0.1, 0.1],
+            ]
+        )
+
+        bucket_np = self._scatter(token_ids, weights, vocab_size)
+
+        expected = np.array(
+            [
+                [0.0, 0.3, 0.5, 0.2, 0.0],
+                [0.4, 0.1, 0.0, 0.0, 0.5],
+            ],
+            dtype="float32",
+        )
+        np.testing.assert_allclose(bucket_np, expected, atol=1e-6)
+        np.testing.assert_allclose(bucket_np.sum(axis=-1), [1.0, 1.0], atol=1e-6)
+
+    def test_scatter_avoids_materializing_dense_one_hot(self):
+        """Regression guard for the OOM: bucket size stays O(B*V), not O(B*W*V)."""
+        batch_size, window_size, vocab_size = 512, 128, 10000
+        rng = np.random.default_rng(0)
+        token_ids = rng.integers(0, vocab_size, size=(batch_size, window_size))
+        raw = rng.random((batch_size, window_size))
+        weights = raw / raw.sum(axis=-1, keepdims=True)
+
+        bucket_np = self._scatter(token_ids, weights, vocab_size)
+
+        self.assertEqual(bucket_np.shape, (batch_size, vocab_size))
+        np.testing.assert_allclose(bucket_np.sum(axis=-1), np.ones(batch_size), atol=1e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en" class="bg-slate-50">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wave field stepper - __TITLE__</title>
+<style>/*__CSS__*/</style>
+</head>
+<body class="text-slate-800 text-sm antialiased">
+<div id="tip" class="fixed z-50 hidden pointer-events-none bg-white border border-slate-300 rounded-md px-2 py-1 text-xs shadow-sm"></div>
+
+<header class="sticky top-0 z-20 bg-white border-b border-slate-200">
+  <div class="max-w-[1600px] mx-auto px-5 py-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+    <div class="mr-2">
+      <h1 class="text-base font-semibold text-slate-900">Wave field stepper</h1>
+      <p class="text-xs text-slate-500">__TITLE__</p>
+    </div>
+    <div class="flex items-center gap-1">
+      <button onclick="go(cur - 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="previous (left arrow)">&larr;</button>
+      <button onclick="go(cur + 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="next (right arrow)">&rarr;</button>
+      <button id="play" onclick="toggle()" class="border border-slate-300 rounded-md px-3 py-1 w-16 hover:bg-slate-100">play</button>
+    </div>
+    <input type="range" id="slider" min="0" value="0" class="flex-1 min-w-48 accent-slate-700" oninput="go(+this.value)">
+    <span id="stepl" class="text-xs text-slate-500 tabular-nums w-24 text-right"></span>
+  </div>
+</header>
+
+<main class="max-w-[1600px] mx-auto px-5 py-4 grid grid-cols-[25rem_1fr] gap-4 items-start">
+  <aside class="space-y-4 sticky top-20">
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-baseline justify-between">
+        <h2 class="font-semibold text-slate-900">This step</h2><span class="text-xs text-slate-500" id="nowpos"></span>
+      </div>
+      <div class="p-4 space-y-4">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500">reader &rarr; next token</div>
+          <div class="mt-1 text-lg"><span id="nowread" class="font-mono"></span> <span class="text-slate-400">&rarr;</span> <span id="nowtgt" class="font-mono font-semibold"></span>
+            <span id="nowp" class="ml-1 text-sm text-slate-500 tabular-nums"></span></div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">top predictions</div>
+          <div id="toppred" class="space-y-1"></div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">heard energy per state space</div>
+          <div id="spaces" class="space-y-1"></div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">loudest after the filter</div>
+          <div id="loud" class="flex flex-wrap gap-1"></div>
+        </div>
+      </div>
+    </section>
+    <section class="bg-white border border-slate-200 rounded-md">
+      <div class="px-4 py-2 border-b border-slate-200 flex items-baseline justify-between">
+        <h2 class="font-semibold text-slate-900">Story</h2><span class="text-xs text-slate-500">click a word to jump</span>
+      </div>
+      <div id="story" class="px-4 py-3 max-h-[38vh] overflow-y-auto leading-7 text-[14px]"></div>
+    </section>
+  </aside>
+
+  <section class="bg-white border border-slate-200 rounded-md min-w-0">
+    <nav id="tabs" class="flex border-b border-slate-200 px-2"></nav>
+    <div class="p-4">
+
+      <div data-tab="overview" class="space-y-6">
+        <div>
+          <div class="flex items-baseline justify-between"><h3 class="font-semibold text-slate-900">Who the reader hears</h3><span id="padinfo" class="text-xs text-slate-500"></span></div>
+          <p class="text-xs text-slate-500 mb-2">Share of each context token in what the reader hears, &Sigma; Re(conj(U) u<sub>j</sub>) / &Sigma; |U|<sup>2</sup> (sums to 100%). Red = negative share: its wave arrives out of phase and cancels part of the others.
+            Click a word to inspect it in the Tokens tab.</p>
+          <div class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 items-baseline">
+            <div class="text-xs text-slate-500">with the filter</div><div id="tAfter" class="leading-7"></div>
+            <div class="text-xs text-slate-500">without (g = 1)</div><div id="tBefore" class="leading-7"></div>
+          </div>
+          <div id="lgc" class="mt-3 mb-1"></div>
+          <canvas id="cc" class="w-full block"></canvas>
+          <p class="text-xs text-slate-500 mt-1">Bars: share after the filter, stacked by state space. Dots: share before the filter. <span id="selfinfo"></span></p>
+        </div>
+        <div>
+          <h3 class="font-semibold text-slate-900">Votes: who pushed each prediction</h3>
+          <p class="text-xs text-slate-500 mb-2">Exact split of each logit: the linear path per state space (what the waves of that propagation length carried), the bias, and the GELU MLP. Diamond = the logit.</p>
+          <div id="lgv" class="mb-1"></div>
+          <canvas id="votes" class="w-full block"></canvas>
+          <div class="mt-3 flex flex-wrap items-center gap-1"><span class="text-xs uppercase tracking-wide text-slate-500 mr-1">who voted for</span><span id="candbtns" class="flex flex-wrap gap-1"></span></div>
+          <div id="tvtext" class="leading-7 mt-2"></div>
+          <canvas id="tvchart" class="w-full block mt-1"></canvas>
+          <p class="text-xs text-slate-500 mt-1">Each token's vote through the linear path (its exact part of the features, after RMSNorm). Green = for, red = against. <span id="tvpad"></span></p>
+        </div>
+      </div>
+
+      <div data-tab="waves" class="hidden space-y-6">
+        <div>
+          <div class="flex items-baseline justify-between"><h3 class="font-semibold text-slate-900">Spectrum: the state and what the filter lets through</h3>
+            <span class="text-xs text-slate-500">click a channel</span></div>
+          <p class="text-xs text-slate-500 mb-2">Channels in index order 0&ndash;63 (initialized fast to slow; hover for each one's learned period). Gray: energy of the state on each channel before the filter; colored: after the filter the cascade built, g = 1 + head(q) (each normalized to 100%).
+            Below: the filter's gain |g<sub>k</sub>| for the current reader (log scale, line = 1).</p>
+          <canvas id="spec" class="w-full block"></canvas>
+          <canvas id="gain" class="w-full block mt-1"></canvas>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-xs uppercase tracking-wide text-slate-500">channel</span><span id="stinfo" class="font-mono text-xs"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500 ml-4">state space</span><span id="clsbtns" class="flex gap-1"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500 ml-4">view</span><span id="fltbtns" class="flex gap-1"></span>
+        </div>
+        <div class="grid grid-cols-[minmax(0,22rem)_1fr] gap-6">
+          <div>
+            <h3 class="font-semibold text-slate-900">Phasors</h3>
+            <p class="text-xs text-slate-500 mb-2">Each context token's wave on this channel as it arrives now, added head to tail from the oldest (light) to the newest (dark). The black arrow is what is heard. Arrows pointing the same way resonate; opposite ones cancel.</p>
+            <canvas id="phasor" class="w-full block aspect-square"></canvas>
+          </div>
+          <div class="min-w-0">
+            <h3 class="font-semibold text-slate-900">Waves over the window</h3>
+            <p class="text-xs text-slate-500 mb-2">Real part of the wavelets of the loudest context tokens (k &ge; 1) on this channel, from the moment each is emitted until now (they decay and rotate), and their sum over all context tokens (black). The value at the right edge is what the reader hears.</p>
+            <canvas id="wave" class="w-full block"></canvas>
+            <div id="wavelg" class="mt-1"></div>
+          </div>
+        </div>
+      </div>
+
+      <div data-tab="spectrogram" class="hidden space-y-6">
+        <p class="text-xs text-slate-500">The whole story, one column per step (click to jump, the outline is the current step); rows are channels 0&ndash;63 from the top. State and heard are the context's waves (k &ge; 1, without the reader's own write), each column normalized to 100%.</p>
+        <div><h3 class="font-semibold text-slate-900">Context state before the filter</h3><canvas id="sgF" class="w-full block mt-1"></canvas></div>
+        <div><h3 class="font-semibold text-slate-900">Reader's filter gain |g| <span class="font-normal text-xs text-slate-500">(blue &lt; 1 suppressed, orange &gt; 1 amplified, log scale; geometric mean over the state spaces)</span></h3><canvas id="sgG" class="w-full block mt-1"></canvas></div>
+        <div><h3 class="font-semibold text-slate-900">Context heard (after the reader's filter)</h3><canvas id="sgU" class="w-full block mt-1"></canvas></div>
+      </div>
+
+      <div data-tab="cascade" class="hidden space-y-6">
+        <p class="text-xs text-slate-500">The reader listens in stages, from the shortest range to the longest. Its query starts as its own signature, sets the filter of state space 1, and what state space 1 hears updates the query (a residual MLP on [query ; reading]), which sets the filter of state space 2, and so on.
+          Per stage: what the query resembles (the closest token signatures), the filter it built (gain per channel), who the stage hears through that filter, and what the stage contributes to the prediction.
+          A query whose closest signatures only reach cosine ~0.3 is no longer close to any single token: it has become a mix (read the filter and who the stage hears instead).</p>
+        <div id="flow" class="flex flex-wrap items-center gap-2"></div>
+        <div id="stages" class="space-y-4"></div>
+      </div>
+
+      <div data-tab="channels" class="hidden space-y-6">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-xs uppercase tracking-wide text-slate-500">channel</span><span id="ckinfo" class="font-mono text-xs"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500 ml-4">state space</span><span id="ckcls" class="flex gap-1"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500 ml-4">view</span><span id="ckflt" class="flex gap-1"></span>
+          <span class="text-xs uppercase tracking-wide text-slate-500 ml-4">frame</span><span id="ckframe" class="flex gap-1"></span>
+        </div>
+        <div>
+          <h3 class="font-semibold text-slate-900">Every channel at this step</h3>
+          <p class="text-xs text-slate-500 mb-2">One dial per channel (rows: state spaces, columns: channels 0&ndash;31 then 32&ndash;63). The pointer is the channel's complex value: its angle is the phase, its length the amplitude (relative to that channel's largest value over the story).
+            Click a channel to follow it over the text.</p>
+          <canvas id="ckgrid" class="w-full block"></canvas>
+        </div>
+        <div>
+          <h3 class="font-semibold text-slate-900">Decay per channel <span id="ckdecnote" class="font-normal text-xs text-slate-500"></span></h3>
+          <p class="text-xs text-slate-500 mb-2">Half-life of every channel in tokens (how many steps until its content is half as loud). Light = forgets fast, dark = remembers long; log color scale. The outlined cell is the selected channel.</p>
+          <canvas id="ckdec" class="w-full block"></canvas>
+          <div id="ckdecleg" class="mt-1 text-xs text-slate-500"></div>
+        </div>
+        <div class="grid grid-cols-[minmax(0,16rem)_1fr] gap-6">
+          <div>
+            <h3 class="font-semibold text-slate-900">Selected channel</h3>
+            <p class="text-xs text-slate-500 mb-2">Pointer now (black) and its tip over the last 24 steps (fading trail).</p>
+            <canvas id="ckbig" class="w-full block aspect-square"></canvas>
+          </div>
+          <div class="min-w-0">
+            <h3 class="font-semibold text-slate-900">The selected channel's dial over the text</h3>
+            <p class="text-xs text-slate-500 mb-2">Above each word: the channel right after reading it. Click a word to jump there.</p>
+            <canvas id="ckribbon" class="w-full block"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div data-tab="tokens" class="hidden space-y-6">
+        <p class="text-xs text-slate-500">A token's parameters: its signature (per channel), how it splits over the state spaces (its mix: how far it carries), and what it writes into each one. How it listens is in the Cascade tab (the filters come from the context). Left: the current reader. Right: a token picked in the Overview text (default: the loudest context token).</p>
+        <div class="grid grid-cols-2 gap-6" id="cards"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const D = /*__DATA__*/null;
+const W = D.words, S = D.steps, P = D.params, T = P.T, K = P.K, L = P.L, IDS = D.ids;
+const CC = ["#e15759", "#f28e2b", "#4e79a7", "#59a14f", "#b07aa1", "#9c755f"];  // state spaces
+const BIASC = "#94a3b8", MLPC = "#8b5cf6";
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const pct = (v, d = 1) => (v * 100).toFixed(d) + "%";
+function rgba(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${Math.min(1, Math.max(0, a)).toFixed(3)})`; }
+const signedBg = (v, m) => v >= 0 ? `rgba(5,150,105,${Math.min(1, v / m).toFixed(3)})` : `rgba(220,38,38,${Math.min(1, -v / m).toFixed(3)})`;
+const shareBg = (v, m) => v >= 0 ? `rgba(109,40,217,${(0.85 * Math.min(1, v / m)).toFixed(3)})` : `rgba(220,38,38,${(0.85 * Math.min(1, -v / m)).toFixed(3)})`;
+const legend = (names, cols) => names.map((n, k) => `<span class="inline-flex items-center gap-1 mr-3 text-xs text-slate-600"><span class="w-2.5 h-2.5 rounded-sm" style="background:${cols[k]}"></span>${esc(n)}</span>`).join("");
+const hbar = (label, v, max, col, right) => `<div class="flex items-center gap-2"><div class="w-28 truncate font-mono text-xs">${label}</div>
+  <div class="flex-1 h-2 bg-slate-100 rounded-sm"><div class="h-2 rounded-sm" style="width:${Math.max(0, Math.min(1, v / max)) * 100}%;background:${col}"></div></div>
+  <div class="w-16 text-right text-xs tabular-nums">${right}</div></div>`;
+
+// ---- the model's wave math (mirrors model/archs/wave_field.py) ----
+const VOC = {};
+// cr/ci: what the token writes into each state space before its mix (L x K, the projected signature); sr/si: its signature.
+for (const [id, v] of Object.entries(D.vocab)) VOC[id] = { w: v.w, cr: Float64Array.from(v.cr), ci: Float64Array.from(v.ci), p: Float64Array.from(v.p),
+  sr: Float64Array.from(v.sr), si: Float64Array.from(v.si) };
+const DEC = [], COS = [], SIN = [];  // DEC[l*K+k][d] normalized decay of each channel; COS/SIN[k][d]
+for (let q = 0; q < L * K; q++) { const a = new Float64Array(T); let z = 0; for (let d = 0; d < T; d++) { a[d] = Math.exp(-P.alpha[q] * d); z += a[d]; } for (let d = 0; d < T; d++) a[d] /= z; DEC.push(a); }
+const DECL = Array.from({ length: L }, (_, l) => Array.from({ length: T }, (_, d) => { let s = 0; for (let k = 0; k < K; k++) s += DEC[l * K + k][d]; return s / K; }));  // state-space average (display)
+const stepG = i => ({ gr: Float64Array.from(S[i].g[0]), gi: Float64Array.from(S[i].g[1]) });  // the cascade's filters at step i, (L, K)
+for (let k = 0; k < K; k++) { const c = new Float64Array(T), s = new Float64Array(T); for (let d = 0; d < T; d++) { c[d] = Math.cos(P.omega[k] * d); s[d] = Math.sin(P.omega[k] * d); } COS.push(c); SIN.push(s); }
+const ORDER = Array.from({ length: K }, (_, k) => k);  // channel index 0..K-1 (initialized fast -> slow; training moves the frequencies)
+const period = k => 2 * Math.PI / Math.abs(P.omega[k]);
+const HALF = D.half;
+const tokAt = j => (j >= 0 ? IDS[j] : 0);
+
+// Field of step i (reader at story position i): unfiltered contributions f[t][l][k] and filtered u = g f.
+function field(i) {
+  const g = stepG(i), n = T * L * K;
+  const fr = new Float64Array(n), fi = new Float64Array(n);
+  for (let t = 0; t < T; t++) {
+    const j = i - (T - 1) + t, v = VOC[tokAt(j)], d = T - 1 - t;
+    for (let l = 0; l < L; l++) { const o = (t * L + l) * K;
+      for (let k = 0; k < K; k++) { const a = v.p[l] * DEC[l * K + k][d], c = COS[k][d], s = SIN[k][d], q = l * K + k;
+        fr[o + k] = a * (v.cr[q] * c - v.ci[q] * s); fi[o + k] = a * (v.cr[q] * s + v.ci[q] * c); } }
+  }
+  const Fr = new Float64Array(L * K), Fi = new Float64Array(L * K);
+  for (let t = 0; t < T; t++) for (let q = 0; q < L * K; q++) { Fr[q] += fr[t * L * K + q]; Fi[q] += fi[t * L * K + q]; }
+  const Ur = new Float64Array(L * K), Ui = new Float64Array(L * K);
+  for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) { const q = l * K + k; Ur[q] = g.gr[q] * Fr[q] - g.gi[q] * Fi[q]; Ui[q] = g.gr[q] * Fi[q] + g.gi[q] * Fr[q]; }
+  return { i, g, fr, fi, Fr, Fi, Ur, Ui };
+}
+// Shares: per slot and state space, after (u = g f) and before (f) the filter.
+function shares(F) {
+  const { g, fr, fi, Fr, Fi, Ur, Ui } = F;
+  let eU = 0, eF = 0;
+  for (let q = 0; q < L * K; q++) { eU += Ur[q] * Ur[q] + Ui[q] * Ui[q]; eF += Fr[q] * Fr[q] + Fi[q] * Fi[q]; }
+  const after = [], before = new Float64Array(T);
+  for (let t = 0; t < T; t++) { const row = new Float64Array(L);
+    for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) { const q = l * K + k, o = t * L * K + q;
+      const ur = g.gr[q] * fr[o] - g.gi[q] * fi[o], ui = g.gr[q] * fi[o] + g.gi[q] * fr[o];
+      row[l] += (Ur[q] * ur + Ui[q] * ui) / eU; before[t] += (Fr[q] * fr[o] + Fi[q] * fi[o]) / eF; }
+    after.push(row); }
+  const cls = new Float64Array(L); for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) { const q = l * K + k; cls[l] += (Ur[q] * Ur[q] + Ui[q] * Ui[q]) / eU; }
+  return { after, before, eU, eF, cls };
+}
+function spectrum(F, ctxOnly) {
+  const eF = new Float64Array(K), eU = new Float64Array(K), o = (T - 1) * L * K, g = F.g;
+  for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) { const q = l * K + k;
+    let fr = F.Fr[q], fi = F.Fi[q]; if (ctxOnly) { fr -= F.fr[o + q]; fi -= F.fi[o + q]; }
+    const ur = g.gr[q] * fr - g.gi[q] * fi, ui = g.gr[q] * fi + g.gi[q] * fr;
+    eF[k] += fr * fr + fi * fi; eU[k] += ur * ur + ui * ui; }
+  const sF = eF.reduce((a, b) => a + b, 0), sU = eU.reduce((a, b) => a + b, 0);
+  return { eF: eF.map(v => v / sF), eU: eU.map(v => v / sU) };
+}
+// Gain of channel k in a step filter: one state space, or the geometric mean over the state spaces (l < 0)
+function stepGain(g, k, l) { if (l >= 0) return Math.hypot(g.gr[l * K + k], g.gi[l * K + k]);
+  let s = 0; for (let c = 0; c < L; c++) s += Math.log(Math.hypot(g.gr[c * K + k], g.gi[c * K + k]) + 1e-9); return Math.exp(s / L); }
+
+// ---- canvas helpers ----
+const tip = document.getElementById("tip");
+function canvas(id, h) { const cv = document.getElementById(id), dpr = window.devicePixelRatio || 1, Wc = cv.clientWidth || 800; h = h || cv.clientWidth;
+  cv.style.height = h + "px"; cv.width = Wc * dpr; cv.height = h * dpr; const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, Wc, h);
+  g.font = "10px ui-sans-serif, system-ui"; return [cv, g, Wc, h]; }
+function hover(cv, f) { cv.onmousemove = e => { const r = f(e.offsetX, e.offsetY); if (!r) { tip.classList.add("hidden"); return; }
+  tip.innerHTML = r; tip.classList.remove("hidden"); tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 14) + "px"; }; cv.onmouseleave = () => tip.classList.add("hidden"); }
+function bars(id, n, series, o) {
+  const h = o.h || 200, [cv, g, Wc] = canvas(id, h);
+  const showLab = o.labels && n <= 40, pL = 46, pT = 6, pB = showLab ? 44 : 6, ph = h - pT - pB, bw = (Wc - pL - 4) / Math.max(n, 1);
+  const top = new Array(n).fill(0), bot = new Array(n).fill(0);
+  for (let j = 0; j < n; j++) for (const s of series) { const v = s.y[j] || 0; if (o.stack) { if (v >= 0) top[j] += v; else bot[j] += v; } else { top[j] = Math.max(top[j], v); bot[j] = Math.min(bot[j], v); } }
+  const mk = (o.markers || []).concat(o.dots || []);
+  let ymax = Math.max(0, ...top, ...mk), ymin = Math.min(0, ...bot, ...mk);
+  if (o.ymax !== undefined) ymax = o.ymax; if (o.ymin !== undefined) ymin = o.ymin;
+  if (ymax - ymin < 1e-12) ymax = ymin + 1;
+  const Y = v => pT + (ymax - v) / (ymax - ymin) * ph, fmt = o.fmt || (v => v.toFixed(2));
+  g.fillStyle = "#64748b"; g.strokeStyle = "#e2e8f0"; g.textAlign = "right";
+  const ticks = [ymax, ymin, 0].filter((v, i, a) => a.findIndex(u => Math.abs(Y(u) - Y(v)) < 12) === i);
+  for (const v of ticks) { g.fillText(fmt(v), pL - 6, Y(v) + 3); g.beginPath(); g.moveTo(pL, Y(v) + 0.5); g.lineTo(Wc, Y(v) + 0.5); g.stroke(); }
+  if (o.hl !== undefined && o.hl >= 0 && o.hl < n) { g.fillStyle = "rgba(15,23,42,0.06)"; g.fillRect(pL + o.hl * bw, pT, bw, ph); }
+  g.save(); g.beginPath(); g.rect(0, pT, Wc, ph); g.clip();
+  for (let j = 0; j < n; j++) { let up = 0, dn = 0;
+    for (const s of series) { const v = s.y[j] || 0; if (!v) continue;
+      g.fillStyle = typeof s.color === "function" ? s.color(v, j) : s.color;
+      const base = o.stack ? (v >= 0 ? up : dn) : 0, y0 = Y(base), y1 = Y(base + v), wd = s.w || 0.76;
+      g.fillRect(pL + j * bw + bw * (1 - wd) / 2, Math.min(y0, y1), Math.max(bw * wd, 0.8), Math.max(Math.abs(y1 - y0), 0.5));
+      if (o.stack) { if (v >= 0) up += v; else dn += v; } } }
+  g.restore();
+  if (o.clipNote) { g.fillStyle = "#0f172a"; g.textAlign = "right"; g.fillText(o.clipNote, Wc - 4, pT + 10); }
+  if (o.markers) { g.fillStyle = "#0f172a"; o.markers.forEach((v, j) => { const cx = pL + (j + 0.5) * bw, cy = Y(v); g.beginPath(); g.moveTo(cx, cy - 5); g.lineTo(cx + 5, cy); g.lineTo(cx, cy + 5); g.lineTo(cx - 5, cy); g.fill(); }); }
+  if (o.dots) { g.fillStyle = "#0f172a"; o.dots.forEach((v, j) => { g.beginPath(); g.arc(pL + (j + 0.5) * bw, Y(v), Math.min(2.5, bw / 3 + 0.8), 0, 7); g.fill(); }); }
+  if (o.sel !== undefined) { g.strokeStyle = "#0f172a"; g.lineWidth = 1.5; g.strokeRect(pL + o.sel * bw + 0.5, pT + 0.5, bw - 1, ph - 1); g.lineWidth = 1; }
+  if (showLab) { g.fillStyle = "#334155"; g.textAlign = "right"; o.labels.forEach((t, j) => { g.save(); g.translate(pL + (j + 0.6) * bw, h - pB + 12); g.rotate(-0.5); g.fillText(String(t).slice(0, 20), 0, 0); g.restore(); }); }
+  hover(cv, (x) => { const j = Math.floor((x - pL) / bw); return j >= 0 && j < n && o.tip ? o.tip(j) : null; });
+  cv.onclick = o.click ? e => { const j = Math.floor((e.offsetX - pL) / bw); if (j >= 0 && j < n) o.click(j); } : null;
+}
+
+// ---- static layout ----
+let cur = 0, timer = null, tab = "overview", candSel = 5, channel = null, clsSel = -1, filtered = true, picked = null, prevCur = -1, F = null, SH = null;
+document.getElementById("slider").max = S.length - 1;
+const story = document.getElementById("story");
+const spans = W.map((w, i) => { const sp = document.createElement("span"); sp.textContent = w; sp.className = "cursor-pointer rounded-sm px-px hover:bg-slate-100";
+  sp.onclick = () => go(Math.min(i, S.length - 1)); story.appendChild(sp); return sp; });
+const TABS = [["overview", "Overview"], ["cascade", "Cascade"], ["waves", "Waves"], ["channels", "Channels"], ["spectrogram", "Spectrogram"], ["tokens", "Tokens"]];
+const CLS = Array.from({ length: L }, (_, l) => `space ${l + 1} (half-life ${HALF[l].toFixed(1)})`);
+
+function setTab(t) {
+  tab = t;
+  document.getElementById("tabs").innerHTML = TABS.map(([id, name]) =>
+    `<button onclick="setTab('${id}')" class="px-3 py-2 -mb-px border-b-2 ${id === t ? "border-slate-800 text-slate-900 font-medium" : "border-transparent text-slate-500 hover:text-slate-800"}">${name}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(el => el.classList.toggle("hidden", el.dataset.tab !== t));
+  drawTab();
+}
+function drawTab() {
+  if (!F) return;
+  const st = S[cur];
+  if (tab === "overview") { drawHeard(st); drawVotes(st); }
+  if (tab === "waves") drawWaves();
+  if (tab === "spectrogram") drawSpectrogram();
+  if (tab === "tokens") drawCards();
+  if (tab === "channels") drawClocks();
+  if (tab === "cascade") drawCascade();
+}
+function toggle() {
+  if (timer) { clearInterval(timer); timer = null; document.getElementById("play").textContent = "play"; return; }
+  timer = setInterval(() => { if (cur >= S.length - 1) toggle(); else go(cur + 1); }, 400);
+  document.getElementById("play").textContent = "pause";
+}
+document.addEventListener("keydown", e => { if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  if (e.key === "ArrowRight") { e.preventDefault(); go(cur + 1); } if (e.key === "ArrowLeft") { e.preventDefault(); go(cur - 1); } });
+
+const firstReal = () => Math.max(0, cur - (T - 1));
+const slotOf = p => p - (cur - (T - 1));
+function loudest(n, ctxOnly) { const f = firstReal(), arr = [];
+  for (let p = f; p <= (ctxOnly ? cur - 1 : cur); p++) { const r = SH.after[slotOf(p)]; arr.push([p, r.reduce((a, b) => a + b, 0)]); }
+  return arr.sort((a, b) => b[1] - a[1]).slice(0, n); }
+
+function go(i) {
+  cur = Math.min(Math.max(i, 0), S.length - 1);
+  const st = S[cur];
+  F = field(cur); SH = shares(F);
+  const err = Math.abs(SH.eU - st.en) / st.en; if (err > 1e-3) console.warn("energy mismatch at step", cur, SH.eU, st.en);
+  picked = null;
+  document.getElementById("slider").value = cur;
+  document.getElementById("stepl").textContent = `step ${cur + 1} / ${S.length}`;
+  if (prevCur >= 0) { spans[prevCur].classList.remove("ring-2", "ring-slate-900"); if (spans[prevCur + 1]) spans[prevCur + 1].classList.remove("underline", "decoration-2", "decoration-emerald-600", "text-emerald-700"); }
+  spans[cur].classList.add("ring-2", "ring-slate-900"); if (spans[cur + 1]) spans[cur + 1].classList.add("underline", "decoration-2", "decoration-emerald-600", "text-emerald-700");
+  prevCur = cur;
+  const box = story.getBoundingClientRect(), r = spans[cur].getBoundingClientRect();
+  if (r.top < box.top || r.bottom > box.bottom) story.scrollTop += r.top - box.top - box.height / 2;
+  document.getElementById("nowpos").textContent = `token ${cur + 1}`;
+  document.getElementById("nowread").textContent = W[cur];
+  document.getElementById("nowtgt").textContent = st.tgt[0];
+  document.getElementById("nowp").textContent = `p ${st.tgt[1].toFixed(3)}`;
+  const pmax = st.top[0][1] || 1;
+  document.getElementById("toppred").innerHTML = st.top.map(([t, p]) => hbar(esc(t), p, pmax, t === st.tgt[0] ? "#059669" : "#94a3b8", pct(p))).join("");
+  document.getElementById("spaces").innerHTML = Array.from(SH.cls).map((v, l) => hbar(`space ${l + 1} <span class="text-slate-400">${HALF[l].toFixed(1)}</span>`, v, 1, CC[l], pct(v))).join("");
+  document.getElementById("loud").innerHTML = loudest(6).map(([p, v]) => `<span class="inline-flex items-baseline gap-1 border border-slate-200 rounded px-1.5 py-0.5 font-mono text-xs">${esc(W[p])}<span class="text-slate-400">${pct(v, 0)} k=${cur - p}</span></span>`).join("");
+  drawTab();
+}
+
+function drawHeard(st) {
+  const f = firstReal(), pos = Array.from({ length: cur - f + 1 }, (_, j) => f + j), n = pos.length;
+  const after = pos.map(p => SH.after[slotOf(p)]), tot = after.map(r => r.reduce((a, b) => a + b, 0)), bef = pos.map(p => SH.before[slotOf(p)]);
+  let padA = 0, padB = 0; for (let t = 0; t < slotOf(f); t++) { padA += SH.after[t].reduce((a, b) => a + b, 0); padB += SH.before[t]; }
+  document.getElementById("padinfo").textContent = slotOf(f) > 0 ? `padding: ${pct(padA)} after, ${pct(padB)} before the filter` : "";
+  const ctx = j => j < n - 1, m = Math.max(...tot.filter((_, j) => ctx(j)).map(Math.abs), ...bef.filter((_, j) => ctx(j)).map(Math.abs), 1e-6);
+  document.getElementById("selfinfo").innerHTML = `The reader itself (k=0) is <b>${pct(tot[n - 1])}</b> of what it hears (${pct(bef[n - 1])} before its filter); shading and axis are scaled to the context tokens.`;
+  const sp = (p, v, ttl) => `<span class="cursor-pointer rounded-sm px-px ${p === cur ? "ring-2 ring-slate-900" : ""}" style="background:${shareBg(v, m)}" title="${esc(ttl)}" onclick="pick(${p})">${esc(W[p])}</span>`;
+  const ttl = j => `k=${cur - pos[j]}\nafter the filter ${pct(tot[j], 2)}\nbefore ${pct(bef[j], 2)}\n` + after[j].map((v, l) => `space ${l + 1}: ${pct(v, 2)}`).join("\n");
+  document.getElementById("tAfter").innerHTML = pos.map((p, j) => sp(p, tot[j], ttl(j))).join("");
+  document.getElementById("tBefore").innerHTML = pos.map((p, j) => sp(p, bef[j], ttl(j))).join("");
+  document.getElementById("lgc").innerHTML = legend(CLS, CC);
+  bars("cc", n, Array.from({ length: L }, (_, l) => ({ y: after.map(r => r[l]), color: CC[l] })), { stack: true, h: 220, fmt: v => pct(v, 1), hl: n - 1, dots: bef.map((v, j) => (ctx(j) ? v : null)).filter(v => v !== null), ymax: m * 1.1, ymin: Math.min(0, ...tot.filter((_, j) => ctx(j)), ...bef.filter((_, j) => ctx(j))) * 1.1,
+    clipNote: n > 1 ? `reader bar clipped (${pct(tot[n - 1])})` : "",
+    tip: j => `<b>${esc(W[pos[j]])}</b> (k=${cur - pos[j]})<br>after ${pct(tot[j], 2)} &middot; before ${pct(bef[j], 2)}<br>` + after[j].map((v, l) => `space ${l + 1}: ${pct(v, 2)}`).join("<br>"),
+    click: j => pick(pos[j]) });
+}
+function pick(p) { picked = p; setTab("tokens"); }
+
+function drawVotes(st) {
+  const comp = D.comp, cands = st.cand.map((t, c) => (c === 5 ? "target: " : "") + t);
+  const vcol = k => (k < L ? CC[k] : k === L ? BIASC : MLPC);
+  document.getElementById("lgv").innerHTML = legend(comp, comp.map((_, k) => vcol(k))) + `<span class="text-xs text-slate-600">&#9670; logit</span>`;
+  bars("votes", cands.length, comp.map((_, k) => ({ y: st.cv.map(v => v[k]), color: vcol(k) })),
+    { stack: true, h: 250, labels: cands, markers: st.cv.map(v => v.reduce((a, b) => a + b, 0)),
+      tip: j => `<b>${esc(cands[j])}</b><br>` + comp.map((nm, k) => `${esc(nm)}: ${st.cv[j][k].toFixed(2)}`).join("<br>") + `<br>logit ${st.cv[j].reduce((a, b) => a + b, 0).toFixed(2)}` });
+  document.getElementById("candbtns").innerHTML = st.cand.map((t, c) =>
+    `<button onclick="candSel=${c};drawVotes(S[cur])" class="border rounded-md px-2 py-0.5 font-mono text-xs ${c === candSel ? "bg-slate-800 text-white border-slate-800" : "bg-white border-slate-300 hover:bg-slate-100"}">${c === 5 ? "target " : ""}${esc(t)}</button>`).join("");
+  const tv = st.tv[candSel], f = firstReal(), pos = tv.map((_, j) => f + j), m = Math.max(...tv.map(Math.abs)) || 1;
+  document.getElementById("tvtext").innerHTML = pos.map((p, j) => `<span class="rounded-sm px-px ${p === cur ? "ring-2 ring-slate-900" : ""}" style="background:${signedBg(tv[j], m)}" title="vote ${tv[j].toFixed(2)}, k=${cur - p}">${esc(W[p])}</span>`).join("");
+  document.getElementById("tvpad").textContent = Math.abs(st.tvpad[candSel]) > 0.005 ? `Padding votes ${st.tvpad[candSel].toFixed(2)}.` : "";
+  bars("tvchart", tv.length, [{ y: tv, color: v => (v >= 0 ? "#059669" : "#dc2626") }], { h: 160, hl: tv.length - 1, tip: j => `<b>${esc(W[pos[j]])}</b> (k=${cur - pos[j]}): ${tv[j].toFixed(2)}` });
+}
+
+// ---- waves tab ----
+function drawWaves() {
+  const sp = spectrum(F), g = F.g;
+  if (channel === null) channel = ORDER.reduce((b, k) => (sp.eU[k] > sp.eU[b] ? k : b), ORDER[0]);
+  const lab = ORDER.map(k => period(k).toFixed(1));
+  const tipk = j => { const k = ORDER[j]; return `<b>channel ${k}</b> period ${period(k).toFixed(2)} tokens<br>state ${pct(sp.eF[k], 2)} &rarr; heard ${pct(sp.eU[k], 2)}<br>gain |g| ${stepGain(g, k, clsSel).toFixed(3)}`; };
+  const selJ = ORDER.indexOf(channel), click = j => { channel = ORDER[j]; drawWaves(); };
+  bars("spec", K, [{ y: ORDER.map(k => sp.eF[k]), color: "#cbd5e1", w: 0.9 }, { y: ORDER.map(k => sp.eU[k]), color: "#6d28d9", w: 0.45 }],
+    { h: 190, fmt: v => pct(v, 0), sel: selJ, tip: tipk, click });
+  const lg = ORDER.map(k => Math.log2(stepGain(g, k, clsSel) + 1e-9)), gm = Math.max(1, ...lg.map(Math.abs));
+  bars("gain", K, [{ y: lg, color: v => (v >= 0 ? "#f28e2b" : "#4e79a7") }], { h: 90, ymin: -gm, ymax: gm, fmt: v => "x" + (2 ** v).toPrecision(2), sel: selJ, tip: tipk, click });
+  document.getElementById("stinfo").innerHTML = `#${channel} &middot; period ${period(channel).toFixed(2)} tokens &middot; gain ${stepGain(g, channel, clsSel).toFixed(3)}${clsSel < 0 && L > 1 ? " (geo. mean over state spaces)" : ""} &middot; heard ${pct(sp.eU[channel], 1)}`;
+  document.getElementById("clsbtns").innerHTML = [-1].concat(Array.from({ length: L }, (_, l) => l)).map(l =>
+    `<button onclick="clsSel=${l};drawWaves()" class="border rounded-md px-2 py-0.5 text-xs ${l === clsSel ? "bg-slate-800 text-white border-slate-800" : "bg-white border-slate-300 hover:bg-slate-100"}">${l < 0 ? "all" : `${l + 1} <span class="opacity-60">(${HALF[l].toFixed(1)})</span>`}</button>`).join("");
+  document.getElementById("fltbtns").innerHTML = [[true, "after the filter"], [false, "before"]].map(([v, nm]) =>
+    `<button onclick="filtered=${v};drawWaves()" class="border rounded-md px-2 py-0.5 text-xs ${v === filtered ? "bg-slate-800 text-white border-slate-800" : "bg-white border-slate-300 hover:bg-slate-100"}">${nm}</button>`).join("");
+  drawPhasor(); drawWave();
+}
+// Complex arrival of slot t on the channel (selected state spaces, filtered or not).
+function arrival(t, k) {
+  let r = 0, im = 0; const o = t * L * K;
+  for (let l = 0; l < L; l++) { if (clsSel >= 0 && l !== clsSel) continue; const q = l * K + k, a = F.fr[o + q], b = F.fi[o + q];
+    if (filtered) { r += F.g.gr[q] * a - F.g.gi[q] * b; im += F.g.gr[q] * b + F.g.gi[q] * a; } else { r += a; im += b; } }
+  return [r, im];
+}
+function drawPhasor() {
+  const [cv, g, Wc, h] = canvas("phasor"), k = channel;
+  const arr = []; let x = 0, y = 0, minx = 0, maxx = 0, miny = 0, maxy = 0;
+  for (let t = 0; t < T; t++) { const [a, b] = arrival(t, k); arr.push([x, y, a, b, t]); x += a; y += b; minx = Math.min(minx, x); maxx = Math.max(maxx, x); miny = Math.min(miny, y); maxy = Math.max(maxy, y); }
+  const span = Math.max(maxx - minx, maxy - miny) * 1.15 || 1, cx = (minx + maxx) / 2, cy = (miny + maxy) / 2, sc = (Wc - 20) / span;
+  const X = v => Wc / 2 + (v - cx) * sc, Y = v => h / 2 - (v - cy) * sc;
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(0, Y(0) + 0.5); g.lineTo(Wc, Y(0) + 0.5); g.moveTo(X(0) + 0.5, 0); g.lineTo(X(0) + 0.5, h); g.stroke();
+  const resU = [x, y], mags = arr.map(a => Math.hypot(a[2], a[3])), mmax = Math.max(...mags) || 1;
+  const f0 = slotOf(firstReal());
+  arr.forEach(([x0, y0, a, b, t], n) => { if (mags[n] < mmax * 0.002) return;
+    const proj = a * resU[0] + b * resU[1], age = (T - 1 - t) / (T - 1);
+    g.strokeStyle = t < f0 ? "rgba(148,163,184,0.6)" : (proj >= 0 ? `rgba(109,40,217,${(1 - 0.75 * age).toFixed(2)})` : `rgba(220,38,38,${(1 - 0.75 * age).toFixed(2)})`);
+    g.lineWidth = 1 + 2 * mags[n] / mmax; g.beginPath(); g.moveTo(X(x0), Y(y0)); g.lineTo(X(x0 + a), Y(y0 + b)); g.stroke(); });
+  g.lineWidth = 2.5; g.strokeStyle = "#0f172a"; g.beginPath(); g.moveTo(X(0), Y(0)); g.lineTo(X(x), Y(y)); g.stroke();
+  const ang = Math.atan2(-(y), x); g.fillStyle = "#0f172a"; g.beginPath(); const hx = X(x), hy = Y(y);
+  g.moveTo(hx, hy); g.lineTo(hx - 9 * Math.cos(ang - 0.4), hy - 9 * Math.sin(ang - 0.4)); g.lineTo(hx - 9 * Math.cos(ang + 0.4), hy - 9 * Math.sin(ang + 0.4)); g.fill(); g.lineWidth = 1;
+  const top = arr.map((a, n) => [n, mags[n]]).filter(([n]) => arr[n][4] >= f0).sort((p, q) => q[1] - p[1]).slice(0, 6);
+  g.fillStyle = "#0f172a"; g.textAlign = "left";
+  top.forEach(([n]) => { const [x0, y0, a, b, t] = arr[n]; g.fillText(W[cur - (T - 1) + t].trim(), X(x0 + a / 2) + 4, Y(y0 + b / 2) - 4); });
+  hover(cv, (mx, my) => { let best = null, bd = 64;
+    arr.forEach(([x0, y0, a, b, t], n) => { const d = (X(x0 + a / 2) - mx) ** 2 + (Y(y0 + b / 2) - my) ** 2; if (d < bd) { bd = d; best = n; } });
+    if (best === null) return null; const t = arr[best][4], p = cur - (T - 1) + t;
+    return `<b>${esc(p >= 0 ? W[p] : "(padding)")}</b> k=${cur - p}<br>|arrival| ${mags[best].toExponential(2)} &middot; phase ${(Math.atan2(arr[best][3], arr[best][2]) * 180 / Math.PI).toFixed(0)}&deg;`; });
+}
+function drawWave() {
+  const [cv, g, Wc, h] = canvas("wave", 300), k = channel, f = firstReal(), n = cur - f + 1;
+  const pL = 46, pR = 8, pT = 8, pB = 24, pw = Wc - pL - pR, ph = h - pT - pB;
+  const Xp = p => pL + (n === 1 ? pw : (p - f) / (n - 1) * pw);
+  // wavelet of slot t (emitted at story position j) seen at time tau: g * p c e^{(-a + i w)(tau - j)} / Z (Real part)
+  const wav = (t, tau) => { const j = cur - (T - 1) + t, d = tau - j; if (d < 0 || d >= T) return 0; const v = VOC[tokAt(j)];
+    let out = 0; for (let l = 0; l < L; l++) { if (clsSel >= 0 && l !== clsSel) continue; const q = l * K + k, a = v.p[l] * DEC[q][d];
+      const r = a * (v.cr[q] * COS[k][d] - v.ci[q] * SIN[k][d]), im = a * (v.cr[q] * SIN[k][d] + v.ci[q] * COS[k][d]);
+      out += filtered ? F.g.gr[q] * r - F.g.gi[q] * im : r; }
+    return out; };
+  const taus = Array.from({ length: n }, (_, q) => f + q);
+  const total = taus.map(tau => { let s = 0; for (let t = 0; t < T; t++) s += wav(t, tau); return s; });
+  const loud = Array.from({ length: n - 1 }, (_, q) => { const t = slotOf(f + q), [a, b] = arrival(t, k); return [t, Math.hypot(a, b)]; }).sort((p, q) => q[1] - p[1]).slice(0, 6);
+  const lines = loud.map(([t]) => taus.map(tau => wav(t, tau)));
+  let m = Math.max(...total.map(Math.abs), ...lines.flat().map(Math.abs)) || 1;
+  const Y = v => pT + ph / 2 - v / m * ph / 2;
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(pL, Y(0) + 0.5); g.lineTo(Wc - pR, Y(0) + 0.5); g.stroke();
+  g.fillStyle = "#64748b"; g.textAlign = "right"; g.fillText(m.toExponential(1), pL - 4, pT + 8); g.fillText("0", pL - 4, Y(0) + 3); g.fillText((-m).toExponential(1), pL - 4, h - pB);
+  const PAL = ["#e15759", "#f28e2b", "#4e79a7", "#59a14f", "#b07aa1", "#9c755f"];
+  const curve = (ys, from, col, wdt) => { g.strokeStyle = col; g.lineWidth = wdt; g.beginPath(); let started = false;
+    ys.forEach((v, q) => { if (taus[q] < from) return; const px = Xp(taus[q]), py = Y(v); if (!started) { g.moveTo(px, py); started = true; } else g.lineTo(px, py); }); g.stroke(); g.lineWidth = 1; };
+  loud.forEach(([t], c) => { const j = cur - (T - 1) + t; curve(lines[c], j, rgba(PAL[c], 0.85), 1.4); g.fillStyle = PAL[c]; g.beginPath(); g.arc(Xp(j), Y(lines[c][j - f]), 3, 0, 7); g.fill(); });
+  curve(total, f, "#0f172a", 2);
+  g.fillStyle = "#334155"; g.textAlign = "center";
+  const every = Math.max(1, Math.ceil(n / Math.floor(pw / 55)));
+  for (let q = 0; q < n; q += every) g.fillText(W[f + q].trim().slice(0, 8), Xp(f + q), h - 8);
+  document.getElementById("wavelg").innerHTML = legend(loud.map(([t]) => `${W[cur - (T - 1) + t]} (k=${T - 1 - t})`), PAL) + `<span class="text-xs text-slate-600">&#9644; sum of all context tokens</span>`;
+  hover(cv, (mx) => { const q = Math.round((mx - pL) / pw * (n - 1)); if (q < 0 || q >= n) return null;
+    return `<b>${esc(W[f + q])}</b> (k=${cur - f - q})<br>sum ${total[q].toExponential(2)}<br>` + loud.map(([t], c) => `${esc(W[cur - (T - 1) + t])}: ${lines[c][q].toExponential(2)}`).join("<br>"); });
+}
+
+// ---- spectrogram tab (computed once) ----
+let SG = null;
+function computeSG() {
+  const n = S.length, sF = [], sU = [], sG = [];
+  for (let i = 0; i < n; i++) { const Fi = field(i), sp = spectrum(Fi, true); sF.push(ORDER.map(k => sp.eF[k])); sU.push(ORDER.map(k => sp.eU[k])); sG.push(ORDER.map(k => Math.log2(stepGain(Fi.g, k, -1) + 1e-9))); }
+  const ab = sG.flat().map(Math.abs).sort((a, b) => a - b);
+  SG = { sF, sU, sG, gm: Math.max(0.25, ab[Math.floor(ab.length * 0.98)]) };  // 98th percentile: a few huge gains would wash out the rest
+}
+function heat(id, M, color, tipf) {
+  const n = M.length, rowH = 3, h = K * rowH + 4, [cv, g, Wc] = canvas(id, h), cw = Wc / n;
+  for (let i = 0; i < n; i++) for (let r = 0; r < K; r++) { g.fillStyle = color(M[i][r]); g.fillRect(i * cw, 2 + r * rowH, Math.ceil(cw), rowH); }
+  g.strokeStyle = "#0f172a"; g.lineWidth = 1.5; g.strokeRect(cur * cw, 1, Math.max(cw, 2), h - 2); g.lineWidth = 1;
+  hover(cv, (x, y) => { const i = Math.floor(x / cw), r = Math.floor((y - 2) / rowH); return i >= 0 && i < n && r >= 0 && r < K ? tipf(i, r) : null; });
+  cv.onclick = e => { const i = Math.floor(e.offsetX / cw), r = Math.floor((e.offsetY - 2) / rowH); if (r >= 0 && r < K) channel = ORDER[r]; go(i); };
+}
+function drawSpectrogram() {
+  if (!SG) computeSG();
+  const q98 = M => { const a = M.flat().sort((x, y) => x - y); return a[Math.floor(a.length * 0.98)]; }, mF = q98(SG.sF), mU = q98(SG.sU);
+  const purple = m => v => `rgba(76,29,149,${Math.min(1, v / m).toFixed(3)})`;
+  const t0 = (i, r) => `step ${i + 1}: <b>${esc(W[i])}</b> &rarr; ${esc(S[i].tgt[0])}<br>channel ${ORDER[r]}, period ${period(ORDER[r]).toFixed(1)}`;
+  heat("sgF", SG.sF, purple(mF), (i, r) => t0(i, r) + `<br>state ${pct(SG.sF[i][r], 2)}`);
+  heat("sgG", SG.sG, v => (v >= 0 ? `rgba(242,142,43,${Math.min(1, v / SG.gm).toFixed(3)})` : `rgba(78,121,167,${Math.min(1, -v / SG.gm).toFixed(3)})`),
+    (i, r) => t0(i, r) + `<br>gain x${(2 ** SG.sG[i][r]).toPrecision(3)}`);
+  heat("sgU", SG.sU, purple(mU), (i, r) => t0(i, r) + `<br>heard ${pct(SG.sU[i][r], 2)}`);
+}
+
+// ---- decay per channel ----
+const halfOf = (l, k) => Math.LN2 / P.alpha[l * K + k];
+const phaseColor = (re, im, a) => `hsla(${((Math.atan2(im, re) * 180 / Math.PI) + 360) % 360},70%,45%,${a})`;
+function drawDecayMap(sl, sk) {
+  const cvEl = document.getElementById("ckdec"), Wc = cvEl.clientWidth || 1000, pL = 64, cell = (Wc - pL) / K, rh = 18, h = L * rh + 16;
+  const [, g] = canvas("ckdec", h);
+  const hl = []; for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) hl.push(halfOf(l, k));
+  const lo = Math.log(Math.min(...hl)), hi = Math.log(Math.max(...hl)), t = v => (Math.log(v) - lo) / (hi - lo + 1e-9);
+  for (let l = 0; l < L; l++) {
+    g.textAlign = "right"; g.fillStyle = CC[l]; g.fillText(`space ${l + 1}`, pL - 6, l * rh + rh / 2 + 3);
+    for (let k = 0; k < K; k++) { g.fillStyle = `rgba(30,41,59,${(0.08 + 0.9 * t(halfOf(l, k))).toFixed(3)})`; g.fillRect(pL + k * cell, l * rh + 1, Math.max(cell - 1, 1), rh - 2); }
+  }
+  if (sl >= 0) { g.strokeStyle = "#6d28d9"; g.lineWidth = 2; g.strokeRect(pL + sk * cell, sl * rh, cell, rh); g.lineWidth = 1; }
+  g.textAlign = "center"; g.fillStyle = "#94a3b8"; for (let k = 0; k < K; k += 8) g.fillText(k, pL + (k + 0.5) * cell, h - 3);
+  hover(cvEl, (x, y) => { const k = Math.floor((x - pL) / cell), l = Math.floor(y / rh); if (k < 0 || k >= K || l < 0 || l >= L) return null;
+    return `space ${l + 1}, channel ${k}<br>half-life <b>${halfOf(l, k).toFixed(1)}</b> tokens (keeps ${(100 * Math.exp(-P.alpha[l * K + k])).toFixed(1)}% per step)<br>period ${period(k).toFixed(1)} tokens`; });
+  cvEl.onclick = e => { const k = Math.floor((e.offsetX - pL) / cell), l = Math.floor(e.offsetY / rh); if (k >= 0 && k < K && l >= 0 && l < L) { ckState = [l, k]; ckCls = l; channel = k; drawClocks(); } };
+  const stats = Array.from({ length: L }, (_, l) => { const a = Array.from({ length: K }, (_, k) => halfOf(l, k)).sort((x, y) => x - y); return `space ${l + 1}: ${a[0].toFixed(1)} &ndash; ${a[K - 1].toFixed(1)} (median ${a[K >> 1].toFixed(1)})`; });
+  document.getElementById("ckdecleg").innerHTML = `half-life range per state space: ${stats.join(" &middot; ")}`;
+}
+
+// ---- cascade tab ----
+function drawCascade() {
+  const st = S[cur], g = F.g, f = firstReal(), pos = Array.from({ length: cur - f + 1 }, (_, j) => f + j), tgt = 5, top1 = 0, QS = st.q;
+  const chip = (w, c) => `<span class="inline-flex items-baseline gap-1 border border-slate-200 rounded px-1.5 py-0.5 font-mono text-xs">${esc(w)}<span class="text-slate-400">${c.toFixed(2)}</span></span>`;
+  document.getElementById("flow").innerHTML = `<span class="font-mono text-sm border border-slate-800 rounded px-2 py-0.5">${esc(W[cur])}</span>` +
+    QS.map((q, l) => `<span class="text-slate-400">&rarr;</span><span class="text-xs" style="color:${CC[l]}">stage ${l + 1}</span><span class="font-mono text-xs">${esc(q[0][0])}</span>`).join("") +
+    `<span class="text-slate-400">&rarr;</span><span class="text-xs text-slate-500">predicts</span><span class="font-mono text-sm font-semibold">${esc(st.top[0][0])}</span>` +
+    `<span class="text-xs text-slate-500">(target <span class="font-mono">${esc(st.tgt[0])}</span>)</span>`;
+  document.getElementById("stages").innerHTML = Array.from({ length: L }, (_, l) => `<div class="border border-slate-200 rounded-md">
+    <div class="px-4 py-2 border-b border-slate-200 flex flex-wrap items-baseline gap-x-3"><span class="w-3 h-3 rounded-sm self-center" style="background:${CC[l]}"></span>
+      <h3 class="font-semibold text-slate-900">Stage ${l + 1}: state space ${l + 1}</h3><span class="text-xs text-slate-500">half-life ${HALF[l].toFixed(1)} tokens &middot; ${pct(SH.cls[l])} of the heard energy</span>
+      <span class="ml-auto text-xs text-slate-500">vote for <span class="font-mono">${esc(st.cand[top1])}</span> <b class="${st.cv[top1][l] >= 0 ? "text-emerald-700" : "text-red-700"}">${st.cv[top1][l].toFixed(2)}</b>
+        &middot; for target <span class="font-mono">${esc(st.cand[tgt])}</span> <b class="${st.cv[tgt][l] >= 0 ? "text-emerald-700" : "text-red-700"}">${st.cv[tgt][l].toFixed(2)}</b></span></div>
+    <div class="p-4 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-6">
+      <div class="space-y-3">
+        <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">${l === 0 ? "query = the reader's signature; closest signatures" : "query after the earlier stages; closest signatures"}</div><div class="flex flex-wrap gap-1">${QS[l].map(([w, c]) => chip(w, c)).join("")}</div></div>
+        <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">filter it built: gain per channel (log, line = 1)</div><canvas id="cqg${l}" class="w-full block"></canvas></div>
+      </div>
+      <div><div class="text-xs uppercase tracking-wide text-slate-500 mb-1">who this stage hears (share of its state space after the filter; red = cancels)</div><div id="cqt${l}" class="leading-7 max-h-64 overflow-y-auto"></div></div>
+    </div></div>`).join("");
+  for (let l = 0; l < L; l++) {
+    const lg = ORDER.map(k => Math.log2(stepGain(g, k, l) + 1e-9)), gm = Math.max(1, ...lg.map(Math.abs));
+    bars(`cqg${l}`, K, [{ y: lg, color: v => (v >= 0 ? "#f28e2b" : "#4e79a7") }], { h: 80, ymin: -gm, ymax: gm, fmt: v => "x" + (2 ** v).toPrecision(2),
+      tip: j => { const k = ORDER[j], q = l * K + k; return `channel ${k}, period ${period(k).toFixed(1)}<br>gain x${stepGain(g, k, l).toPrecision(3)}, rotation ${(Math.atan2(g.gi[q], g.gr[q]) * 180 / Math.PI).toFixed(0)}&deg;`; } });
+    const sh = pos.map(p => SH.after[slotOf(p)][l] / (SH.cls[l] || 1)), m = Math.max(1e-6, ...sh.slice(0, -1).map(Math.abs));
+    document.getElementById(`cqt${l}`).innerHTML = pos.map((p, j) => `<span class="rounded-sm px-px ${p === cur ? "ring-2 ring-slate-900" : ""}" style="background:${shareBg(sh[j], m)}" title="k=${cur - p}: ${pct(sh[j], 2)} of stage ${l + 1}">${esc(W[p])}</span>`).join("") +
+      `<div class="text-xs text-slate-500 mt-1">the reader itself: ${pct(sh[sh.length - 1])} of this stage (shading scaled to the context)</div>`;
+  }
+}
+
+// ---- channels tab ----
+// Channels of step i = the state at the reader's position (window before and including it), per state space and channel.
+// Absolute frame: the pointer turns by omega every step (it is a channel). Clock frame: multiplied by e^{-i omega i},
+// so it only moves when a token arrives (and shrinks as old ones decay or leave the window).
+let CK = null, ckCls = -1, ckHeard = false, ckFrame = "abs", ckState = null;
+function computeClocks() {
+  const n = S.length, Fr = [], Fi = [], Ur = [], Ui = [];
+  for (let i = 0; i < n; i++) { const f = field(i); Fr.push(f.Fr); Fi.push(f.Fi); Ur.push(f.Ur); Ui.push(f.Ui); }
+  CK = { Fr, Fi, Ur, Ui };
+}
+function ckValue(i, l, k) {  // complex value of state (state space l or all, channel k) at step i in the chosen view and frame
+  const R = ckHeard ? CK.Ur : CK.Fr, I = ckHeard ? CK.Ui : CK.Fi;
+  let r = 0, im = 0;
+  for (let c = 0; c < L; c++) { if (l >= 0 && c !== l) continue; r += R[i][c * K + k]; im += I[i][c * K + k]; }
+  if (ckFrame === "channel") { const a = -P.omega[k] * i, co = Math.cos(a), si = Math.sin(a); [r, im] = [r * co - im * si, r * si + im * co]; }
+  return [r, im];
+}
+function ckMax(l, k) { let m = 1e-12; for (let i = 0; i < S.length; i++) m = Math.max(m, Math.hypot(...ckValue(i, l, k))); return m; }
+function dial(g, cx, cy, r, z, m, col, face) {
+  if (face !== false) { g.strokeStyle = "#e2e8f0"; g.lineWidth = 1; g.beginPath(); g.arc(cx, cy, r, 0, 7); g.stroke(); }
+  const a = Math.min(1, Math.hypot(...z) / m), ang = Math.atan2(z[1], z[0]);
+  g.strokeStyle = col; g.lineWidth = Math.min(2.5, Math.max(1.2, r / 7)); g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + r * a * Math.cos(ang), cy - r * a * Math.sin(ang)); g.stroke(); g.lineWidth = 1;
+}
+function drawClocks() {
+  if (!CK) computeClocks();
+  if (ckState === null) ckState = [ckCls, channel !== null ? channel : 0];
+  const btn = (on, js, label) => `<button onclick="${js}" class="border rounded-md px-2 py-0.5 text-xs ${on ? "bg-slate-800 text-white border-slate-800" : "bg-white border-slate-300 hover:bg-slate-100"}">${label}</button>`;
+  document.getElementById("ckcls").innerHTML = [-1].concat(Array.from({ length: L }, (_, l) => l)).map(l => btn(l === ckCls, `ckCls=${l};ckState[0]=${l};drawClocks()`, l < 0 ? "all (sum)" : `${l + 1} <span class="opacity-60">(${HALF[l].toFixed(1)})</span>`)).join("");
+  document.getElementById("ckflt").innerHTML = btn(!ckHeard, "ckHeard=false;drawClocks()", "state") + btn(ckHeard, "ckHeard=true;drawClocks()", "heard (after the filter)");
+  document.getElementById("ckframe").innerHTML = btn(ckFrame === "abs", "ckFrame='abs';drawClocks()", "absolute (spinning)") + btn(ckFrame === "channel", "ckFrame='channel';drawClocks()", "channel frame (rotation removed)");
+  const [sl, sk] = ckState;
+  document.getElementById("ckinfo").innerHTML = `${sl < 0 ? "all state spaces" : `space ${sl + 1}`} &middot; channel ${sk} &middot; period ${period(sk).toFixed(2)} tokens`;
+  // grid: rows = state spaces (+ the sum row when "all"), columns = channels
+  { const rows = ckCls < 0 ? L + 1 : 1, cls = ckCls < 0 ? [...Array(L).keys(), -1] : [ckCls], COLS = Math.min(K, 32), blocks = Math.ceil(K / COLS);
+    const cvEl = document.getElementById("ckgrid"), Wc = cvEl.clientWidth || 1000, pL = 64, cell = (Wc - pL) / COLS, r = cell / 2 - 2, bh = rows * cell + 18, h = blocks * bh;
+    const [, g] = canvas("ckgrid", h);
+    const place = (ri, k) => [pL + (k % COLS + 0.5) * cell, Math.floor(k / COLS) * bh + ri * cell + cell / 2];
+    g.textAlign = "center"; g.fillStyle = "#94a3b8"; for (let k = 0; k < K; k += 4) { const [cx] = place(0, k); g.fillText(k, cx, Math.floor(k / COLS) * bh + rows * cell + 12); }
+    for (let b = 0; b < blocks; b++) cls.forEach((l, ri) => { g.textAlign = "right"; g.fillStyle = l < 0 ? "#0f172a" : CC[l]; g.fillText(l < 0 ? "sum" : `space ${l + 1}`, pL - 6, b * bh + ri * cell + cell / 2 + 3); });
+    cls.forEach((l, ri) => {
+      for (let k = 0; k < K; k++) { const [cx, cy] = place(ri, k), sel = l === sl && k === sk;
+        if (sel) { g.fillStyle = "rgba(109,40,217,0.12)"; g.fillRect(cx - cell / 2, cy - cell / 2, cell, cell); }
+        dial(g, cx, cy, r, ckValue(cur, l, k), ckMax(l, k), l < 0 ? "#0f172a" : CC[l]); } });
+    const hit = (x, y) => { const b = Math.floor(y / bh), ri = Math.floor((y - b * bh) / cell), c = Math.floor((x - pL) / cell), k = b * COLS + c;
+      return c >= 0 && c < COLS && ri >= 0 && ri < rows && k < K ? [ri, k] : [-1, -1]; };
+    hover(cvEl, (x, y) => { const [ri, k] = hit(x, y); if (ri < 0) return null;
+      const l = cls[ri], z = ckValue(cur, l, k);
+      return `${l < 0 ? "sum of state spaces" : `space ${l + 1}, channel half-life ${halfOf(l, k).toFixed(1)} tokens`}, channel ${k}<br>period ${period(k).toFixed(2)} tokens<br>amplitude ${Math.hypot(...z).toExponential(2)}, phase ${(Math.atan2(z[1], z[0]) * 180 / Math.PI).toFixed(0)}&deg;`; });
+    cvEl.onclick = e => { const [ri, k] = hit(e.offsetX, e.offsetY); if (ri >= 0) { ckState = [cls[ri], k]; channel = k; drawClocks(); } };
+  }
+  drawDecayMap(sl, sk);
+  const m = ckMax(sl, sk), col = sl < 0 ? "#0f172a" : CC[sl];
+  // big dial with trail
+  { const [, g, Wc, h] = canvas("ckbig"), cx = Wc / 2, cy = h / 2, r = Wc / 2 - 12;
+    g.strokeStyle = "#e2e8f0"; g.beginPath(); g.arc(cx, cy, r, 0, 7); g.stroke(); g.beginPath(); g.moveTo(cx - r, cy); g.lineTo(cx + r, cy); g.moveTo(cx, cy - r); g.lineTo(cx, cy + r); g.stroke();
+    const tipAt = i => { const z = ckValue(i, sl, sk), a = Math.hypot(...z) / m, ang = Math.atan2(z[1], z[0]); return [cx + r * a * Math.cos(ang), cy - r * a * Math.sin(ang)]; };
+    for (let i = Math.max(0, cur - 24); i < cur; i++) { const [x0, y0] = tipAt(i), [x1, y1] = tipAt(i + 1), f = 1 - (cur - i) / 25;
+      g.strokeStyle = rgba(col.length === 7 ? col : "#0f172a", 0.15 + 0.6 * f); g.lineWidth = 1.5; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+      g.fillStyle = rgba(col, 0.2 + 0.6 * f); g.beginPath(); g.arc(x0, y0, 2, 0, 7); g.fill(); }
+    dial(g, cx, cy, r, ckValue(cur, sl, sk), m, "#0f172a", false);
+    const [tx, ty] = tipAt(cur); g.fillStyle = "#0f172a"; g.beginPath(); g.arc(tx, ty, 3.5, 0, 7); g.fill();
+    g.fillStyle = "#64748b"; g.textAlign = "left"; g.fillText(W[cur].trim(), tx + 6, ty - 6);
+  }
+  // ribbon: channel above each word, text flow
+  { const cvEl = document.getElementById("ckribbon"), Wc = cvEl.clientWidth || 900, g0 = cvEl.getContext("2d");
+    g0.font = "13px ui-sans-serif, system-ui"; const R = 11, lineH = 50, pad = 4, pos = []; let x = 0, line = 0;
+    for (let i = 0; i < S.length; i++) { const wdt = Math.max(2 * R + 2, g0.measureText(W[i]).width + pad);
+      if (x + wdt > Wc && x > 0) { x = 0; line++; } pos.push([x, line, wdt]); x += wdt; }
+    const h = (line + 1) * lineH + 4, [, g] = canvas("ckribbon", h); g.font = "13px ui-sans-serif, system-ui";
+    pos.forEach(([x0, ln, wdt], i) => { const cx = x0 + wdt / 2, cy = ln * lineH + R + 3;
+      if (i === cur) { g.fillStyle = "rgba(109,40,217,0.12)"; g.fillRect(x0, ln * lineH, wdt, lineH - 4); }
+      dial(g, cx, cy, R, ckValue(i, sl, sk), m, col);
+      g.fillStyle = i === cur ? "#0f172a" : "#334155"; g.textAlign = "center"; g.fillText(W[i], cx, cy + R + 15); });
+    const at = (mx, my) => pos.findIndex(([x0, ln, wdt]) => mx >= x0 && mx < x0 + wdt && my >= ln * lineH && my < (ln + 1) * lineH);
+    hover(cvEl, (mx, my) => { const i = at(mx, my); if (i < 0) return null; const z = ckValue(i, sl, sk);
+      return `<b>${esc(W[i])}</b> (step ${i + 1})<br>amplitude ${(Math.hypot(...z) / m * 100).toFixed(0)}% of max, phase ${(Math.atan2(z[1], z[0]) * 180 / Math.PI).toFixed(0)}&deg;`; });
+    cvEl.onclick = e => { const i = at(e.offsetX, e.offsetY); if (i >= 0) go(i); };
+  }
+}
+
+// ---- tokens tab ----
+function drawWrites(id, v) {
+  const cvEl = document.getElementById(id), Wc = cvEl.clientWidth || 500, pL = 52, rh = 34, h = L * rh + 14, cell = (Wc - pL) / K;
+  const [, g] = canvas(id, h);
+  let m = 1e-9; for (let l = 0; l < L; l++) for (let k = 0; k < K; k++) m = Math.max(m, v.p[l] * Math.hypot(v.cr[l * K + k], v.ci[l * K + k]));
+  for (let l = 0; l < L; l++) {
+    const base = (l + 1) * rh - 3;
+    g.textAlign = "right"; g.fillStyle = CC[l]; g.fillText(`space ${l + 1}`, pL - 6, base - rh / 2 + 6);
+    g.strokeStyle = "#f1f5f9"; g.beginPath(); g.moveTo(pL, base + 0.5); g.lineTo(Wc, base + 0.5); g.stroke();
+    for (let k = 0; k < K; k++) { const q = l * K + k, a = v.p[l] * Math.hypot(v.cr[q], v.ci[q]), bh = (rh - 6) * a / m;
+      g.fillStyle = phaseColor(v.cr[q], v.ci[q], 0.9); g.fillRect(pL + k * cell + cell * 0.1, base - bh, Math.max(cell * 0.8, 0.8), bh); }
+  }
+  g.textAlign = "center"; g.fillStyle = "#94a3b8"; for (let k = 0; k < K; k += 16) g.fillText(k, pL + (k + 0.5) * cell, h - 2);
+  hover(cvEl, (x, y) => { const k = Math.floor((x - pL) / cell), l = Math.floor(y / rh); if (k < 0 || k >= K || l < 0 || l >= L) return null;
+    const q = l * K + k; return `space ${l + 1}, channel ${k}<br>writes amplitude ${(v.p[l] * Math.hypot(v.cr[q], v.ci[q])).toFixed(3)}, phase ${(Math.atan2(v.ci[q], v.cr[q]) * 180 / Math.PI).toFixed(0)}&deg;<br>channel half-life ${halfOf(l, k).toFixed(1)} tokens`; });
+}
+function drawCards() {
+  const pk = picked !== null ? picked : (loudest(1, true)[0] || [cur])[0];
+  const cards = [[cur, "reader"], [pk, `context token, k=${cur - pk}`]];
+  document.getElementById("cards").innerHTML = cards.map(([p, role], c) => `<div class="border border-slate-200 rounded-md">
+    <div class="px-4 py-2 border-b border-slate-200 flex items-baseline gap-2"><h3 class="font-semibold text-slate-900 font-mono">${esc(W[p])}</h3><span class="text-xs text-slate-500">${role}</span></div>
+    <div class="p-4 space-y-3">
+      <div><div class="text-xs text-slate-500">signature |c<sub>k</sub>| per channel (0&ndash;63), before the per-state-space projections</div><canvas id="ce${c}" class="w-full block"></canvas></div>
+      <div><div class="text-xs text-slate-500">state space mix (how far it carries)</div><div id="cm${c}" class="space-y-1 mt-1"></div></div>
+      <div><div class="text-xs text-slate-500">what it writes into each state space: p<sub>l</sub> &middot; c<sub>l,k</sub> (its projected signature). Bar height = amplitude, color = phase (hue wheel), one row per state space, channels 0&ndash;63</div><canvas id="cw${c}" class="w-full block"></canvas></div>
+      <div><div class="text-xs text-slate-500">loudness of its wave by distance (envelope &Sigma;<sub>l</sub> p<sub>l</sub> decay<sub>l</sub>(d), all channels)</div><canvas id="cp${c}" class="w-full block"></canvas></div>
+    </div></div>`).join("");
+  cards.forEach(([p], c) => {
+    const v = VOC[IDS[p]], amp = ORDER.map(k => Math.hypot(v.sr[k], v.si[k]));
+    const tk = j => `channel ${ORDER[j]}, period ${period(ORDER[j]).toFixed(1)}`;
+    bars(`ce${c}`, K, [{ y: amp, color: "#6d28d9" }], { h: 110, tip: j => tk(j) + `<br>|c| ${amp[j].toFixed(3)}` });
+    drawWrites(`cw${c}`, v);
+    document.getElementById(`cm${c}`).innerHTML = Array.from(v.p).map((x, l) => hbar(`space ${l + 1} <span class="text-slate-400">${HALF[l].toFixed(1)}</span>`, x, 1, CC[l], pct(x))).join("");
+    const env = Array.from({ length: T }, (_, d) => { let s = 0; for (let l = 0; l < L; l++) s += v.p[l] * DECL[l][d]; return s; });
+    bars(`cp${c}`, T, Array.from({ length: L }, (_, l) => ({ y: env.map((_, d) => v.p[l] * DECL[l][d]), color: CC[l], w: 1 })), { stack: true, h: 90, fmt: v => v.toFixed(3), tip: d => `distance ${d}: ${env[d].toFixed(4)}` });
+  });
+}
+
+window.addEventListener("resize", () => drawTab());
+const H = Object.fromEntries(location.hash.slice(1).split("&").filter(Boolean).map(kv => kv.includes("=") ? kv.split("=").map(decodeURIComponent) : ["step", kv]));
+setTab(TABS.some(t => t[0] === H.tab) ? H.tab : "overview");
+go(+H.step || 0);
+</script>
+</body>
+</html>

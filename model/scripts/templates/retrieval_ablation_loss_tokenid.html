@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Token-anchored retrieval ablation: loss impact -- {{ run_name }}</title>
+<style>{{ style | safe }}</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="report-header">
+    <h1>How much does corrupting token-anchored retrieval cost, in loss?</h1>
+    <div class="subtitle">Validation loss/perplexity/bpc/top-1 accuracy, real retrieval vs. three corruptions</div>
+    <div class="meta">
+      <span class="tag">run <strong>{{ run_name }}</strong></span>
+      <span class="tag">checkpoint <strong>{{ checkpoint }}</strong></span>
+      <span class="tag">examples <strong>{{ "{:,}".format(num_examples) }}</strong></span>
+      <span class="tag">batch size <strong>{{ batch_size }}</strong></span>
+      <span class="tag">generated {{ generated_at }}</span>
+    </div>
+  </header>
+
+  <section class="card">
+    <h2>Why this report</h2>
+    <p class="hint">
+      The attention/retrieval traces showed the softmax retrieval step has
+      collapsed to a near-uniform, input-independent vector, and that
+      individual token ranks barely move when it is substituted away. This
+      report makes the causal claim directly, in the unit that actually
+      matters -- validation loss over {{ "{:,}".format(num_examples) }}
+      real examples -- under three conditions, with every other trained
+      weight held fixed:
+    </p>
+    <table class="data-table">
+      <thead><tr><th>condition</th><th>what changes</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge grey">normal</span></td><td>the real forward pass, unmodified</td></tr>
+        <tr><td><span class="badge grey">uniform</span></td><td>retrieved vector replaced by the exact vector a perfectly uniform vocabulary-weight vector would produce (in-distribution, but query-independent)</td></tr>
+        <tr><td><span class="badge grey">shuffled</span></td><td>each example gets another example's real retrieved vector (on-distribution -- a genuine retrieved output -- but mismatched content, isolating "wrong content" from "off-distribution")</td></tr>
+        <tr><td><span class="badge grey">random</span></td><td>retrieved vector replaced by genuine random noise (off-distribution; destroys retrieved content entirely)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="stat-grid">
+      <div class="stat neutral">
+        <div class="label">Normal loss</div>
+        <div class="value">{{ "%.4f"|format(results.normal.loss) }}</div>
+      </div>
+      <div class="stat {{ 'good' if results.uniform.loss_delta_pct < 2 else ('bad' if results.uniform.loss_delta_pct > 20 else 'neutral') }}">
+        <div class="label">Uniform-substituted loss (&Delta;)</div>
+        <div class="value">{{ "%.4f"|format(results.uniform.loss) }} ({{ "%+.1f%%"|format(results.uniform.loss_delta_pct) }})</div>
+      </div>
+      <div class="stat {{ 'good' if results.shuffled.loss_delta_pct < 2 else ('bad' if results.shuffled.loss_delta_pct > 20 else 'neutral') }}">
+        <div class="label">Shuffled-content loss (&Delta;)</div>
+        <div class="value">{{ "%.4f"|format(results.shuffled.loss) }} ({{ "%+.1f%%"|format(results.shuffled.loss_delta_pct) }})</div>
+      </div>
+      <div class="stat {{ 'good' if results.random.loss_delta_pct < 2 else ('bad' if results.random.loss_delta_pct > 20 else 'neutral') }}">
+        <div class="label">Random-corrupted loss (&Delta;)</div>
+        <div class="value">{{ "%.4f"|format(results.random.loss) }} ({{ "%+.1f%%"|format(results.random.loss_delta_pct) }})</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Full results</h2>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>condition</th>
+          <th>loss</th>
+          <th>&Delta; loss</th>
+          <th>&Delta; loss %</th>
+          <th>perplexity</th>
+          <th>bpc</th>
+          <th>top-1 accuracy</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for name, r in results.items() %}
+        <tr>
+          <td><span class="badge {{ 'green' if name == 'normal' else 'grey' }}">{{ name }}</span></td>
+          <td>{{ "%.4f"|format(r.loss) }}</td>
+          <td>{{ "%+.4f"|format(r.loss_delta) }}</td>
+          <td>{{ "%+.2f%%"|format(r.loss_delta_pct) }}</td>
+          <td>{{ "%.3f"|format(r.perplexity) }}</td>
+          <td>{{ "%.4f"|format(r.bpc) }}</td>
+          <td>{{ "%.2f%%"|format(r.top1_accuracy * 100) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="hint">
+      The comparison that matters is <strong>uniform vs. shuffled vs.
+      random</strong>: all three remove the query-specific retrieved content,
+      but only <code class="inline">random</code> also pushes Block 2 and the
+      FFN readout off the input distribution they were trained on. If
+      <code class="inline">uniform</code> and <code class="inline">shuffled</code>
+      stay close to <code class="inline">normal</code> while
+      <code class="inline">random</code> is far worse, the large &Delta; under
+      <code class="inline">random</code> reflects distributional shock, not
+      lost retrieved information -- i.e. the model has learned to rely on the
+      retrieved block having a specific statistical shape (unit-norm, near
+      the big table's mean), not on its query-specific content. If
+      <code class="inline">shuffled</code> is much worse than
+      <code class="inline">uniform</code> despite both being in-distribution,
+      that would instead mean the retrieved content's specific identity (not
+      just its shape) matters.
+    </p>
+  </section>
+
+  <footer class="report-footer">
+    Generated by <code class="inline">model scripts retrieval-ablation-loss-tokenid</code> &middot;
+    checkpoint <code class="inline">{{ checkpoint_path }}</code>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "report-css",
+  "version": "1.0.0",
+  "description": "Builds the Tailwind CSS inlined into offline HTML reports.",
+  "scripts": {
+    "build": "tailwindcss -i input.css -o ../../model/scripts/templates/report_tailwind.css --minify"
+  },
+  "type": "commonjs",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "tailwindcss": "^4.3.3"
+  },
+  "private": true
+}

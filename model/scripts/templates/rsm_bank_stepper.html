@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en" class="bg-slate-50">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bank stepper - __TITLE__</title>
+<style>/*__CSS__*/</style>
+</head>
+<body class="text-slate-800 text-sm antialiased">
+
+<header class="sticky top-0 z-20 bg-white border-b border-slate-200">
+  <div class="max-w-[1600px] mx-auto px-5 py-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+    <div class="mr-2">
+      <h1 class="text-base font-semibold text-slate-900">Bank memory stepper</h1>
+      <p class="text-xs text-slate-500">__TITLE__</p>
+    </div>
+    <select id="doc" onchange="pick(+this.value)" class="border border-slate-300 rounded-md px-2 py-1 bg-white"></select>
+    <select id="layer" onchange="setLayer(+this.value)" class="border border-slate-300 rounded-md px-2 py-1 bg-white"></select>
+    <div class="flex items-center gap-1 text-xs text-slate-500">bank
+      <button onclick="stepBank(-1)" class="border border-slate-300 rounded-md px-2 py-1 hover:bg-slate-100" title="previous bank by half-life (down arrow)">&minus;</button>
+      <select id="banksel" onchange="bank = +this.value; draw()" class="border border-slate-300 rounded-md px-2 py-1 bg-white text-sm text-slate-800"></select>
+      <button onclick="stepBank(1)" class="border border-slate-300 rounded-md px-2 py-1 hover:bg-slate-100" title="next bank by half-life (up arrow)">+</button>
+    </div>
+    <div class="flex items-center gap-1">
+      <button onclick="go(cur - 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="previous (left arrow)">&larr;</button>
+      <button onclick="go(cur + 1)" class="border border-slate-300 rounded-md px-2.5 py-1 hover:bg-slate-100" title="next (right arrow)">&rarr;</button>
+    </div>
+    <div class="text-lg"><span id="now" class="font-mono font-semibold"></span>
+      <span class="text-xs text-slate-500 ml-2" id="next"></span></div>
+    <span id="stepl" class="ml-auto text-xs text-slate-500 tabular-nums"></span>
+  </div>
+</header>
+
+<main class="max-w-[1600px] mx-auto px-5 py-4">
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900">Loss per word</h2>
+      <span id="lossinfo" class="text-xs text-slate-500"></span>
+      <label class="ml-auto text-xs text-slate-500">red at <select id="cap" onchange="draw()" class="border border-slate-300 rounded-md px-1 bg-white"><option>3</option><option selected>6</option><option>9</option></select> nats</label>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">Cross entropy of each word given everything before it (memory reset at the marker): green = expected, red = not. Only the tokens the model is trained to predict are colored (with loss spans: the assistant's turns, its calls and the closing tag); grey = context it reads but does not predict (tool list, user, tool results). <span class="underline">Underlined</span> = written by the model itself (after the prefill). Click a word to step to the position that had to predict it.</p>
+    <p id="note" class="text-xs text-slate-600 mb-2 font-mono"></p>
+    <div id="loss" class="leading-7 text-[14px]"></div>
+  </section>
+
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900">Read: attention over past tokens</h2>
+      <span id="readinfo" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">The read o<sub>t</sub> = &Sigma;<sub>b</sub> r<sub>tb</sub> bank<sub>b</sub> / &Sigma;<sub>b</sub> r<sub>tb</sub> z<sub>b</sub> is exactly a weighted average of past values: token j gets a<sub>tj</sub> = &Sigma;<sub>b</sub> r<sub>tb</sub> (1-&mu;<sub>b</sub>) &mu;<sub>b</sub><sup>t-j</sup> w<sub>jb</sub> / &Sigma;<sub>b</sub> r<sub>tb</sub> z<sub>b</sub> (sums to 100%). Purple = weight. Hover a token for its weight and the banks it came through; click it to select its main bank. The gate g scales the read before it adds to the state.</p>
+    <div id="att" class="leading-7 text-[14px]"></div>
+    <div id="pred" class="mt-3 text-xs text-slate-600"></div>
+    <div class="text-xs text-slate-500 mt-3 mb-1">read over time: at every step (column), the attention weight of each past token in the pooled read (same colors as a legend below; grey = all others). Hover for the read at a step, click to go there.</div>
+    <canvas id="cread" class="w-full block cursor-pointer"></canvas>
+    <div id="rlegend" class="mt-2 text-xs leading-7"></div>
+  </section>
+
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900">Banks at this token</h2>
+      <span id="bankinfo" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">All banks, ordered by learned half-life (short left, long right). Up (blue): this token's write softmax w<sub>tb</sub>. Down (purple): the read's share from each bank, r<sub>tb</sub> z<sub>b</sub> / &Sigma; r z (what the read actually got from it; the read softmax r<sub>tb</sub> itself is the grey outline). Each half scaled to its own largest bar. Click a bank.</p>
+    <canvas id="cbanks" class="w-full block cursor-pointer"></canvas>
+  </section>
+
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900">Banks over the text</h2>
+      <div class="flex gap-1 text-xs" id="hmodes"></div>
+      <span id="hinfo" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">Rows: banks by half-life (short at the top), columns: tokens. Darker = larger (square-root scale, max of this text and layer). Dashed: the current token and the selected bank. Click to go to a token and bank.</p>
+    <canvas id="cheat" class="w-full block cursor-pointer"></canvas>
+  </section>
+
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900" id="btitle"></h2>
+      <span id="binfo" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">What the selected bank stores after this token: each past token's share c<sub>jb</sub> / z<sub>b</sub> = (1-&mu;<sub>b</sub>) &mu;<sub>b</sub><sup>t-j</sup> w<sub>jb</sub> / z<sub>b</sub> of the bank's value average (sums to 100%). Click a token to step there.</p>
+    <div id="store" class="leading-7 text-[14px]"></div>
+    <div class="flex items-baseline gap-3 mt-3"><span class="text-xs font-medium text-slate-700">read from this bank at this token</span><span id="rbinfo" class="text-xs text-slate-500"></span></div>
+    <p class="text-xs text-slate-500 mb-1">The part of the pooled read that came through this bank: r<sub>tb</sub> c<sub>jb</sub> / &Sigma;<sub>b'</sub> r<sub>tb'</sub> z<sub>b'</sub> per past token (these add up to the bank's read share; over all banks they add up to the attention above). Green = weight.</p>
+    <div id="rbank" class="leading-7 text-[14px]"></div>
+    <div class="text-xs text-slate-500 mt-3 mb-1">contents over time: at every step (column), the share of each past token in this bank; colored = the tokens that ever reach the largest shares, grey = all others, white = nothing written yet. Hover for the contents at a step, click to go there.</div>
+    <canvas id="cstack" class="w-full block cursor-pointer"></canvas>
+    <div id="slegend" class="mt-2 text-xs leading-7"></div>
+    <div class="text-xs text-slate-500 mt-3 mb-1">over the text: write weight w<sub>tb</sub> (blue bars) and written mass z<sub>b</sub> (black), each on 0..its max in this text (left labels); read share r<sub>tb</sub> z<sub>b</sub> / &Sigma; r z (purple) on 0..100% (right). The share is relative: a bank with little mass can take most of the read when the banks the read selects are all nearly empty.</div>
+    <canvas id="cbank" class="w-full block"></canvas>
+  </section>
+
+  <section class="bg-white border border-slate-200 rounded-md p-4 mb-4">
+    <div class="flex items-baseline gap-3">
+      <h2 class="font-semibold text-slate-900">State</h2>
+      <span id="stinfo" class="text-xs text-slate-500"></span>
+    </div>
+    <p class="text-xs text-slate-500 mb-3">The state s<sub>t</sub> after this token (it addresses the read; s<sub>t-1</sub> addresses the write): each token's share &lang;s<sub>t</sub>, c<sub>j</sub>&rang; / |s<sub>t</sub>|<sup>2</sup>, c<sub>j</sub> = &gamma; &lambda;<sup>t-j</sup> R<sup>t-j</sup> u<sub>j</sub>. Purple adds, red cancels (rotated out of phase).</p>
+    <div id="state" class="leading-7 text-[14px]"></div>
+  </section>
+</main>
+
+<script>
+const D = /*__DATA__*/null;
+const S = D.S, NL = D.NL;
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const q = v => JSON.stringify(v);
+const br = t => t.endsWith("\\n") ? "<br>" : "";  // a token ending in a newline: break the line after it
+const pct = v => (100 * v).toFixed(v >= 0.1 ? 0 : 1) + "%";
+
+let T, N, Wd, L, cur = 0, lay = 0, bank = 0, hmode = "read share";
+let Wt, WS, Rt, Z, RS, ORDER, SLOT, MU;  // per text and layer: w, r (N x S), mass z, read share, banks by half-life
+const fmt = v => v === 0 ? "0" : Math.abs(v) >= 1e-3 ? v.toFixed(4) : v.toExponential(2);
+const W = (t, b) => Wt[t * S + b], R = (t, b) => Rt[t * S + b];
+const start = t => { let b = t; while (b > 0 && !T.reset[b]) b--; return b; };
+
+document.getElementById("doc").innerHTML = D.docs.map((t, d) => `<option value="${d}">${esc(t.name)} (${t.N} tokens)</option>`).join("");
+document.getElementById("layer").innerHTML = Array.from({ length: NL }, (_, n) => `<option value="${n}">layer ${n + 1}</option>`).join("");
+if (NL === 1) document.getElementById("layer").style.display = "none";
+const HMODES = ["write w", "read r", "read share", "mass z", "selected bank stores"];
+document.getElementById("hmodes").innerHTML = HMODES.map(m => `<button data-m="${m}" onclick="hmode='${m}';draw()" class="border border-slate-300 rounded-md px-2 py-0.5">${m}</button>`).join("");
+
+function prepare() {
+  L = T.layers[lay]; MU = D.mu[lay];
+  // the effective write beta_t w_tb (beta = the write gate, 1 without one); the softmax alone is WS
+  WS = Float64Array.from(L.w, v => Math.exp(v * 1e-3)); Rt = Float64Array.from(L.r, v => Math.exp(v * 1e-3));  // ln in 1e-3 units
+  Wt = WS.map((v, i) => v * L.wg[Math.floor(i / S)]);
+  Z = new Float64Array(N * S); RS = new Float64Array(N * S);
+  for (let t = 0; t < N; t++) {
+    let den = 0;
+    for (let b = 0; b < S; b++) {
+      const prev = t > 0 && !T.reset[t] ? Z[(t - 1) * S + b] : 0;
+      Z[t * S + b] = MU[b] * prev + (1 - MU[b]) * W(t, b);
+      den += R(t, b) * Z[t * S + b];
+    }
+    for (let b = 0; b < S; b++) RS[t * S + b] = R(t, b) * Z[t * S + b] / Math.max(den, 1e-30);
+  }
+  ORDER = Array.from({ length: S }, (_, b) => b).sort((a, b) => D.hl[lay][a] - D.hl[lay][b]);
+  SLOT = new Int32Array(S); ORDER.forEach((b, s) => SLOT[b] = s);
+  const used = b => { let m = 0; for (let t = 0; t < N; t++) m += RS[t * S + b]; return m / N; };
+  document.getElementById("banksel").innerHTML = ORDER.map(b => `<option value="${b}">bank ${b} - half-life ${D.hl[lay][b].toFixed(1)} - read share ${pct(used(b))}</option>`).join("");
+  STACK = {};
+}
+let STACK = {};
+function stepBank(d) { bank = ORDER[Math.max(0, Math.min(S - 1, SLOT[bank] + d))]; draw(); }
+function pick(d) {
+  T = D.docs[d]; N = T.N; Wd = T.words; prepare();
+  let best = 0, bm = -1;  // start on the bank the reads use most
+  for (let b = 0; b < S; b++) { let m = 0; for (let t = 0; t < N; t++) m += RS[t * S + b]; if (m > bm) { bm = m; best = b; } }
+  bank = best; go(Math.min(cur, N - 1));
+}
+function setLayer(n) { lay = n; prepare(); draw(); }
+
+function canvas(el, h) {
+  const r = window.devicePixelRatio || 1, w = el.clientWidth;
+  el.width = w * r; el.height = h * r; el.style.height = h + "px"; el.style.width = "100%";
+  const c = el.getContext("2d"); c.setTransform(r, 0, 0, r, 0, 0); c.clearRect(0, 0, w, h); c.font = "10px sans-serif";
+  return [c, w, h];
+}
+
+// token j's contribution to bank b after token t: (1 - mu_b) mu_b^(t-j) w_jb
+const contrib = (t, j, b) => (1 - MU[b]) * Math.pow(MU[b], t - j) * W(j, b);
+function attention(t) {  // a_tj for j = b0..t, and per j the bank split
+  const b0 = start(t), num = new Float64Array(N);
+  let den = 0; for (let b = 0; b < S; b++) den += R(t, b) * Z[t * S + b];
+  const pw = new Float64Array(S).fill(1);
+  for (let j = t; j >= b0; j--) {
+    let s = 0; for (let b = 0; b < S; b++) { s += R(t, b) * (1 - MU[b]) * pw[b] * W(j, b); pw[b] *= MU[b]; }
+    num[j] = s / Math.max(den, 1e-12);  // the model clamps the mass at 1e-12: a nearly empty memory reads less
+  }
+  return [num, b0, den];
+}
+function viaBanks(t, j, den) {
+  const parts = []; for (let b = 0; b < S; b++) parts.push([R(t, b) * contrib(t, j, b) / den, b]);
+  parts.sort((a, b) => b[0] - a[0]);
+  return parts;
+}
+const shade = (v, m, col) => { const a = Math.min(1, Math.abs(v) / m) * 0.85; return [`rgba(${col},${a.toFixed(3)})`, a]; };
+const bankName = b => `bank ${b} (half-life ${D.hl[lay][b].toFixed(1)})`;
+
+let ATT;
+function drawRead() {
+  const [a, b0, den] = attention(cur); ATT = [a, den];
+  let m = 1e-9; for (let j = b0; j <= cur; j++) m = Math.max(m, a[j]);
+  let ent = 0; for (let b = 0; b < S; b++) { const r = R(cur, b); if (r > 0) ent -= r * Math.log(r); }
+  const g = L.g[cur];
+  const gates = (L.ka ? `h = ${L.ka[cur].toFixed(3)} state + ${g.toFixed(3)} read` : `read gate g = ${g.toFixed(3)}`)
+    + (L.a2 ? `; y = ${L.a2[cur].toFixed(3)} input + ${L.g2[cur].toFixed(3)} MLP` : "");
+  document.getElementById("readinfo").textContent = `${gates}; read softmax spans ~${Math.exp(ent).toFixed(1)} banks; largest token weight ${pct(m)}`;
+  document.getElementById("att").innerHTML = Wd.map((t, j) => {
+    if (j > cur) return `<span class="text-slate-300">${esc(t)}</span>${br(t)}`;
+    if (j < b0) return `<span class="text-slate-400">${esc(t)}</span>${br(t)}`;
+    const [bg, al] = shade(a[j], m, "109,40,217");
+    const via = viaBanks(cur, j, den).slice(0, 3).filter(p => p[0] > 0.02 * a[j]).map(p => `bank ${p[1]} hl ${D.hl[lay][p[1]].toFixed(0)}: ${pct(p[0] / Math.max(a[j], 1e-30))}`).join(", ");
+    return `<span title="${esc(`weight ${pct(a[j])} (gated ${pct(a[j] * g)}); via ${via}`)}" onclick="selectVia(${j})" class="cursor-pointer rounded-sm ${j === cur ? "outline outline-2 outline-slate-900" : ""}" style="background:${bg};color:${al > 0.5 ? "#fff" : "inherit"}">${esc(t)}</span>${br(t)}`;
+  }).join("");
+  const p = cur + 1 < N ? `next: ${T.top[cur].map((t, c) => `${esc(q(t))} ${pct(T.prob[cur * 5 + c])}`).join(", ")}` : "";
+  const dec = L.dec[cur].map((t, c) => `${esc(q(t))} ${L.decv[cur * 5 + c].toFixed(2)}`).join(", ");
+  document.getElementById("pred").innerHTML = `<span class="font-medium">model predicts</span> ${p}<br><span class="font-medium">read looks like the value of</span> ${dec} <span class="text-slate-400">(cosine of the read with each token's own value W<sub>v</sub> u)</span>`;
+}
+function selectVia(j) { bank = viaBanks(cur, j, ATT[1])[0][1]; draw(); }
+
+const median = a => { const s = Array.from(a).sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+function drawBanks() {
+  const [c, w, h] = canvas(document.getElementById("cbanks"), 220);
+  const pl = 6, pr = 6, mid = h / 2, bw = (w - pl - pr) / S, H = mid - 14;
+  const WSc = b => WS[cur * S + b];
+  let mw = 1e-9, mr = 1e-9; for (let b = 0; b < S; b++) { mw = Math.max(mw, WSc(b)); mr = Math.max(mr, RS[cur * S + b], R(cur, b)); }
+  ORDER.forEach((b, s) => {
+    const x = pl + s * bw, on = b === bank;
+    c.fillStyle = on ? "#0f172a" : "#4e79a7"; const hw = H * WSc(b) / mw; c.fillRect(x + bw * 0.1, mid - hw, bw * 0.8, hw);
+    c.fillStyle = on ? "#0f172a" : "#6d28d9"; const hr = H * RS[cur * S + b] / mr; c.fillRect(x + bw * 0.1, mid, bw * 0.8, hr);
+    c.strokeStyle = "#94a3b8"; c.lineWidth = 0.7; c.strokeRect(x + bw * 0.1, mid, bw * 0.8, H * R(cur, b) / mr);
+  });
+  c.strokeStyle = "#cbd5e1"; c.beginPath(); c.moveTo(pl, mid); c.lineTo(w - pr, mid); c.stroke();
+  c.fillStyle = "#64748b"; c.textAlign = "left";
+  c.fillText(`write softmax w (max ${mw.toFixed(3)})`, pl, 10);
+  c.fillText(`read share (max ${mr.toFixed(3)})`, pl, h - 2);
+  c.textAlign = "right";
+  [0.25, 0.5, 0.75, 1].forEach(f => { const s = Math.min(S - 1, Math.floor(f * S)); c.fillText(`hl ${D.hl[lay][ORDER[s]].toFixed(0)}`, Math.min(w - pr, pl + (s + 0.5) * bw + 12), 10); });
+  let ew = 0; for (let b = 0; b < S; b++) { const v = WSc(b); if (v > 0) ew -= v * Math.log(v); }
+  const top = ORDER.slice().sort((a, b) => RS[cur * S + b] - RS[cur * S + a]).slice(0, 4).map(b => `${b} ${pct(RS[cur * S + b])}`).join(", ");
+  const topw = ORDER.slice().sort((a, b) => WSc(b) - WSc(a)).slice(0, 4).map(b => `${b} ${pct(WSc(b))}`).join(", ");
+  const wgate = D.write_gate ? `write gate ${fmt(L.wg[cur])} (${(L.wg[cur] / median(L.wg)).toFixed(2)}x the text's median); ` : "";
+  document.getElementById("bankinfo").textContent = (T.reset[cur] ? "marker: memory restarts; " : "") + wgate + `softmax spreads over ~${Math.exp(ew).toFixed(1)} banks (top: ${topw}); read from: ${top}`;
+}
+document.getElementById("cbanks").addEventListener("click", e => {
+  const el = e.currentTarget, s = Math.floor((e.offsetX - 6) / ((el.clientWidth - 12) / S));
+  if (s >= 0 && s < S) { bank = ORDER[s]; draw(); }
+});
+document.getElementById("cbanks").addEventListener("mousemove", e => {
+  const el = e.currentTarget, s = Math.floor((e.offsetX - 6) / ((el.clientWidth - 12) / S));
+  if (s >= 0 && s < S) { const b = ORDER[s]; el.title = `${bankName(b)}: write softmax ${WS[cur * S + b].toFixed(4)}, effective write ${fmt(W(cur, b))}, read softmax ${R(cur, b).toFixed(4)}, read share ${pct(RS[cur * S + b])}, mass z ${fmt(Z[cur * S + b])}`; }
+});
+
+function heatValue(t, b, store) {
+  if (hmode === "write w") return W(t, b);
+  if (hmode === "read r") return R(t, b);
+  if (hmode === "read share") return RS[t * S + b];
+  if (hmode === "mass z") return Z[t * S + b];
+  return b === bank ? (store[t] || 0) : 0;
+}
+function drawHeat() {
+  document.querySelectorAll("#hmodes button").forEach(el => el.className = `border rounded-md px-2 py-0.5 ${el.dataset.m === hmode ? "bg-slate-800 text-white border-slate-800" : "border-slate-300"}`);
+  const store = hmode === "selected bank stores" ? bankStore(cur, bank)[0] : null;
+  if (store) {  // one row is too thin: show the selected bank's store as a full-height band
+    const [c, w, h] = canvas(document.getElementById("cheat"), 60);
+    let m = 1e-9; for (let j = 0; j < N; j++) m = Math.max(m, store[j] || 0);
+    const cw = w / N; for (let j = 0; j < N; j++) { c.fillStyle = `rgba(109,40,217,${Math.sqrt((store[j] || 0) / m).toFixed(3)})`; c.fillRect(j * cw, 0, Math.ceil(cw), h); }
+    c.setLineDash([3, 3]); c.strokeStyle = "#0f172a"; c.beginPath(); c.moveTo((cur + 0.5) * cw, 0); c.lineTo((cur + 0.5) * cw, h); c.stroke(); c.setLineDash([]);
+    document.getElementById("hinfo").textContent = `${bankName(bank)} after token ${cur + 1}`;
+    return;
+  }
+  const H = Math.max(S * 3, 256);
+  const [c, w, h] = canvas(document.getElementById("cheat"), H);
+  let m = 1e-9; for (let t = 0; t < N; t++) for (let b = 0; b < S; b++) m = Math.max(m, heatValue(t, b));
+  const img = new ImageData(N, S);
+  for (let t = 0; t < N; t++) for (let s = 0; s < S; s++) {
+    const v = Math.sqrt(heatValue(t, ORDER[s]) / m), k = (s * N + t) * 4;
+    img.data[k] = 255 - v * 200; img.data[k + 1] = 255 - v * 215; img.data[k + 2] = 255 - v * 40; img.data[k + 3] = 255;
+  }
+  const off = document.createElement("canvas"); off.width = N; off.height = S; off.getContext("2d").putImageData(img, 0, 0);
+  c.imageSmoothingEnabled = false; c.drawImage(off, 0, 0, w, h);
+  const cw = w / N, rh = h / S;
+  c.setLineDash([3, 3]); c.strokeStyle = "#0f172a"; c.lineWidth = 1;
+  c.beginPath(); c.moveTo((cur + 0.5) * cw, 0); c.lineTo((cur + 0.5) * cw, h); c.stroke();
+  c.beginPath(); c.moveTo(0, (SLOT[bank] + 0.5) * rh); c.lineTo(w, (SLOT[bank] + 0.5) * rh); c.stroke(); c.setLineDash([]);
+  document.getElementById("hinfo").textContent = `max ${fmt(m)}`;
+}
+const heatEl = document.getElementById("cheat");
+heatEl.addEventListener("click", e => {
+  const t = Math.floor(e.offsetX / (heatEl.clientWidth / N)), s = Math.floor(e.offsetY / (heatEl.clientHeight / S));
+  if (hmode !== "selected bank stores" && s >= 0 && s < S) bank = ORDER[s];
+  go(t);
+});
+heatEl.addEventListener("mousemove", e => {
+  const t = Math.max(0, Math.min(N - 1, Math.floor(e.offsetX / (heatEl.clientWidth / N)))), s = Math.max(0, Math.min(S - 1, Math.floor(e.offsetY / (heatEl.clientHeight / S))));
+  heatEl.title = hmode === "selected bank stores" ? `${q(Wd[t])}` : `${q(Wd[t])} (token ${t + 1}), ${bankName(ORDER[s])}: ${hmode} ${fmt(heatValue(t, ORDER[s]))}`;
+});
+
+function bankStore(t, b) {  // shares of bank b after token t
+  const b0 = start(t), z = Z[t * S + b], sh = new Float64Array(N);
+  let pw = 1; for (let j = t; j >= b0; j--) { sh[j] = (1 - MU[b]) * pw * W(j, b) / Math.max(z, 1e-30); pw *= MU[b]; }
+  return [sh, b0];
+}
+function drawBank() {
+  const b = bank, [sh, b0] = bankStore(cur, b);
+  document.getElementById("btitle").textContent = `Selected: ${bankName(b)}`;
+  document.getElementById("binfo").textContent = `init half-life ${D.hl0[b].toFixed(1)}, mu ${MU[b].toFixed(4)}; at this token: write softmax ${WS[cur * S + b].toFixed(4)}, effective write ${fmt(W(cur, b))}, read softmax ${R(cur, b).toFixed(4)}, read share ${pct(RS[cur * S + b])}, mass z ${fmt(Z[cur * S + b])}`;
+  let m = 1e-9; for (let j = b0; j <= cur; j++) m = Math.max(m, sh[j]);
+  document.getElementById("store").innerHTML = Wd.map((t, j) => {
+    if (j > cur) return `<span class="text-slate-300">${esc(t)}</span>${br(t)}`;
+    if (j < b0) return `<span class="text-slate-400">${esc(t)}</span>${br(t)}`;
+    const [bg, al] = shade(sh[j], m, "109,40,217");
+    return `<span title="${esc(`share ${pct(sh[j])}; written with w = ${WS[j * S + b].toFixed(4)}, gate ${fmt(L.wg[j])}`)}" onclick="go(${j})" class="cursor-pointer rounded-sm ${j === cur ? "outline outline-2 outline-slate-900" : ""}" style="background:${bg};color:${al > 0.5 ? "#fff" : "inherit"}">${esc(t)}</span>${br(t)}`;
+  }).join("");
+  // what the read took through this bank: r_tb c_jb / den, c_jb = share_j z_b
+  const k = R(cur, b) * Z[cur * S + b] / Math.max(ATT[1], 1e-30), [att] = ATT;
+  let mr = 1e-12; for (let j = b0; j <= cur; j++) mr = Math.max(mr, k * sh[j]);
+  const gate = L.g[cur];
+  document.getElementById("rbinfo").textContent = `this bank gives ${pct(k)} of the read (gate ${gate.toFixed(2)}: ${pct(k * gate)} of the read added to the state); colors scaled to its largest token, ${pct(mr)} of the read`;
+  document.getElementById("rbank").innerHTML = Wd.map((t, j) => {
+    if (j > cur) return `<span class="text-slate-300">${esc(t)}</span>${br(t)}`;
+    if (j < b0) return `<span class="text-slate-400">${esc(t)}</span>${br(t)}`;
+    const v = k * sh[j], [bg, al] = shade(v, mr, "21,128,61");
+    return `<span title="${esc(`${pct(v)} of the read through this bank (of this token's ${pct(att[j])} total)`)}" onclick="go(${j})" class="cursor-pointer rounded-sm ${j === cur ? "outline outline-2 outline-slate-900" : ""}" style="background:${bg};color:${al > 0.5 ? "#fff" : "inherit"}">${esc(t)}</span>${br(t)}`;
+  }).join("");
+  const [c, w, h] = canvas(document.getElementById("cbank"), 160);
+  const pl = 52, pr = 40, pt = 6, pb = 16, X = i => pl + i / Math.max(N - 1, 1) * (w - pl - pr);
+  // write and mass on their own max (left labels); the read share is a fraction: fixed 0..1 (right label)
+  const series = [[t => W(t, b), "#4e79a7", 0], [t => Z[t * S + b], "#0f172a", 0], [t => RS[t * S + b], "#6d28d9", 1]];
+  c.strokeStyle = "#e2e8f0"; c.strokeRect(pl, pt, w - pl - pr, h - pt - pb);
+  series.forEach(([f, col, fixed], k) => {
+    let mx = 1e-30; for (let t = 0; t < N; t++) mx = Math.max(mx, f(t));
+    if (fixed) mx = 1;
+    const Y = v => pt + (1 - v / mx) * (h - pt - pb);
+    if (k === 0) { c.fillStyle = "rgba(78,121,167,0.55)"; const bw = Math.max(1, (w - pl - pr) / N * 0.8); for (let t = 0; t < N; t++) c.fillRect(X(t) - bw / 2, Y(f(t)), bw, Y(0) - Y(f(t))); }
+    else { c.beginPath(); for (let t = 0; t < N; t++) (t ? c.lineTo : c.moveTo).call(c, X(t), Y(f(t))); c.strokeStyle = col; c.lineWidth = 1.3; c.stroke(); }
+    c.fillStyle = col;
+    if (fixed) { c.textAlign = "left"; c.fillText("100%", w - pr + 3, pt + 8); c.fillText("0%", w - pr + 3, h - pb); }
+    else { c.textAlign = "right"; c.fillText(fmt(mx), pl - 3, pt + 8 + k * 11); }
+  });
+  for (let t = 0; t < N; t++) if (T.reset[t]) { c.fillStyle = "#e15759"; c.fillRect(X(t) - 0.5, pt, 1, h - pt - pb); }
+  c.beginPath(); c.moveTo(X(cur), pt); c.lineTo(X(cur), h - pb); c.strokeStyle = "#0f172a"; c.setLineDash([3, 3]); c.stroke(); c.setLineDash([]);
+  c.fillStyle = "#64748b"; c.textAlign = "center"; c.fillText("1", X(0), h - 3); c.fillText(String(N), X(N - 1), h - 3);
+}
+
+// stacked shares over time: sh[t][j] (each row sums to 1 within the document), the 12 tokens with the largest peaks colored
+const PAL = ["#e15759", "#4e79a7", "#59a14f", "#f28e2b", "#b07aa1", "#9c755f", "#76b7b2", "#edc948", "#ff9da7", "#1f77b4", "#8c564b", "#17becf"];
+function stackFrom(rowFn) {
+  const sh = Array.from({ length: N }, () => new Float32Array(N)), peak = new Float64Array(N);
+  for (let t = 0; t < N; t++) {
+    const [s, b0] = rowFn(t);
+    for (let j = b0; j <= t; j++) { sh[t][j] = s[j]; peak[j] = Math.max(peak[j], s[j]); }
+  }
+  const top = Array.from({ length: N }, (_, j) => j).filter(j => peak[j] > 0.02).sort((x, y) => peak[y] - peak[x]).slice(0, PAL.length).sort((x, y) => x - y);
+  return { sh, top, color: new Map(top.map((j, k) => [j, PAL[k]])) };
+}
+// bank b's contents: (1 - mu_b) mu_b^(t-j) w_jb / z_b(t);  the read: attention a_tj
+const stackOf = b => STACK[b] || (STACK[b] = stackFrom(t => bankStore(t, b)));
+const readStack = () => STACK.read || (STACK.read = stackFrom(t => { const [a, b0] = attention(t); return [a, b0]; }));
+function drawStackChart(id, legendId, st, empty) {
+  const [c, w, h] = canvas(document.getElementById(id), 200);
+  const pl = 34, pr = 6, pt = 4, pb = 16, cw = (w - pl - pr) / N, Y = v => pt + (1 - v) * (h - pt - pb);
+  for (let t = 0; t < N; t++) {
+    let acc = 0;
+    for (const j of st.top) { const v = st.sh[t][j]; if (v > 0) { c.fillStyle = st.color.get(j); c.fillRect(pl + t * cw, Y(acc + v), Math.ceil(cw), Y(acc) - Y(acc + v)); acc += v; } }
+    let rest = 0; for (let j = 0; j <= t; j++) rest += st.sh[t][j];
+    rest -= acc; if (rest > 1e-4) { c.fillStyle = "#cbd5e1"; c.fillRect(pl + t * cw, Y(acc + rest), Math.ceil(cw), Y(acc) - Y(acc + rest)); }
+  }
+  c.fillStyle = "#64748b"; c.textAlign = "right"; ["0%", "50%", "100%"].forEach((s, k) => c.fillText(s, pl - 3, Y(k / 2) + 3));
+  c.textAlign = "center"; c.fillText("1", pl + cw / 2, h - 3); c.fillText(String(N), pl + (N - 0.5) * cw, h - 3);
+  for (let t = 0; t < N; t++) if (T.reset[t]) { c.fillStyle = "#0f172a"; c.fillRect(pl + t * cw, pt, 1, h - pt - pb); }
+  c.beginPath(); c.moveTo(pl + (cur + 0.5) * cw, pt); c.lineTo(pl + (cur + 0.5) * cw, h - pb); c.strokeStyle = "#0f172a"; c.setLineDash([3, 3]); c.stroke(); c.setLineDash([]);
+  document.getElementById(legendId).innerHTML = st.top.length ? st.top.map(j =>
+    `<span onclick="go(${j})" class="cursor-pointer inline-block mr-3 whitespace-nowrap"><span class="inline-block w-3 h-3 rounded-sm align-middle" style="background:${st.color.get(j)}"></span> ${esc(q(Wd[j]))} <span class="text-slate-400">@${j + 1}, now ${pct(st.sh[cur][j])}</span></span>`).join("")
+    : `<span class="text-slate-400">${empty}</span>`;
+}
+function drawStack() {
+  drawStackChart("cstack", "slegend", stackOf(bank), "no token ever holds more than 2% of this bank");
+  drawStackChart("cread", "rlegend", readStack(), "no token ever gets more than 2% of the read");
+}
+for (const [id, get] of [["cstack", () => stackOf(bank)], ["cread", readStack]]) {
+  const el = document.getElementById(id);
+  const tAt = e => Math.max(0, Math.min(N - 1, Math.floor((e.offsetX - 34) / ((el.clientWidth - 40) / N))));
+  el.addEventListener("click", e => go(tAt(e)));
+  el.addEventListener("mousemove", e => {
+    const t = tAt(e), row = get().sh[t];
+    const top = Array.from(row.keys()).filter(j => row[j] > 0).sort((x, y) => row[y] - row[x]).slice(0, 6);
+    el.title = `after ${q(Wd[t])} (token ${t + 1}): ` + top.map(j => `${q(Wd[j])}@${j + 1} ${pct(row[j])}`).join(", ");
+  });
+}
+
+function drawState() {
+  const sh = L.state[cur], b0 = cur - sh.length + 1;
+  let m = 1e-9; for (const v of sh) m = Math.max(m, Math.abs(v));
+  document.getElementById("stinfo").textContent = `state half-life ${D.lam_hl[lay].toFixed(2)} tokens`;
+  document.getElementById("state").innerHTML = Wd.map((t, j) => {
+    if (j > cur) return `<span class="text-slate-300">${esc(t)}</span>${br(t)}`;
+    if (j < b0) return `<span class="text-slate-400">${esc(t)}</span>${br(t)}`;
+    const v = sh[j - b0], [bg, al] = shade(v, m, v >= 0 ? "109,40,217" : "220,38,38");
+    return `<span title="${(v / 10).toFixed(1)}%" onclick="go(${j})" class="cursor-pointer rounded-sm ${j === cur ? "outline outline-2 outline-slate-900" : ""}" style="background:${bg};color:${al > 0.5 ? "#fff" : "inherit"}">${esc(t)}</span>${br(t)}`;
+  }).join("");
+}
+
+const lossColor = v => `hsl(${(120 * (1 - Math.min(1, v / +document.getElementById("cap").value))).toFixed(0)},75%,78%)`;
+function drawLoss() {
+  let sum = 0, n = 0;
+  document.getElementById("loss").innerHTML = Wd.map((t, j) => {
+    const u = T.gen !== undefined && j >= T.gen ? " underline" : "";
+    if (j === 0 || !T.valid[j - 1] || !T.tgt[j]) return `<span class="text-slate-400${u}" onclick="go(${Math.max(0, j - 1)})">${esc(t)}</span>${br(t)}`;
+    const v = T.loss[j - 1]; sum += v; n++;
+    const tip = `loss ${v.toFixed(2)} nats, p = ${pct(T.pact[j - 1])}; model said ${T.top[j - 1][0]} (${pct(T.prob[(j - 1) * 5])})`;
+    return `<span title="${esc(tip)}" onclick="go(${j - 1})" class="cursor-pointer rounded-sm${u} ${j === cur + 1 ? "outline outline-2 outline-slate-900" : ""}" style="background:${lossColor(v)}">${esc(t)}</span>${br(t)}`;
+  }).join("");
+  document.getElementById("lossinfo").textContent = n ? `mean ${(sum / n).toFixed(3)} nats over the ${n} predicted tokens` : "";
+  document.getElementById("note").textContent = T.note || "";
+}
+function drawHeader() {
+  document.getElementById("now").textContent = q(Wd[cur]);
+  document.getElementById("next").textContent = cur + 1 < N ? `predicts ${q(T.top[cur][0])} (${pct(T.prob[cur * 5])}), actual ${q(Wd[cur + 1])} (${pct(T.pact[cur])})${T.reset[cur] ? "  (memory reset)" : ""}` : "";
+  document.getElementById("stepl").textContent = `token ${cur + 1} / ${N}`;
+}
+
+function draw() { document.getElementById("banksel").value = bank; drawHeader(); drawLoss(); drawRead(); drawBanks(); drawHeat(); drawBank(); drawStack(); drawState(); }
+function go(i) { cur = Math.max(0, Math.min(N - 1, i)); draw(); }
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === "ArrowLeft") go(cur - 1); if (e.key === "ArrowRight") go(cur + 1);
+  if (e.key === "ArrowUp") { e.preventDefault(); stepBank(1); } if (e.key === "ArrowDown") { e.preventDefault(); stepBank(-1); }
+});
+window.addEventListener("resize", draw);
+// open a given text / token / bank: page.html#doc=0&t=79&bank=12
+const H0 = Object.fromEntries(location.hash.slice(1).split("&").filter(Boolean).map(p => p.split("=")));
+const d0 = Math.min(D.docs.length - 1, +(H0.doc || 0));
+document.getElementById("doc").value = d0; cur = +(H0.t || 0); pick(d0);
+if (H0.bank !== undefined) { bank = +H0.bank; draw(); }
+</script>
+</body>
+</html>

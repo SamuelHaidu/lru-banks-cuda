@@ -1,0 +1,300 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Token prior, forgetting and repetition saturation on a shared kernel: idea sketch</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; max-width: 1250px; color: #222; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .formula { font-family: monospace; background: #f4f4f6; padding: 10px 14px; border-radius: 6px; margin: 10px 0; line-height: 1.6; }
+  .row { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; margin: 12px 0; }
+  label { font-size: 13px; color: #555; margin-right: 10px; }
+  textarea { width: 100%; font-size: 15px; padding: 6px; box-sizing: border-box; height: 54px; }
+  .tokens { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .tok { border: 1px solid #ccc; border-radius: 6px; padding: 4px 6px; text-align: center; min-width: 58px; }
+  .tok .w { font-size: 15px; font-weight: 600; }
+  .tok .k { font-size: 11px; color: #888; }
+  .tok input { width: 54px; font-size: 12px; display: block; margin: 1px auto 0; }
+  .tok .lab { font-size: 10px; color: #999; }
+  .heat span { padding: 2px 3px; margin: 1px; border-radius: 3px; display: inline-block; font-size: 17px; }
+  .note { font-size: 13px; color: #555; line-height: 1.55; }
+  .ctrl { display: grid; grid-template-columns: 150px 220px 60px; gap: 4px 10px; align-items: center; font-size: 13px; }
+  button { font-size: 13px; padding: 5px 10px; margin: 2px 6px 2px 0; }
+  button.on { background: #333; color: #fff; }
+  .scen { font-size: 13px; color: #333; background: #fff8e6; border-left: 3px solid #f0b400; padding: 6px 10px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>Token prior, per-token forgetting and repetition saturation</h1>
+<div class="note">Predicting the token after the last word; distance k = 1 is the last word. Every vocabulary token has three
+learned numbers: a prior <b>s</b>, a forgetting rate <b>&lambda;</b>, and a saturation <b>&kappa;</b> for repeated mentions.
+Equal words share their numbers.</div>
+<div class="formula">
+  h = &Sigma;<sub>j</sub> <b>s<sub>t</sub></b> &middot; <b>&delta;<sub>t</sub>(n<sub>j</sub>)</b> &middot; <b>f(k; &lambda;<sub>t</sub>)</b> &middot; R<sub>k</sub> e<sub>t</sub>
+  &nbsp;&nbsp;&nbsp;(t = token at position j, k = its distance, n<sub>j</sub> = which mention of t it is: 1st, 2nd, ...)<br>
+  <b>forgetting</b> (shared kernel w = env &middot; osc, &#373; = env(k)/env(1)): log-mix f = env(1) &#373;(k)<sup>&lambda;</sup> osc(k) &nbsp;|&nbsp; linear mix f = env(1) [(1-&lambda;) + &lambda; &#373;(k)] osc(k)<br>
+  &nbsp;&nbsp;&lambda; = 1: forgets like the shared kernel; &lambda; = 0: constant presence. Never stronger in the past than when it appeared.<br>
+  <b>saturation</b> (order-based, "option B"): the n-th mention gets &delta;(n) = g(n) - g(n-1), so n mentions add up to g(n), bounded<br>
+  &nbsp;&nbsp;BM25: g(n) = n (1 + &kappa;) / (n + &kappa;) &nbsp;&rarr; g(1) = 1, g(&infin;) = 1 + &kappa;
+  &nbsp;&nbsp;|&nbsp;&nbsp; power: g(n) = n<sup>&alpha;</sup> &nbsp;(&alpha; = 1 additive, &alpha; = 0 only the first mention counts)<br>
+  optional: divide by the total weight (weighted average)
+</div>
+
+<div class="panel">
+  <b>Ready-made scenarios</b>
+  <div id="scenbtns" style="margin-top:6px"></div>
+  <div class="scen" id="scendesc"></div>
+</div>
+
+<div class="panel">
+  <label>Context text (split on words and punctuation; edit freely)</label>
+  <textarea id="text"></textarea>
+  <div style="margin-top:6px">
+    <label>forgetting mix <select id="mix" onchange="draw()">
+      <option value="log">log-mix &#373;^&lambda;</option>
+      <option value="lin">linear mix (1-&lambda;) + &lambda;&#373;</option></select></label>
+    <label>saturation <select id="sat" onchange="buildTokens(); draw()">
+      <option value="bm25">BM25 g(n) = n(1+&kappa;)/(n+&kappa;)</option>
+      <option value="power">power g(n) = n^&alpha;</option>
+      <option value="off">off (additive)</option></select></label>
+    <label><input type="checkbox" id="normalize" onchange="draw()"> normalize (weighted average)</label>
+  </div>
+  <div class="tokens" id="tokens"></div>
+</div>
+
+<div class="row">
+  <div class="panel" style="flex:1; min-width:360px">
+    <b>Shared distance curve w(k)</b>
+    <div class="ctrl" style="margin-top:8px">
+      <span>shape</span>
+      <select id="shape" onchange="draw()">
+        <option value="power">power law k^-p</option>
+        <option value="exp">damped oscillator e^-k/&tau; cos(&omega;k)</option>
+        <option value="log">log oscillator k^-p cos(&gamma; log k)</option>
+      </select><span></span>
+      <span>p (power)</span><input type="range" id="p" min="0" max="2" step="0.01" value="0.84" oninput="draw()"><span id="pv"></span>
+      <span>&tau; (exp timescale)</span><input type="range" id="tau" min="1" max="60" step="0.5" value="12" oninput="draw()"><span id="tauv"></span>
+      <span>&omega; / &gamma; (frequency)</span><input type="range" id="freq" min="0" max="3" step="0.01" value="0.4" oninput="draw()"><span id="freqv"></span>
+    </div>
+  </div>
+  <div class="panel" style="flex:1; min-width:360px">
+    <b>Share of the context vector each token gets</b>
+    <div class="heat" id="heat" style="margin-top:8px; line-height:2"></div>
+    <div class="note" id="summary"></div>
+  </div>
+</div>
+
+<div class="panel"><div id="types" style="height:380px"></div>
+  <div class="note">Total weight per token type (all its mentions summed). Grey: additive, no saturation. Red: with saturation. The dotted marker is the saturation bound s &middot; g(&infin;) for BM25.</div></div>
+<div class="panel"><div id="chart" style="height:430px"></div></div>
+<div class="panel"><div id="life" style="height:420px"></div>
+  <div class="note">One mention followed as it ages: s &middot; f(k; &lambda;) at distance k. Thick lines: tokens with &lambda; &lt; 1 (slower forgetting). Dashed: the shared kernel w(k).</div></div>
+<div class="panel"><div id="share" style="height:330px"></div></div>
+
+<div class="panel note">
+  <b>Reading it</b><br>
+  - <b>Prior s</b> alone is a rescaled embedding (a linear model can absorb it); it matters with normalization or when the embedding is reused elsewhere.<br>
+  - <b>Forgetting &lambda;</b> depends on distance, so it is new expressivity: with a power law and log-mix each token gets its own exponent k<sup>-&lambda;p</sup>, between "constant" and the shared decay.<br>
+  - <b>Saturation &kappa;</b> bounds repetition: with BM25, a token's mentions can never add up to more than s(1+&kappa;) times one mention, however often it appears. Small &kappa;: one mention is enough (names). Large &kappa;: nearly additive (topic words).<br>
+  - Saturation here is <b>order-based</b>: the 1st mention keeps full weight and later mentions get less, even if the 1st is old. That is what makes it cheap (one number per position, like s), parallel and recurrent; the exact version (saturate on the decayed weights per query) costs an extra (T &times; S) &middot; (S &times; S) matmul.<br>
+  - Everything here is a weight per (context position, distance), independent of the query, so the whole thing is a parallel banded sum; the linear mix even splits into a cumulative sum plus the shared-kernel convolution.
+</div>
+
+<script>
+// ---------------------------------------------------------------- scenarios
+// p = prior s, l = lambda (forgetting), k = kappa (BM25) / alpha (power) per token. Unlisted tokens get DEFAULTS.
+const FUNC = { "the": [0.4, 1, 50], "a": [0.4, 1, 50], "and": [0.4, 1, 50], "to": [0.4, 1, 50], "was": [0.5, 1, 50], "in": [0.4, 1, 50],
+  "of": [0.4, 1, 50], "her": [0.5, 1, 50], "his": [0.5, 1, 50], "at": [0.4, 1, 50], "on": [0.4, 1, 50], "it": [0.5, 1, 50], "with": [0.4, 1, 50],
+  ".": [0.3, 1, 50], ",": [0.3, 1, 50], "she": [0.6, 1, 50], "She": [0.6, 1, 50], "he": [0.6, 1, 50], "He": [0.6, 1, 50], "Then": [0.5, 1, 50], "The": [0.4, 1, 50] };
+const SCENARIOS = {
+  all: {
+    name: "full story: all three effects",
+    desc: "<b>Lily</b> (s 1.2, &lambda; 0, &kappa; 0.5): a name, never forgotten, but its 6 mentions add up to at most 1.5x one mention (7.2 additive, 1.66 saturated). " +
+          "<b>kite</b> (s 1.6, &lambda; 1, &kappa; 50): important but recent-only: the old mention has faded, the recent one is strong, and repetition is not penalized. " +
+          "<b>Max</b> (s 1.1, &lambda; 0.4, &kappa; 1): medium memory, mild saturation. Function words: low prior, forget like the kernel.",
+    text: "Lily had a red kite . Lily ran up the hill with her dog Max . The wind was strong and the sky was blue . Lily laughed . Max barked at a bird in a tall tree . Lily waved to the bird . Then the wind pulled the kite high , and Lily held the string tight . Max sat down . Lily",
+    tok: { "Lily": [1.2, 0, 0.5], "kite": [1.6, 1, 50], "Max": [1.1, 0.4, 1], "bird": [1.0, 0.7, 2], "wind": [1.0, 0.8, 5], "string": [1.1, 1, 5] },
+  },
+  name: {
+    name: "a name is kept",
+    desc: "<b>Lily</b> appears once, 40 tokens back. With &lambda; = 0 it keeps its full weight while every other word fades with the kernel. Set its &lambda; to 1 to see it disappear into the past.",
+    text: "Lily went to the park . The sun was warm and the sky was blue . Birds sang in the tall green trees near the pond . A dog ran past and a boy flew a big kite over the hill . After a long walk , she sat on a bench and",
+    tok: { "Lily": [1.3, 0, 0.5], "kite": [1.0, 1, 10], "dog": [1.0, 1, 10], "park": [1.0, 0.8, 10] },
+  },
+  recent: {
+    name: "important only while recent",
+    desc: "<b>cake</b> has a high prior (1.8) but &lambda; = 1: it dominates when it is close (the last mention, k = 2) and the early mention has faded almost to nothing. " +
+          "&kappa; is large so the second mention is not discounted. Compare with <b>Mom</b> (&lambda; 0, kept from the start).",
+    text: "Mom made a cake for the party . Everyone sang and danced in the big room . The music was loud and the lights were bright . Children ran around the table and laughed . Then Tom saw the cake and",
+    tok: { "cake": [1.8, 1, 50], "Mom": [1.2, 0, 0.5], "Tom": [1.1, 0.5, 1], "party": [1.0, 0.8, 10], "music": [0.9, 1, 10] },
+  },
+  repeat: {
+    name: "many mentions are bounded",
+    desc: "<b>Lily</b> is mentioned 10 times. Additive (grey bar) it would carry 10x one mention; with BM25 &kappa; = 0.5 its total is capped near 1.5x (12.0 additive, 1.71 saturated). " +
+          "<b>ball</b> (&kappa; = 3) saturates more slowly; switch saturation to off to compare.",
+    text: "Lily saw a ball . Lily wanted the ball . Lily ran . Lily jumped . Lily laughed . Lily got the ball . Lily threw the ball . Lily smiled . Lily sat . Lily",
+    tok: { "Lily": [1.2, 0, 0.5], "ball": [1.2, 0.6, 3] },
+  },
+};
+const DEFAULT = [1.0, 1.0, 50];  // prior, lambda, kappa for words not listed
+
+let coef = {}, lamb = {}, kap = {};
+let currentScen = "all";
+
+function tokenize(s) { return s.match(/[A-Za-z']+|[0-9]+|[^\sA-Za-z0-9]/g) || []; }
+
+function scenario(name) {
+  currentScen = name;
+  const sc = SCENARIOS[name];
+  document.getElementById("text").value = sc.text;
+  document.getElementById("scendesc").innerHTML = sc.desc;
+  coef = {}; lamb = {}; kap = {};
+  const set = (t, v) => { coef[t] = v[0]; lamb[t] = v[1]; kap[t] = v[2]; };
+  Object.entries(FUNC).forEach(([t, v]) => set(t, v));
+  Object.entries(sc.tok).forEach(([t, v]) => set(t, v));
+  document.querySelectorAll("#scenbtns button").forEach(b => b.classList.toggle("on", b.dataset.s === name));
+  buildTokens(); draw();
+}
+
+// ---------------------------------------------------------------- model pieces
+function envOsc(k) {
+  const shape = document.getElementById("shape").value;
+  const p = +document.getElementById("p").value, tau = +document.getElementById("tau").value, f = +document.getElementById("freq").value;
+  if (shape === "power") return [Math.pow(k, -p), 1];
+  if (shape === "exp") return [Math.exp(-k / tau), Math.cos(f * k)];
+  return [Math.pow(k, -p), Math.cos(f * Math.log(k))];
+}
+function curve(k) { const [e, o] = envOsc(k); return e * o; }
+const S = t => (t in coef ? coef[t] : DEFAULT[0]);
+const L = t => (t in lamb ? lamb[t] : DEFAULT[1]);
+const K = t => (t in kap ? kap[t] : DEFAULT[2]);
+
+function forget(t, k) {  // f(k; lambda_t), prior excluded
+  const [e1] = envOsc(1), [e, o] = envOsc(k), wh = e / e1, l = L(t);
+  const m = document.getElementById("mix").value === "log" ? Math.pow(wh, l) : (1 - l) + l * wh;
+  return e1 * m * o;
+}
+function g(t, n) {  // cumulative saturation of n mentions
+  const mode = document.getElementById("sat").value;
+  if (mode === "off" || n <= 0) return Math.max(n, 0);
+  if (mode === "bm25") { const kk = Math.max(K(t), 1e-6); return n * (1 + kk) / (n + kk); }
+  return Math.pow(n, Math.min(Math.max(K(t), 0), 1));
+}
+const delta = (t, n) => g(t, n) - g(t, n - 1);
+function gInf(t) {
+  const mode = document.getElementById("sat").value;
+  return mode === "bm25" ? 1 + Math.max(K(t), 1e-6) : Infinity;
+}
+
+// ---------------------------------------------------------------- UI
+function buildTokens() {
+  const toks = tokenize(document.getElementById("text").value);
+  const box = document.getElementById("tokens"); box.innerHTML = "";
+  const satLabel = document.getElementById("sat").value === "power" ? "sat α" : "sat κ";
+  const seen = {};
+  toks.forEach((t, i) => {
+    seen[t] = (seen[t] || 0) + 1;
+    const d = document.createElement("div"); d.className = "tok";
+    d.innerHTML = `<div class="w">${t}</div><div class="k">k=${toks.length - i} &middot; #${seen[t]}</div>`;
+    const mk = (store, key, lab, def, clamp) => {
+      if (!(t in store)) store[t] = def;
+      const l = document.createElement("div"); l.className = "lab"; l.textContent = lab; d.appendChild(l);
+      const inp = document.createElement("input"); inp.type = "number"; inp.step = "0.1"; inp.value = store[t];
+      inp.dataset.t = t; inp.dataset.key = key;
+      inp.oninput = () => {
+        store[t] = clamp(+inp.value);
+        document.querySelectorAll(".tok input").forEach(x => { if (x.dataset.t === t && x.dataset.key === key) x.value = inp.value; });
+        draw();
+      };
+      d.appendChild(inp);
+    };
+    mk(coef, "s", "prior s", DEFAULT[0], v => v);
+    mk(lamb, "l", "forget λ", DEFAULT[1], v => Math.min(1, Math.max(0, v)));
+    mk(kap, "k", satLabel, DEFAULT[2], v => Math.max(0, v));
+    box.appendChild(d);
+  });
+}
+
+function draw() {
+  ["p", "tau", "freq"].forEach(id => document.getElementById(id + "v").textContent = document.getElementById(id).value);
+  const toks = tokenize(document.getElementById("text").value);
+  const n = toks.length, norm = document.getElementById("normalize").checked;
+  const ks = toks.map((_, i) => n - i);
+  const count = {}, nth = toks.map(t => (count[t] = (count[t] || 0) + 1));
+  const base = ks.map(curve);
+  const f = toks.map((t, i) => forget(t, ks[i]));
+  const dl = toks.map((t, i) => delta(t, nth[i]));
+  let raw = toks.map((t, i) => S(t) * f[i]);           // no saturation
+  let eff = raw.map((v, i) => v * dl[i]);               // with saturation
+  let plain = base.slice();
+  if (norm) {
+    const z = a => a.reduce((x, y) => x + y, 0) || 1;
+    const z1 = z(eff), z0 = z(plain), zr = z(raw);
+    eff = eff.map(v => v / z1); plain = plain.map(v => v / z0); raw = raw.map(v => v / zr);
+  }
+  const label = toks.map((t, i) => `${t} (k=${ks[i]}, #${nth[i]})`);
+
+  // per-position weights
+  Plotly.react("chart", [
+    { x: ks, y: plain, type: "bar", name: "shared kernel w(k)", marker: { color: "rgba(120,120,120,0.35)" }, text: label, hovertemplate: "%{text}<br>%{y:.3f}<extra>shared kernel</extra>" },
+    { x: ks, y: eff, type: "bar", name: "s · δ(n) · f(k; λ)", marker: { color: "#d6604d" }, text: label, hovertemplate: "%{text}<br>%{y:.3f}<extra>token weight</extra>" },
+  ], {
+    title: "Weight per context position: shared kernel vs prior x saturation x forgetting", barmode: "overlay",
+    xaxis: { title: "distance k (1 = last word)", autorange: "reversed", tickvals: ks, ticktext: toks.map((t, i) => `${t}<br>${ks[i]}`), tickfont: { size: 9 } },
+    yaxis: { title: "weight" }, legend: { orientation: "h", y: 1.12 }, margin: { t: 70 },
+  });
+
+  // per type totals
+  const types = [...new Set(toks)].filter(t => /[A-Za-z]/.test(t));
+  const sumBy = arr => types.map(t => toks.reduce((a, x, i) => a + (x === t ? arr[i] : 0), 0));
+  const totRaw = sumBy(raw), totEff = sumBy(eff);
+  const order = types.map((_, i) => i).sort((a, b) => totRaw[b] - totRaw[a]);
+  const bound = types.map(t => (norm ? null : S(t) * gInf(t) * forget(t, 1)));
+  Plotly.react("types", [
+    { x: order.map(i => `${types[i]} (x${count[types[i]]})`), y: order.map(i => totRaw[i]), type: "bar", name: "additive (no saturation)", marker: { color: "rgba(120,120,120,0.5)" } },
+    { x: order.map(i => `${types[i]} (x${count[types[i]]})`), y: order.map(i => totEff[i]), type: "bar", name: "with saturation", marker: { color: "#d6604d" } },
+    { x: order.map(i => `${types[i]} (x${count[types[i]]})`), y: order.map(i => (isFinite(bound[i]) ? bound[i] : null)), mode: "markers", name: "bound s·g(∞) (if all mentions were at k=1)", marker: { symbol: "line-ew-open", size: 18, color: "#333" } },
+  ], { title: "Total weight per token type (all mentions summed)", barmode: "group", legend: { orientation: "h", y: 1.15 }, margin: { t: 60, b: 80 } });
+
+  // lifetime of one mention
+  const A = Math.max(n, 80), dist = Array.from({ length: A }, (_, a) => a + 1);
+  const pal = ["#d6604d", "#4393c3", "#1a9850", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#666", "#e41a1c", "#377eb8", "#4daf4a", "#999"];
+  const content = types.filter(t => !(t in FUNC));
+  const life = content.map((t, j) => ({ x: dist, y: dist.map(k => S(t) * forget(t, k)), mode: "lines",
+    name: `${t} (s=${S(t)}, λ=${L(t)})`, line: { color: pal[j % pal.length], width: L(t) < 1 ? 3 : 1 } }));
+  life.push({ x: dist, y: dist.map(k => 0.4 * forget("the", k)), mode: "lines", name: "function word (s=0.4, λ=1)", line: { color: "#bbb", width: 1 } });
+  life.push({ x: dist, y: dist.map(curve), mode: "lines", name: "shared kernel w(k)", line: { color: "#000", dash: "dash", width: 2 } });
+  Plotly.react("life", life, { title: "One mention as it ages", xaxis: { title: "distance k", type: "log" },
+    yaxis: { title: "s · f(k; λ)", type: document.getElementById("shape").value === "power" ? "log" : "linear" }, legend: { font: { size: 11 } } });
+
+  // share
+  const tot = eff.reduce((a, b) => a + Math.abs(b), 0) || 1, tot0 = plain.reduce((a, b) => a + Math.abs(b), 0) || 1;
+  const share = eff.map(v => Math.abs(v) / tot), share0 = plain.map(v => Math.abs(v) / tot0);
+  Plotly.react("share", [
+    { x: label, y: share0, type: "bar", name: "shared kernel", marker: { color: "rgba(120,120,120,0.5)" } },
+    { x: label, y: share, type: "bar", name: "with token parameters", marker: { color: "#d6604d" } },
+  ], { title: "Share of total |weight| per position", barmode: "group", yaxis: { tickformat: ".0%" },
+       xaxis: { tickfont: { size: 9 } }, legend: { orientation: "h", y: 1.15 }, margin: { t: 60, b: 110 } });
+
+  const mx = Math.max(...share);
+  document.getElementById("heat").innerHTML = toks.map((t, i) => {
+    const a = share[i] / mx, col = eff[i] < 0 ? `rgba(67,147,195,${a})` : `rgba(214,96,77,${a})`;
+    return `<span style="background:${col}" title="s=${S(t)}, λ=${L(t)}, mention #${nth[i]} δ=${dl[i].toFixed(2)}, f=${f[i].toFixed(3)}, share ${(share[i] * 100).toFixed(1)}%">${t}</span>`;
+  }).join("");
+  const typeShare = types.map((t, i) => [Math.abs(totEff[i]) / types.reduce((a, _, j) => a + Math.abs(totEff[j]), 0), t]).sort((a, b) => b[0] - a[0]).slice(0, 5);
+  document.getElementById("summary").innerHTML = "Top token types: <b>" + typeShare.map(([v, t]) => `${t} ${(v * 100).toFixed(0)}%`).join(", ") +
+    "</b><br><span style='color:#888'>Hover a word for its numbers. red = positive, blue = negative weight; intensity = share.</span>";
+}
+
+// ---------------------------------------------------------------- init
+const sb = document.getElementById("scenbtns");
+Object.entries(SCENARIOS).forEach(([key, sc]) => {
+  const b = document.createElement("button"); b.textContent = sc.name; b.dataset.s = key; b.onclick = () => scenario(key); sb.appendChild(b);
+});
+document.getElementById("text").addEventListener("input", () => { buildTokens(); draw(); });
+scenario("all");
+</script>
+</body>
+</html>

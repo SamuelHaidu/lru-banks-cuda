@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token waves: binding by resonance</title>
+<style>
+  :root { --b: #e2e8f0; --t: #1e293b; --m: #64748b; --bg: #f8fafc; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--t); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  header { background: #fff; border-bottom: 1px solid var(--b); padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--m); font-size: 13px; max-width: 1100px; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--b); border-radius: 6px; }
+  .card h2 { margin: 0; padding: 9px 14px; border-bottom: 1px solid var(--b); font-size: 14px; display: flex; justify-content: space-between; align-items: baseline; }
+  .card h2 span { font-weight: 400; color: var(--m); font-size: 12px; }
+  .body { padding: 12px 14px; }
+  .full { grid-column: 1 / -1; }
+  .note { color: var(--m); font-size: 12px; margin: 6px 0 0; }
+  .tok { display: inline-block; margin: 3px 2px; padding: 3px 8px; border: 1px solid var(--b); border-radius: 4px; cursor: pointer; font-family: ui-monospace, monospace; font-size: 14px; user-select: none; background: #fff; color: #94a3b8; }
+  .tok.on { color: var(--t); border-color: currentColor; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+  .ctl { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .ctl label { color: var(--m); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
+  button:hover { background: #f1f5f9; }
+  button.act { background: #1e293b; color: #fff; border-color: #1e293b; }
+  .seg { display: inline-flex; border: 1px solid #cbd5e1; border-radius: 4px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; border-right: 1px solid #cbd5e1; }
+  .seg button:last-child { border-right: 0; }
+  canvas { width: 100%; display: block; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; margin-right: 14px; font-size: 12px; color: var(--m); }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .meter { display: grid; grid-template-columns: 9rem 1fr 4.5rem; gap: 6px 10px; align-items: center; font-size: 13px; }
+  .bar { height: 10px; background: #f1f5f9; border-radius: 2px; position: relative; overflow: hidden; }
+  .bar > div { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .big { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  code { background: #f1f5f9; padding: 0 4px; border-radius: 3px; font-size: 12.5px; }
+  .math { font-family: ui-serif, Georgia, serif; font-size: 15px; background: #f8fafc; border: 1px solid var(--b); border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Token waves: binding by resonance</h1>
+  <p>Each token carries a wave: a complex number per channel, a&middot;e<sup>i&theta;</sup>. A bank adds the waves of the tokens in context. Tokens whose phases agree add up (they resonate);
+    tokens with unrelated phases cancel on average. Click words to switch them on and off. The waves here are synthetic, designed to show the mechanism: tokens of the same group
+    (entity, place, action, opening) share a phase pattern; function words have random phases.</p>
+</header>
+<main>
+  <section class="card full">
+    <h2>Sentence <span>click a word to switch it on/off</span></h2>
+    <div class="body">
+      <div id="sent"></div>
+      <div class="row" style="margin-top:10px">
+        <div class="ctl"><label>presets</label>
+          <button data-p="rhinoceros named Roxy">rhinoceros named Roxy</button>
+          <button data-p="icy hill">icy hill</button>
+          <button data-p="named hill">named + hill (unrelated)</button>
+          <button data-p="climb hill Roxy">Roxy + climb + hill</button>
+          <button data-p="*">all</button><button data-p="">none</button></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="ctl"><label>wave</label><div class="seg" id="mode">
+          <button data-m="A" class="act">A: phase per token</button><button data-m="B">B: frequency + phase per token</button></div></div>
+        <div class="ctl"><label>position (RoPE) strength</label><input type="range" id="rho" min="0" max="1" step="0.01" value="0"><span id="rhov" class="num" style="width:2.5rem">0.00</span></div>
+        <div class="ctl" id="tctl"><label>time (query moves on)</label><input type="range" id="tq" min="0" max="60" step="1" value="0"><span id="tqv" class="num" style="width:2.5rem">0</span></div>
+      </div>
+      <div class="legend" id="legend" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Resonance of the bank <span>|M|<sup>2</sup> = self terms + interference</span></h2>
+    <div class="body">
+      <div class="row" style="align-items:flex-end;gap:28px">
+        <div><div class="note" style="margin:0">coherence |M|<sup>2</sup> / &Sigma;|z|<sup>2</sup></div><div class="big" id="coh">-</div></div>
+        <div style="flex:1;min-width:16rem" class="meter" id="energy"></div>
+      </div>
+      <p class="note">Coherence 1 = the tokens are independent (random phases: interference averages to 0). Coherence n = n tokens perfectly in phase. Negative interference = they cancel.</p>
+      <div class="math">|M|<sup>2</sup> = &Sigma;<sub>j</sub> a<sub>j</sub><sup>2</sup> &nbsp;+&nbsp; &Sigma;<sub>i&ne;j</sub> a<sub>i</sub>a<sub>j</sub> cos(&theta;<sub>i</sub> &minus; &theta;<sub>j</sub>) &nbsp;&nbsp;
+        <span style="color:#64748b;font-size:13px">(averaged over channels) - the second sum is every pair's agreement, computed from one sum in O(n)</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>What a reader (the MLP) can decode <span>coherence with each group's phase pattern</span></h2>
+    <div class="body">
+      <div class="meter" id="detect"></div>
+      <p class="note">Detector for group g: |&Sigma;<sub>c</sub>&Sigma;<sub>j</sub> a<sub>j</sub> e<sup>i(&theta;<sub>jc</sub> &minus; P<sub>gc</sub>)</sup>| / channels. It is high only when tokens that carry the group's pattern are present
+        and stay in phase. With position (RoPE) strength &gt; 0 the position rotation scrambles the pattern in fast channels and the detectors fade: binding by content needs position-free channels.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Phasors per channel <span>each arrow = one active token, black = the bank's sum</span></h2>
+    <div class="body"><canvas id="phasors"></canvas>
+      <p class="note">Click a channel to plot its waves below. Long black arrows = resonance. Channel frequency (for RoPE) grows to the left: fast channels lose alignment first when position is on.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Waves in one channel <span id="wavech"></span></h2>
+    <div class="body"><canvas id="waves"></canvas>
+      <p class="note" id="wavenote"></p></div>
+  </section>
+
+  <section class="card">
+    <h2>Pairwise interference <span>mean cos(&theta;<sub>i</sub> &minus; &theta;<sub>j</sub>) over channels</span></h2>
+    <div class="body"><canvas id="pairs"></canvas>
+      <p class="note">Green = the pair resonates (bound), red = it cancels, white = unrelated. This matrix is never computed by the bank: it is hidden inside |M|<sup>2</sup>.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Over time <span>|M| as the query moves on (mode B)</span></h2>
+    <div class="body"><canvas id="time"></canvas>
+      <p class="note" id="timenote"></p></div>
+  </section>
+
+  <section class="card full">
+    <h2>How this maps to the model</h2>
+    <div class="body" style="font-size:13px">
+      <p style="margin-top:0"><b>Today:</b> a bank adds RoPE-rotated token vectors, so a token's phase comes only from its position. Adjacent tokens agree in slow channels, so "icy hill" already adds up there,
+        but nothing lets two tokens choose to be in tune, and nothing reads the energy |M| (the readout is linear in M).</p>
+      <p><b>Option A, phase per token:</b> angle = position&middot;&omega; + &phi;<sub>b</sub>[token]. Tokens with the same role learn similar &phi; and resonate when they co-occur. The per-token rotation folds into the
+        virtual embedding tables (free at run time), and the MLP gets the per-channel magnitudes |M<sub>b,c</sub>| as extra inputs so it can read the resonance directly.</p>
+      <p><b>Option B, frequency + phase per token:</b> angle = &Omega;<sub>token</sub>&middot;(distance) + &phi;<sub>token</sub>. As the query moves on, two tokens with the same frequency keep a constant relative phase (their
+        alignment persists); tokens with different frequencies drift and beat, so their interference averages out over time - unrelated pairs fade on their own. Note the relative phase of two same-frequency tokens
+        still depends on their separation (&Omega;&middot;&Delta;pos), so groups should use slow frequencies. Exact parallel training needs a small codebook of frequency bands (each band pooled with the usual trick).</p>
+      <p style="margin-bottom:0"><b>Why it is cheap:</b> the bank never forms pairs. It keeps one sum per channel, and the pairwise agreement of every token in the window is already inside |M|<sup>2</sup>.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+// ---------------- synthetic token waves ----------------
+const WORDS = ["Once", "upon", "a", "time", ",", "there", "lived", "a", "rhinoceros", "named", "Roxy", ".", "Roxy", "loved", "to", "climb", "the", "icy", "hill", "."];
+const GROUP = { Once: "opening", upon: "opening", time: "opening", rhinoceros: "entity", named: "entity", Roxy: "entity", icy: "place", hill: "place", lived: "action", loved: "action", climb: "action" };
+const GROUPS = ["entity", "place", "action", "opening"];
+const GCOL = { entity: "#e15759", place: "#59a14f", action: "#4e79a7", opening: "#d4a72c", function: "#94a3b8" };
+const C = 24;                                            // complex channels
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const TWO_PI = 2 * Math.PI;
+const PATTERN = {}, FREQ = {};
+for (const g of GROUPS) { PATTERN[g] = Array.from({ length: C }, () => rnd() * TWO_PI); FREQ[g] = 0.02 + 0.03 * GROUPS.indexOf(g); }
+const TOK = WORDS.map((w, j) => {
+  const g = GROUP[w] || "function";
+  const phase = Array.from({ length: C }, (_, c) => g === "function" ? rnd() * TWO_PI : PATTERN[g][c] + (rnd() - 0.5) * 0.5);
+  const amp = g === "function" ? 0.6 : 1.0;
+  const freq = g === "function" ? 0.05 + 0.25 * rnd() : FREQ[g];   // mode B: own frequency (group members share it)
+  return { w, g, phase, amp, freq, pos: j };
+});
+const OMEGA = Array.from({ length: C }, (_, c) => Math.pow(1000, -c / (C - 1)));  // RoPE-like channel frequencies (fast first)
+const N = TOK.length, Q = N - 1;                         // the query sits at the last token
+
+let on = new Set(), mode = "A", rho = 0, tq = 0, chSel = 4;
+
+// angle of token j in channel c at query time t
+function theta(j, c, t = tq) {
+  const T = TOK[j], k = Q - T.pos + t;                   // distance to the query
+  let a = T.phase[c] + rho * OMEGA[c] * k;
+  if (mode === "B") a += T.freq * k;
+  return a;
+}
+function bankSum(t = tq) {                               // M_c = sum_j a_j e^{i theta}
+  const re = new Array(C).fill(0), im = new Array(C).fill(0);
+  for (const j of on) for (let c = 0; c < C; c++) { const a = theta(j, c, t); re[c] += TOK[j].amp * Math.cos(a); im[c] += TOK[j].amp * Math.sin(a); }
+  return { re, im };
+}
+
+// ---------------- UI ----------------
+const sent = document.getElementById("sent");
+sent.innerHTML = TOK.map((t, j) => `<span class="tok" data-j="${j}" style="--c:${GCOL[t.g]}">${t.w}</span>`).join(" ");
+sent.querySelectorAll(".tok").forEach(el => el.onclick = () => { const j = +el.dataset.j; on.has(j) ? on.delete(j) : on.add(j); draw(); });
+document.getElementById("legend").innerHTML = [...GROUPS, "function"].map(g => `<span><i style="background:${GCOL[g]}"></i>${g}${g === "function" ? " words (random phases)" : ""}</span>`).join("");
+document.querySelectorAll("[data-p]").forEach(b => b.onclick = () => {
+  const p = b.dataset.p;
+  on = new Set(p === "*" ? TOK.map((_, j) => j) : TOK.map((t, j) => p.split(" ").includes(t.w) ? j : -1).filter(j => j >= 0));
+  draw();
+});
+document.querySelectorAll("#mode button").forEach(b => b.onclick = () => {
+  mode = b.dataset.m; document.querySelectorAll("#mode button").forEach(x => x.classList.toggle("act", x === b)); draw();
+});
+document.getElementById("rho").oninput = e => { rho = +e.target.value; document.getElementById("rhov").textContent = rho.toFixed(2); draw(); };
+document.getElementById("tq").oninput = e => { tq = +e.target.value; document.getElementById("tqv").textContent = tq; draw(); };
+
+function canvas(id, h) {
+  const cv = document.getElementById(id), dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600;
+  cv.style.height = h + "px"; cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  g.font = "11px ui-sans-serif, system-ui"; return { g, w, h, cv };
+}
+const meterRow = (label, v, max, col, txt, signed = false) => {
+  const f = Math.max(-1, Math.min(1, v / max));
+  const bar = signed ? `<div style="${f >= 0 ? "left:50%" : "right:50%"};width:${Math.abs(f) * 50}%;background:${col}"></div><div style="left:50%;width:1px;background:#94a3b8"></div>`
+                     : `<div style="left:0;width:${Math.max(0, f) * 100}%;background:${col}"></div>`;
+  return `<div>${label}</div><div class="bar">${bar}</div><div class="num">${txt}</div>`;
+};
+
+function draw() {
+  sent.querySelectorAll(".tok").forEach(el => { const j = +el.dataset.j, isOn = on.has(j); el.classList.toggle("on", isOn); el.style.color = isOn ? GCOL[TOK[j].g] : ""; el.style.background = isOn ? GCOL[TOK[j].g] + "18" : "#fff"; });
+  document.getElementById("tctl").style.opacity = mode === "B" || rho > 0 ? 1 : 0.5;
+  const { re, im } = bankSum();
+  const act = [...on];
+  // energy split (averaged over channels)
+  let total = 0, self = 0;
+  for (let c = 0; c < C; c++) total += re[c] ** 2 + im[c] ** 2;
+  for (const j of act) self += TOK[j].amp ** 2 * C;
+  total /= C; self /= C; const inter = total - self;
+  document.getElementById("coh").textContent = act.length ? (total / Math.max(self, 1e-9)).toFixed(2) : "-";
+  const emax = Math.max(1, total, self, Math.abs(inter));
+  document.getElementById("energy").innerHTML =
+    meterRow("total |M|²", total, emax, "#1e293b", total.toFixed(2)) +
+    meterRow("self terms", self, emax, "#94a3b8", self.toFixed(2)) +
+    meterRow("interference", inter, emax, inter >= 0 ? "#059669" : "#dc2626", (inter >= 0 ? "+" : "") + inter.toFixed(2), true);
+  // group detectors
+  const det = GROUPS.map(g => {
+    let r = 0, i = 0;
+    for (let c = 0; c < C; c++) for (const j of act) { const a = theta(j, c) - PATTERN[g][c]; r += TOK[j].amp * Math.cos(a); i += TOK[j].amp * Math.sin(a); }
+    return Math.hypot(r, i) / C;
+  });
+  const dmax = Math.max(1, ...det);
+  document.getElementById("detect").innerHTML = GROUPS.map((g, k) => meterRow(g, det[k], dmax, GCOL[g], det[k].toFixed(2))).join("");
+  drawPhasors(re, im); drawWaves(); drawPairs(); drawTime();
+}
+
+function drawPhasors(re, im) {
+  const cols = 8, rows = Math.ceil(C / cols), { g, w, cv } = canvas("phasors", 2 + rows * 92), cell = w / cols, R = Math.min(cell, 92) / 2 - 10;
+  const amax = Math.max(1, ...re.map((r, c) => Math.hypot(r, im[c])));
+  for (let c = 0; c < C; c++) {
+    const cx = (c % cols + 0.5) * cell, cy = Math.floor(c / cols) * 92 + 46;
+    g.strokeStyle = c === chSel ? "#1e293b" : "#e2e8f0"; g.lineWidth = c === chSel ? 1.5 : 1;
+    g.beginPath(); g.arc(cx, cy, R, 0, TWO_PI); g.stroke();
+    for (const j of on) {                                     // each token, scaled to the circle by the largest possible sum
+      const a = theta(j, c), L = R * TOK[j].amp / amax;
+      g.strokeStyle = GCOL[TOK[j].g]; g.lineWidth = 1.2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + L * Math.cos(a), cy - L * Math.sin(a)); g.stroke();
+    }
+    const L = R * Math.hypot(re[c], im[c]) / amax, a = Math.atan2(im[c], re[c]);
+    g.strokeStyle = "#0f172a"; g.lineWidth = 3; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + L * Math.cos(a), cy - L * Math.sin(a)); g.stroke();
+    g.fillStyle = "#64748b"; g.textAlign = "center"; g.fillText(`ch ${c}`, cx, cy + R + 9);
+  }
+  cv.onclick = e => { const c = Math.floor(e.offsetY / 92) * cols + Math.floor(e.offsetX / cell); if (c >= 0 && c < C) { chSel = c; draw(); } };
+}
+
+function drawWaves() {
+  const { g, w, h } = canvas("waves", 230), act = [...on], c = chSel, pL = 8;
+  document.getElementById("wavech").textContent = `channel ${c}`;
+  const xs = 300, span = 4 * Math.PI, y0 = h / 2, amp = (h / 2 - 12) / Math.max(1, act.reduce((s, j) => s + TOK[j].amp, 0));
+  g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(0, y0); g.lineTo(w, y0); g.stroke();
+  const sum = new Array(xs + 1).fill(0);
+  for (const j of act) {
+    const ph = theta(j, c);
+    g.strokeStyle = GCOL[TOK[j].g]; g.lineWidth = 1; g.globalAlpha = 0.75; g.beginPath();
+    for (let s = 0; s <= xs; s++) { const x = s / xs * span, v = TOK[j].amp * Math.cos(x + ph); sum[s] += v; const px = pL + s / xs * (w - 2 * pL), py = y0 - v * amp; s ? g.lineTo(px, py) : g.moveTo(px, py); }
+    g.stroke(); g.globalAlpha = 1;
+  }
+  if (act.length) { g.strokeStyle = "#0f172a"; g.lineWidth = 2.5; g.beginPath(); sum.forEach((v, s) => { const px = pL + s / xs * (w - 2 * pL), py = y0 - v * amp; s ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke(); }
+  const peak = Math.max(0, ...sum.map(Math.abs)), maxPeak = act.reduce((s, j) => s + TOK[j].amp, 0);
+  document.getElementById("wavenote").textContent = act.length ? `Thin lines: each token's wave (its phase shifts it). Thick: their sum, peak ${peak.toFixed(2)} of a possible ${maxPeak.toFixed(2)} if all were in phase.` : "Switch some words on.";
+}
+
+function drawPairs() {
+  const act = [...on].sort((a, b) => a - b), n = act.length, { g, w, h } = canvas("pairs", Math.max(120, Math.min(320, 40 + n * 22)));
+  if (!n) { g.fillStyle = "#94a3b8"; g.fillText("switch some words on", 10, 20); return; }
+  const pL = 86, pT = 8, cs = Math.min((w - pL - 8) / n, (h - pT - 8) / n);
+  for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) {
+    let s = 0; for (let c = 0; c < C; c++) s += Math.cos(theta(act[a], c) - theta(act[b], c)); s /= C;
+    g.fillStyle = s >= 0 ? `rgba(5,150,105,${s.toFixed(3)})` : `rgba(220,38,38,${(-s).toFixed(3)})`;
+    g.fillRect(pL + b * cs, pT + a * cs, cs - 1, cs - 1);
+  }
+  g.textAlign = "right"; act.forEach((j, a) => { g.fillStyle = GCOL[TOK[j].g]; g.fillText(TOK[j].w, pL - 6, pT + a * cs + cs / 2 + 4); });
+}
+
+function drawTime() {
+  const { g, w, h } = canvas("time", 200), pL = 40, pB = 22, ts = 61;
+  const vals = Array.from({ length: ts }, (_, t) => { const { re, im } = bankSum(t); let s = 0; for (let c = 0; c < C; c++) s += Math.hypot(re[c], im[c]); return s / C; });
+  const vmax = Math.max(1e-9, ...vals, [...on].reduce((s, j) => s + TOK[j].amp, 0));
+  g.strokeStyle = "#e2e8f0"; g.fillStyle = "#64748b"; g.textAlign = "right";
+  for (const v of [0, vmax]) { const y = h - pB - v / vmax * (h - pB - 8); g.beginPath(); g.moveTo(pL, y); g.lineTo(w, y); g.stroke(); g.fillText(v.toFixed(1), pL - 6, y + 4); }
+  g.textAlign = "center"; g.fillText("query moves on (tokens later) →", (w + pL) / 2, h - 5);
+  g.strokeStyle = "#0f172a"; g.lineWidth = 2; g.beginPath();
+  vals.forEach((v, t) => { const x = pL + t / (ts - 1) * (w - pL - 6), y = h - pB - v / vmax * (h - pB - 8); t ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
+  const x = pL + tq / (ts - 1) * (w - pL - 6); g.strokeStyle = "#94a3b8"; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, 6); g.lineTo(x, h - pB); g.stroke(); g.setLineDash([]);
+  document.getElementById("timenote").textContent = mode === "B"
+    ? "Mode B: same-group tokens share a frequency, so their alignment persists as the query moves on (flat line); mixing groups or function words makes the sum beat and fade."
+    : rho > 0 ? "Mode A with position on: every token turns with its channel's RoPE frequency, all at the same rate, so relative phases (and |M|) stay constant over time."
+              : "Mode A: phases do not depend on time, so |M| is constant. Switch to mode B to see coherent groups persist and unrelated tokens beat.";
+}
+
+on = new Set(TOK.map((t, j) => ["rhinoceros", "named", "Roxy"].includes(t.w) ? j : -1).filter(j => j >= 0));
+window.addEventListener("resize", draw);
+draw();
+</script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decoding tokens from a sum of sines</title>
+<style>
+  :root { --b: #e2e8f0; --t: #1e293b; --m: #64748b; --bg: #f8fafc; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--t); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  header { background: #fff; border-bottom: 1px solid var(--b); padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--m); font-size: 13px; max-width: 1200px; }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--b); border-radius: 6px; min-width: 0; }
+  .card h2 { margin: 0; padding: 9px 14px; border-bottom: 1px solid var(--b); font-size: 14px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .card h2 span { font-weight: 400; color: var(--m); font-size: 12px; }
+  .body { padding: 12px 14px; }
+  .full { grid-column: 1 / -1; }
+  .note { color: var(--m); font-size: 12px; margin: 6px 0 0; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+  label.k { color: var(--m); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  button { font: inherit; font-size: 13px; padding: 3px 10px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
+  button:hover { background: #f1f5f9; } button.act { background: #1e293b; color: #fff; border-color: #1e293b; }
+  canvas { width: 100%; display: block; }
+  input[type=text] { font: inherit; padding: 4px 8px; border: 1px solid #cbd5e1; border-radius: 4px; width: 100%; }
+  input[type=number] { font: inherit; font-size: 13px; padding: 2px 4px; border: 1px solid #cbd5e1; border-radius: 4px; width: 70px; }
+  input[type=range] { accent-color: #334155; }
+  .math { font-family: ui-serif, Georgia, serif; font-size: 15px; background: #f8fafc; border: 1px solid var(--b); border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+  .sent { font-size: 19px; line-height: 2.3; }
+  .w { display: inline-block; padding: 0 6px; margin: 0 1px; border-radius: 4px; cursor: pointer; border: 1px solid transparent; position: relative; }
+  .w:hover { border-color: #cbd5e1; }
+  .w.emit { color: #fff; }
+  .w.probe { outline: 2px solid #6d28d9; outline-offset: 1px; }
+  .w.inwin { background: rgba(109,40,217,0.08); }
+  .w sub { font-size: 10px; color: #94a3b8; position: absolute; left: 0; right: 0; bottom: -14px; text-align: center; line-height: 1; }
+  .w.emit sub { color: #64748b; }
+  .fut { display: inline-block; width: 9px; height: 9px; margin: 0 2px; border-radius: 50%; background: #e2e8f0; cursor: pointer; vertical-align: middle; }
+  .fut.probe { background: #6d28d9; } .fut.inwin { background: #c4b5fd; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { text-align: left; font-weight: 500; color: var(--m); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 4px 6px; border-bottom: 1px solid var(--b); }
+  td { padding: 4px 6px; border-bottom: 1px solid #f1f5f9; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, monospace; }
+  .chip { display: inline-block; padding: 2px 8px; border: 1px solid var(--b); border-radius: 4px; font-size: 12px; margin: 2px 4px 2px 0; }
+  .ok { color: #047857; } .bad { color: #b91c1c; } .warn { color: #b45309; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Decoding tokens from a sum of sines</h1>
+  <p>Every word of the sentence is a position. Click a word to make it emit: from its own position forward it sends one damped sine with its own frequency &omega;, phase &phi;, amplitude A and half-life.
+    All emitted waves add into one signal. Pick a probe (shift-click a word or a dot in the future): the decoder sees only the last N samples there and estimates which words were behind and how far back each one is.</p>
+</header>
+<main>
+  <section class="card full">
+    <h2>Sentence <span>click: emit on/off &middot; shift-click (or the probe button): listen here &middot; dots: future positions</span></h2>
+    <div class="body">
+      <div class="sent" id="sent"></div>
+      <div class="row" style="margin-top:14px">
+        <button id="modeBtn">mode: emit</button>
+        <label class="k">window N</label><input type="range" id="win" min="4" max="128" value="48" style="width:180px"><span id="winV" class="mono"></span>
+        <label class="k">noise &sigma;</label><input type="range" id="noise" min="0" max="0.2" step="0.005" value="0" style="width:140px"><span id="noiseV" class="mono"></span>
+        <label class="k">detect if |z| &gt;</label><input type="range" id="thr" min="0.005" max="0.2" step="0.005" value="0.01" style="width:120px"><span id="thrV" class="mono"></span>
+        <label><input type="checkbox" id="shrink"> start the window after the newest emitter</label>
+        <button id="clearBtn">clear emitters</button>
+      </div>
+      <div class="row" style="margin-top:8px"><label class="k">text</label><input type="text" id="text" style="flex:1"></div>
+      <div id="status" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>Waves propagating forward <span>one lane per emitting word, from its position on (dashed: the decay envelope &plusmn;A e<sup>&minus;&alpha;d</sup>); bottom: the sum, the decoder's window (shaded) and its reconstruction (dashed)</span></h2>
+    <div class="body"><canvas id="sig"></canvas></div>
+  </section>
+
+  <section class="card">
+    <h2>Spectrum in the window <span>|DFT| of the N samples; ticks = each word's frequency</span></h2>
+    <div class="body"><canvas id="spec" height="240"></canvas>
+      <p class="note">A peak at a word's frequency means that word is present. Peaks have width about 2&pi;/N: two words closer than that in frequency blur together. The decoder below fits every word at once instead of reading peaks.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Decoded phasors at the probe <span>arrow = decoded z<sub>v</sub>; circle = the truth</span></h2>
+    <div class="body"><canvas id="phas" height="240"></canvas>
+      <p class="note">z<sub>v</sub> = A e<sup>&minus;&alpha;d</sup> e<sup>i(&omega;d + &phi;)</sup>: its length says how decayed the wave is (far back = short), its angle how far it has rotated since it was emitted.</p></div>
+  </section>
+
+  <section class="card full">
+    <h2>Who was behind the probe, and how far back <span>one row per word of the vocabulary (the sentence's distinct words)</span></h2>
+    <div class="body">
+      <table id="dec"></table>
+      <canvas id="lanes" style="margin-top:10px"></canvas>
+      <p class="note">Each lane is the distance axis (0 = the probe, growing to the left). Gray band: distance from the amplitude (coarse, no ambiguity). Ticks: distances allowed by the phase (precise, repeating every period 2&pi;/&omega;). The decoder picks the tick inside the band (dot). Ring = the truth.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>The math</h2>
+    <div class="body">
+      Word v emitted at position p contributes, at position t &ge; p (distance t &minus; p):
+      <div class="math">A<sub>v</sub> e<sup>&minus;&alpha;<sub>v</sub>(t&minus;p)</sup> cos(&omega;<sub>v</sub>(t&minus;p) + &phi;<sub>v</sub>) &nbsp;=&nbsp; Re[ z<sub>v</sub> e<sup>(&minus;&alpha;<sub>v</sub> + i&omega;<sub>v</sub>) n</sup> ], &nbsp; n = t &minus; x, &nbsp; z<sub>v</sub> = A<sub>v</sub> e<sup>&minus;&alpha;<sub>v</sub>d</sup> e<sup>i(&omega;<sub>v</sub>d + &phi;<sub>v</sub>)</sup>, &nbsp; d = x &minus; p</div>
+      The window is linear in the unknown complex numbers z<sub>v</sub> (one per vocabulary word), so the decoder is least squares: N equations, 2V real unknowns. Then, per word:
+      <div class="math">present &nbsp;&hArr;&nbsp; |z<sub>v</sub>| &gt; threshold<br>
+        d<sub>amp</sub> = ln(A<sub>v</sub> / |z<sub>v</sub>|) / &alpha;<sub>v</sub> &nbsp;&nbsp;(coarse)<br>
+        d<sub>phase</sub> = (arg z<sub>v</sub> &minus; &phi;<sub>v</sub>) / &omega;<sub>v</sub> + m &middot; 2&pi;/&omega;<sub>v</sub> &nbsp;&nbsp;(precise, m unknown)<br>
+        d = the d<sub>phase</sub> closest to d<sub>amp</sub></div>
+      Amplitude and phase are two rulers: the decay ruler is unambiguous but blurry (noise &delta; on |z| moves it by &delta; / (&alpha;|z|)), the phase ruler is sharp but periodic. Together they work like a vernier.
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>When it is possible (try each)</h2>
+    <div class="body">
+      <ul style="margin:0;padding-left:18px">
+        <li><b>Each word needs its own frequency</b>: the frequency is the word's identity.</li>
+        <li><b>N &ge; 2V samples</b>: one scalar signal gives N equations for 2V unknowns. A real vocabulary of 10k words would need 20k samples, or many parallel channels (a D-dimensional signal gives D&middot;N equations).</li>
+        <li><b>Frequencies at least ~2&pi;/N apart</b>, otherwise the fit is ill-conditioned and noise blows up.</li>
+        <li><b>The emitter must be behind the window</b>: a wave that starts inside the window is not a damped sine over all of it, so the fit leaks. Listening in the future (dots) after the sentence is the clean case; probing inside the sentence needs "start the window after the newest emitter".</li>
+        <li><b>The same word twice merges</b> (emit both "the"s or both "hill"s): two phasors at one frequency add into one z, decoded as one emission at an in-between distance. No decoder can split them.</li>
+        <li><b>Far words fade below the noise</b>: |z| = A e<sup>&minus;&alpha;d</sup>. A long half-life is remembered longer but its amplitude ruler is blurrier.</li>
+        <li><b>Distance is exact only up to the phase period</b>: if the amplitude ruler is off by more than half a period the vernier picks the wrong tick (raise the noise: errors jump by exactly one period).</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>Vocabulary <span>each distinct word: edit any value; the frequency is its identity</span></h2>
+    <div class="body"><table id="vocab"></table></div>
+  </section>
+</main>
+
+<script>
+const FUT = 96;  // future positions after the sentence
+const PAL = ["#e15759", "#4e79a7", "#59a14f", "#f28e2b", "#b07aa1", "#9c755f", "#2f8f8a", "#d4a72c", "#3b3b8f", "#6a8f2f"];
+const $ = id => document.getElementById(id);
+const alpha = v => Math.LN2 / v.h, rad = v => v.ph * Math.PI / 180;
+const wrap = a => ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+const hash = s => { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0) / 4294967296; };
+
+let words = [], tokOf = [], V = [], P = 0, emit = new Set(), probe = 0, mode = "emit";
+const NZ = (() => { let s = 12345; const r = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648; return Array.from({ length: 1024 }, () => Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r())); })();
+
+function setText(text, keep) {
+  const old = V;
+  words = text.trim().split(/\s+/).filter(Boolean);
+  const keys = words.map(w => w.toLowerCase());
+  const uniq = [...new Set(keys)];
+  // distinct frequencies spread over (0.2, 3.0) rad/token, in order of first appearance shuffled by hash
+  const order = uniq.map((k, i) => [k, hash(k + "#")]).sort((a, b) => a[1] - b[1]).map(a => a[0]);
+  V = uniq.map(k => { const prev = keep && old.find(v => v.key === k); if (prev) return prev;
+    const i = order.indexOf(k), w = 0.2 + 2.8 * (i + 0.5) / order.length, name = words[keys.indexOf(k)];
+    const cap = /^[A-Z]/.test(name) && keys.indexOf(k) > 0;
+    return { key: k, n: name, w: +w.toFixed(3), ph: Math.round(hash(k + "p") * 72) * 5, a: +(0.7 + 0.4 * hash(k + "a")).toFixed(2), h: cap ? 40 : Math.round(12 + 28 * hash(k + "h")) }; });
+  tokOf = keys.map(k => uniq.indexOf(k));
+  P = words.length + FUT;
+  emit = new Set([...emit].filter(p => p < words.length));
+  probe = Math.min(probe, P - 1);
+  buildVocab(); draw();
+}
+
+function wave(v, p, t) { if (t < p) return 0; const d = t - p; return v.a * Math.exp(-alpha(v) * d) * Math.cos(v.w * d + rad(v)); }
+function signal() { const sig = +$("noise").value; return Array.from({ length: P }, (_, t) => { let s = sig * NZ[t % NZ.length]; for (const p of emit) s += wave(V[tokOf[p]], p, t); return s; }); }
+
+function solve(y, x, t0) {
+  const m = 2 * V.length, A = [], b = [];
+  for (let t = t0; t <= x; t++) { const n = t - x, row = [];
+    for (const v of V) { const e = Math.exp(-alpha(v) * n); row.push(e * Math.cos(v.w * n), -e * Math.sin(v.w * n)); }
+    A.push(row); b.push(y[t]); }
+  const M = Array.from({ length: m }, () => new Float64Array(m + 1));
+  for (let r = 0; r < A.length; r++) for (let i = 0; i < m; i++) { M[i][m] += A[r][i] * b[r]; for (let j = 0; j < m; j++) M[i][j] += A[r][i] * A[r][j]; }
+  let tr = 0; for (let i = 0; i < m; i++) tr += M[i][i];
+  for (let i = 0; i < m; i++) M[i][i] += 1e-9 * tr / m + 1e-12;
+  for (let c = 0; c < m; c++) { let piv = c; for (let r = c + 1; r < m; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    [M[c], M[piv]] = [M[piv], M[c]]; for (let r = 0; r < m; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let j = c; j <= m; j++) M[r][j] -= f * M[c][j]; } }
+  const z = V.map((_, k) => [M[2 * k][m] / M[2 * k][2 * k], M[2 * k + 1][m] / M[2 * k + 1][2 * k + 1]]);
+  let res = 0, tot = 0; A.forEach((row, r) => { let f = 0; row.forEach((a, i) => f += a * z[i >> 1][i & 1]); res += (b[r] - f) ** 2; tot += b[r] ** 2; });
+  return { z, rel: Math.sqrt(res / (tot + 1e-12)) };
+}
+function decode(v, z) {
+  const mag = Math.hypot(z[0], z[1]), al = alpha(v), T = 2 * Math.PI / v.w;
+  const dAmp = Math.log(v.a / mag) / al, d0 = wrap(Math.atan2(z[1], z[0]) - rad(v)) / v.w;
+  const m = Math.round((dAmp - d0) / T), d = d0 + Math.max(0, m) * T;
+  return { mag, dAmp, d0, T, d, ticks: Array.from({ length: 200 }, (_, k) => d0 + k * T).filter(q => q < P) };
+}
+
+function cv(id, h) { const c = $(id), dpr = window.devicePixelRatio || 1, w = c.clientWidth; c.style.height = h + "px"; c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.font = "11px ui-sans-serif, system-ui"; return [g, w, h]; }
+function rgba(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+const emitList = () => [...emit].sort((a, b) => a - b);
+const colorOfPos = p => PAL[emitList().indexOf(p) % PAL.length];
+const colorOfTok = k => { const p = emitList().find(q => tokOf[q] === k); return p === undefined ? "#94a3b8" : colorOfPos(p); };
+const label = t => (t < words.length ? words[t] : `+${t - words.length + 1}`);
+
+function window0(x) {
+  let t0 = Math.max(0, x - +$("win").value + 1);
+  const before = emitList().filter(p => p <= x);
+  if ($("shrink").checked && before.length) t0 = Math.max(t0, before[before.length - 1] + 1);
+  return Math.min(t0, x);
+}
+
+function buildSentence(t0) {
+  const el = $("sent"), html = [];
+  words.forEach((w, p) => { const on = emit.has(p), c = on ? colorOfPos(p) : null, inw = p >= t0 && p <= probe;
+    html.push(`<span class="w ${on ? "emit" : ""} ${p === probe ? "probe" : ""} ${inw && !on ? "inwin" : ""}" style="${on ? `background:${c}` : ""}" data-p="${p}" title="${esc(w)}: ω ${V[tokOf[p]].w}, half-life ${V[tokOf[p]].h}">${esc(w)}<sub>${p}</sub></span>`); });
+  html.push(" ");
+  for (let t = words.length; t < P; t++) html.push(`<span class="fut ${t === probe ? "probe" : ""} ${t >= t0 && t <= probe && t !== probe ? "inwin" : ""}" data-p="${t}" title="future position ${t} (+${t - words.length + 1})"></span>`);
+  el.innerHTML = html.join("");
+}
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+$("sent").addEventListener("click", e => { const el = e.target.closest("[data-p]"); if (!el) return; const p = +el.dataset.p;
+  if (e.shiftKey || mode === "probe" || p >= words.length) probe = p; else { emit.has(p) ? emit.delete(p) : emit.add(p); }
+  draw(); });
+
+function draw() {
+  const x = probe, t0 = window0(x), n = x - t0 + 1;
+  $("winV").textContent = $("win").value; $("noiseV").textContent = (+$("noise").value).toFixed(3); $("thrV").textContent = (+$("thr").value).toFixed(3);
+  buildSentence(t0);
+  const y = signal(), thr = +$("thr").value, sol = n >= 2 ? solve(y, x, t0) : null;
+  const truth = V.map((v, k) => { let zr = 0, zi = 0; const ds = [];
+    for (const p of emit) if (tokOf[p] === k && p <= x) { const d = x - p, a = v.a * Math.exp(-alpha(v) * d); zr += a * Math.cos(v.w * d + rad(v)); zi += a * Math.sin(v.w * d + rad(v)); ds.push(d); }
+    return { z: [zr, zi], ds }; });
+  const E = emitList();
+
+  // ---- lanes: one per emitter + the sum ----
+  { const laneH = 56, sumH = 150, labH = 54, h = labH + E.length * laneH + sumH + 10, [g, w] = cv("sig", h), pL = 70, pR = 10, X = t => pL + (t + 0.5) / P * (w - pL - pR);
+    // word labels along the axis
+    g.save(); for (let t = 0; t < P; t++) { if (t >= words.length && (t - words.length) % 8 !== 7) continue;
+      g.save(); g.translate(X(t) + 3, labH - 6); g.rotate(-Math.PI / 3.2); g.fillStyle = emit.has(t) ? colorOfPos(t) : t === x ? "#6d28d9" : "#475569";
+      g.font = emit.has(t) || t === x ? "bold 11px ui-sans-serif, system-ui" : "11px ui-sans-serif, system-ui"; g.fillText(label(t), 0, 0); g.restore(); } g.restore();
+    g.strokeStyle = "#cbd5e1"; g.setLineDash([2, 4]); g.beginPath(); g.moveTo(X(words.length - 0.5), labH); g.lineTo(X(words.length - 0.5), h - 6); g.stroke(); g.setLineDash([]);
+    g.fillStyle = "#94a3b8"; g.textAlign = "left"; g.fillText("future →", X(words.length - 0.5) + 4, labH + 10);
+    // window + probe across all lanes
+    g.fillStyle = "rgba(109,40,217,0.06)"; g.fillRect(X(t0 - 0.5), labH, X(x + 0.5) - X(t0 - 0.5), h - labH - 6);
+    g.strokeStyle = "#6d28d9"; g.lineWidth = 1.5; g.beginPath(); g.moveTo(X(x), labH); g.lineTo(X(x), h - 6); g.stroke(); g.lineWidth = 1;
+    E.forEach((p, i) => { const v = V[tokOf[p]], c = colorOfPos(p), top = labH + i * laneH, mid = top + laneH / 2, A = laneH / 2 - 6, Y = val => mid - val / 1.2 * A;
+      g.strokeStyle = "#f1f5f9"; g.beginPath(); g.moveTo(pL, mid); g.lineTo(w - pR, mid); g.stroke();
+      g.fillStyle = c; g.textAlign = "right"; g.font = "bold 12px ui-sans-serif, system-ui"; g.fillText(words[p], pL - 8, mid + 4); g.font = "11px ui-sans-serif, system-ui";
+      g.fillStyle = "#94a3b8"; g.fillText(`½ ${v.h}`, pL - 8, mid + 16);
+      g.strokeStyle = rgba(c, 0.5); g.setLineDash([3, 3]);
+      for (const s of [1, -1]) { g.beginPath(); for (let t = p; t < P; t += 0.25) { const yy = Y(s * v.a * Math.exp(-alpha(v) * (t - p))); t === p ? g.moveTo(X(t), yy) : g.lineTo(X(t), yy); } g.stroke(); }
+      g.setLineDash([]);
+      g.strokeStyle = c; g.lineWidth = 1.6; g.beginPath(); g.moveTo(X(0), Y(0)); g.lineTo(X(p), Y(0));
+      for (let t = p; t < P; t += 0.2) g.lineTo(X(t), Y(wave(v, p, t))); g.stroke(); g.lineWidth = 1;
+      g.fillStyle = c; g.beginPath(); g.arc(X(p), Y(wave(v, p, p)), 3.5, 0, 7); g.fill();
+      for (let k = 1; p + k * v.h < P && k <= 6; k++) { g.fillStyle = rgba(c, 0.8); g.fillRect(X(p + k * v.h) - 0.5, mid + A - 4, 1, 6); }  // half-life ticks
+    });
+    // sum lane
+    const top = labH + E.length * laneH + 6, mid = top + sumH / 2, amp = Math.max(1.2, ...y.map(Math.abs)) * 1.05, Y = val => mid - val / amp * (sumH / 2 - 6);
+    g.strokeStyle = "#e2e8f0"; g.beginPath(); g.moveTo(pL, mid); g.lineTo(w - pR, mid); g.stroke();
+    g.fillStyle = "#0f172a"; g.textAlign = "right"; g.font = "bold 12px ui-sans-serif, system-ui"; g.fillText("sum", pL - 8, mid + 4); g.font = "11px ui-sans-serif, system-ui";
+    g.strokeStyle = "#0f172a"; g.lineWidth = 2; g.beginPath(); y.forEach((val, t) => t ? g.lineTo(X(t), Y(val)) : g.moveTo(X(t), Y(val))); g.stroke(); g.lineWidth = 1;
+    g.fillStyle = "#0f172a"; for (let t = t0; t <= x; t++) { g.beginPath(); g.arc(X(t), Y(y[t]), 2.2, 0, 7); g.fill(); }
+    if (sol) { g.strokeStyle = "#6d28d9"; g.setLineDash([5, 4]); g.lineWidth = 1.6; g.beginPath();
+      for (let t = t0; t <= x; t += 0.25) { const nn = t - x; let f = 0; V.forEach((v, k) => { const e = Math.exp(-alpha(v) * nn), z = sol.z[k]; f += e * (z[0] * Math.cos(v.w * nn) - z[1] * Math.sin(v.w * nn)); }); t === t0 ? g.moveTo(X(t), Y(f)) : g.lineTo(X(t), Y(f)); }
+      g.stroke(); g.setLineDash([]); g.lineWidth = 1; }
+    if (!E.length) { g.fillStyle = "#94a3b8"; g.textAlign = "center"; g.fillText("click words in the sentence to make them emit", w / 2, labH + 30); }
+    const c = $("sig"); c.onclick = e => { const t = Math.floor((e.offsetX - pL) / (w - pL - pR) * P); if (t < 0 || t >= P) return;
+      if (e.shiftKey || mode === "probe" || t >= words.length || e.offsetY > top) probe = t; else { emit.has(t) ? emit.delete(t) : emit.add(t); } draw(); };
+  }
+
+  // ---- spectrum ----
+  { const [g, w, h] = cv("spec", 240), pL = 10, pR = 10, pT = 10, pB = 34, F = 400;
+    const mags = Array.from({ length: F }, (_, q) => { const om = q / (F - 1) * Math.PI; let r = 0, im = 0; for (let t = t0; t <= x; t++) { r += y[t] * Math.cos(om * (t - x)); im -= y[t] * Math.sin(om * (t - x)); } return Math.hypot(r, im) / n; });
+    const mx = Math.max(...mags, 1e-6), X = om => pL + om / Math.PI * (w - pL - pR), Y = v => h - pB - v / mx * (h - pT - pB);
+    g.fillStyle = "rgba(109,40,217,0.15)"; g.strokeStyle = "#6d28d9"; g.beginPath(); g.moveTo(X(0), Y(0)); mags.forEach((v, q) => g.lineTo(X(q / (F - 1) * Math.PI), Y(v))); g.lineTo(X(Math.PI), Y(0)); g.fill(); g.stroke();
+    g.textAlign = "center"; V.forEach((v, k) => { const c = colorOfTok(k), on = c !== "#94a3b8"; g.strokeStyle = c; g.lineWidth = on ? 2 : 1; g.beginPath(); g.moveTo(X(v.w), h - pB); g.lineTo(X(v.w), h - pB + 6); g.stroke(); g.lineWidth = 1;
+      if (on) { g.fillStyle = c; g.fillText(v.n, X(v.w), h - pB + 18); } });
+    g.fillStyle = "#64748b"; g.textAlign = "left"; g.fillText("ω = 0", pL, h - 4); g.textAlign = "right"; g.fillText("ω = π", w - pR, h - 4);
+    g.textAlign = "center"; g.fillText(`resolution ≈ 2π/N = ${(2 * Math.PI / n).toFixed(2)} rad · word spacing ≈ ${(2.8 / V.length).toFixed(2)} rad`, w / 2, h - 4); }
+
+  // ---- phasors ----
+  { const [g, w, h] = cv("phas", 240), cx = w / 2, cy = h / 2;
+    const all = V.map((_, k) => [sol ? Math.hypot(...sol.z[k]) : 0, Math.hypot(...truth[k].z)]).flat(), R = Math.max(0.05, ...all) * 1.1, s = (h / 2 - 10) / R;
+    g.strokeStyle = "#e2e8f0"; g.beginPath(); g.arc(cx, cy, thr * s, 0, 7); g.stroke(); g.beginPath(); g.moveTo(cx - h / 2, cy); g.lineTo(cx + h / 2, cy); g.moveTo(cx, 0); g.lineTo(cx, h); g.stroke();
+    V.forEach((v, k) => { const c = colorOfTok(k), t = truth[k].z;
+      if (truth[k].ds.length) { g.strokeStyle = c; g.lineWidth = 1.5; g.beginPath(); g.arc(cx + t[0] * s, cy - t[1] * s, 6, 0, 7); g.stroke(); g.lineWidth = 1; }
+      if (!sol) return; const z = sol.z[k], mg = Math.hypot(...z); if (mg < 1e-6) return;
+      g.strokeStyle = mg > thr ? c : "#e2e8f0"; g.lineWidth = 2; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + z[0] * s, cy - z[1] * s); g.stroke(); g.lineWidth = 1;
+      if (mg > thr) { g.fillStyle = c; g.fillText(v.n, cx + z[0] * s + 6, cy - z[1] * s - 4); } }); }
+
+  // ---- table + distance lanes ----
+  const rows = V.map((v, k) => { const z = sol ? sol.z[k] : [0, 0], dc = decode(v, z); return { v, k, z, dc, det: dc.mag > thr, tr: truth[k] }; });
+  let html = `<tr><th>word</th><th>truth (distance)</th><th>|z| decoded</th><th>|z| true</th><th>d from amplitude</th><th>d from phase (mod period)</th><th>decoded distance</th><th>decoded position</th><th>result</th></tr>`;
+  let good = 0, bad = 0;
+  const shown = rows.filter(r => r.det || r.tr.ds.length);
+  for (const r of shown) {
+    const c = colorOfTok(r.k);
+    let res;
+    if (r.tr.ds.length > 1) res = `<span class="warn">merged: ${r.tr.ds.length} emissions at one frequency</span>`;
+    else if (r.det && r.tr.ds.length) { const e = Math.round(r.dc.d) - r.tr.ds[0]; res = e === 0 ? `<span class="ok">found, exact</span>` : `<span class="bad">found, off by ${e > 0 ? "+" : ""}${e}</span>`; e === 0 ? good++ : bad++; }
+    else if (r.det) { res = `<span class="bad">false detection</span>`; bad++; }
+    else { res = `<span class="warn">missed (|z| ${Math.hypot(...r.tr.z).toFixed(3)} under threshold)</span>`; bad++; }
+    const dp = r.det ? x - Math.round(r.dc.d) : null;
+    html += `<tr><td><span class="sw" style="background:${c}"></span><span class="mono">${esc(r.v.n)}</span></td><td>${r.tr.ds.length ? r.tr.ds.join(" + ") : "&ndash;"}</td><td>${r.dc.mag.toFixed(3)}</td><td>${Math.hypot(...r.tr.z).toFixed(3)}</td>
+      <td>${r.det ? r.dc.dAmp.toFixed(1) : ""}</td><td>${r.det ? `${r.dc.d0.toFixed(2)} + m&middot;${r.dc.T.toFixed(2)}` : ""}</td><td><b>${r.det ? r.dc.d.toFixed(2) : ""}</b></td>
+      <td>${dp !== null ? (dp >= 0 && dp < words.length ? `${dp} <span class="mono">"${esc(words[dp])}"</span>` : dp) : ""}</td><td>${res}</td></tr>`;
+  }
+  const absent = rows.length - shown.length;
+  $("dec").innerHTML = html + `<tr><td colspan="9" class="note">${absent} other vocabulary words decoded as absent (|z| under the threshold).</td></tr>`;
+  { const lh = 26, [g, w] = cv("lanes", Math.max(1, shown.length) * lh + 24), pL = 80, pR = 10, X = d => w - pR - d / (P - 1) * (w - pL - pR);
+    g.fillStyle = "#64748b"; g.textAlign = "center"; for (let d = 0; d < P; d += 8) g.fillText(d, X(d), shown.length * lh + 16);
+    shown.forEach((r, i) => { const yc = i * lh + lh / 2 + 2, c = colorOfTok(r.k);
+      g.fillStyle = c; g.textAlign = "right"; g.fillText(r.v.n, pL - 8, yc + 4);
+      g.strokeStyle = "#f1f5f9"; g.beginPath(); g.moveTo(pL, yc); g.lineTo(w - pR, yc); g.stroke();
+      if (r.det) { const sd = (+$("noise").value + 0.004) / Math.sqrt(Math.max(1, n) / 2) / (alpha(r.v) * r.dc.mag);
+        const lo = Math.max(0, r.dc.dAmp - 2 * sd), hi = Math.min(P - 1, r.dc.dAmp + 2 * sd);
+        g.fillStyle = "rgba(100,116,139,0.18)"; g.fillRect(X(hi), yc - 8, Math.max(2, X(lo) - X(hi)), 16);
+        g.strokeStyle = c; r.dc.ticks.forEach(q => { g.beginPath(); g.moveTo(X(q), yc - 6); g.lineTo(X(q), yc + 6); g.stroke(); });
+        g.fillStyle = c; g.beginPath(); g.arc(X(r.dc.d), yc, 4.5, 0, 7); g.fill(); }
+      g.strokeStyle = "#0f172a"; g.lineWidth = 1.5; r.tr.ds.forEach(d => { g.beginPath(); g.arc(X(d), yc, 7, 0, 7); g.stroke(); }); g.lineWidth = 1; }); }
+
+  // ---- status ----
+  const inside = E.filter(p => p > t0 && p <= x);  // emitted at t0 is fine: its wave fills the window
+  const counts = {}; E.forEach(p => counts[tokOf[p]] = (counts[tokOf[p]] || 0) + 1);
+  const dup = Object.entries(counts).filter(([, c]) => c > 1).map(([k]) => V[k].n);
+  $("status").innerHTML = [`<span class="chip">probe at ${x} (${esc(label(x))})</span>`, `<span class="chip">equations N = ${n}</span>`,
+    `<span class="chip ${n < 2 * V.length ? "bad" : ""}">unknowns 2V = ${2 * V.length}${n < 2 * V.length ? " &gt; N: underdetermined" : ""}</span>`,
+    sol ? `<span class="chip">fit residual ${(sol.rel * 100).toFixed(2)}%</span>` : "",
+    inside.length ? `<span class="chip warn">${inside.map(p => esc(words[p])).join(", ")} emitted inside the window: the fit leaks</span>` : "",
+    dup.length ? `<span class="chip warn">${dup.map(esc).join(", ")} emitted twice: merged into one phasor</span>` : "",
+    !E.filter(p => p <= x).length ? `<span class="chip">no emitter behind the probe</span>` : bad === 0 && good > 0 ? `<span class="chip ok">every emission decoded with its exact distance</span>` : bad ? `<span class="chip bad">${bad} wrong / missed</span>` : ""].join("");
+}
+
+function buildVocab() {
+  const inp = (k, f, step) => `<input type="number" step="${step}" value="${V[k][f]}" onchange="V[${k}].${f}=+this.value;buildVocab();draw()">`;
+  $("vocab").innerHTML = `<tr><th>word</th><th>&omega; (rad / token)</th><th>period (tokens)</th><th>phase &phi; (deg)</th><th>amplitude A</th><th>half-life (tokens)</th></tr>` +
+    V.map((v, k) => `<tr><td class="mono">${esc(v.n)}</td><td>${inp(k, "w", 0.01)}</td><td>${(2 * Math.PI / v.w).toFixed(2)}</td><td>${inp(k, "ph", 5)}</td><td>${inp(k, "a", 0.05)}</td><td>${inp(k, "h", 1)}</td></tr>`).join("");
+}
+
+["win", "noise", "thr"].forEach(id => $(id).oninput = draw); $("shrink").onchange = draw;
+$("modeBtn").onclick = () => { mode = mode === "emit" ? "probe" : "emit"; $("modeBtn").textContent = `mode: ${mode}`; $("modeBtn").classList.toggle("act", mode === "probe"); };
+$("clearBtn").onclick = () => { emit.clear(); draw(); };
+$("text").onchange = () => setText($("text").value, true);
+window.addEventListener("resize", draw);
+const DEFAULT = "Once upon a time Roxy the rhinoceros found an icy hill . She wanted to climb the hill , but it was slippery";
+$("text").value = DEFAULT;
+setText(DEFAULT, false);
+$("win").value = Math.min(128, 2 * V.length + 6);
+const at = w => words.indexOf(w);
+[at("Roxy"), at("icy"), at("hill"), at("climb")].forEach(p => emit.add(p));
+probe = Math.min(P - 1, Math.max(...emit) + +$("win").value);  // first point whose window is entirely after the emitters
+draw();
+</script>
+</body>
+</html>

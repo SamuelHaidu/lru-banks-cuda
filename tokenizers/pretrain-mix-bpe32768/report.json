@@ -1,0 +1,134 @@
+{
+ "name": "pretrain-mix-bpe32768",
+ "vocab_size": 32768,
+ "merges": 32496,
+ "sample_bytes": 998462379,
+ "source": "datasets/raw/cosmo-code-math-pretrain-bpe1024-text",
+ "chars_per_token": {
+  "C": {
+   "new": 2.831,
+   "old": 1.619,
+   "tokens_ratio": 0.572
+  },
+  "CSharp": {
+   "new": 4.306,
+   "old": 1.95,
+   "tokens_ratio": 0.453
+  },
+  "Cpp": {
+   "new": 2.982,
+   "old": 1.631,
+   "tokens_ratio": 0.547
+  },
+  "Go": {
+   "new": 2.68,
+   "old": 1.503,
+   "tokens_ratio": 0.561
+  },
+  "Java": {
+   "new": 3.37,
+   "old": 1.675,
+   "tokens_ratio": 0.497
+  },
+  "JavaScript": {
+   "new": 3.112,
+   "old": 1.609,
+   "tokens_ratio": 0.517
+  },
+  "Markdown": {
+   "new": 2.684,
+   "old": 1.217,
+   "tokens_ratio": 0.453
+  },
+  "PHP": {
+   "new": 3.264,
+   "old": 1.662,
+   "tokens_ratio": 0.509
+  },
+  "Python": {
+   "new": 3.087,
+   "old": 1.648,
+   "tokens_ratio": 0.534
+  },
+  "Ruby": {
+   "new": 3.043,
+   "old": 1.711,
+   "tokens_ratio": 0.562
+  },
+  "Rust": {
+   "new": 3.331,
+   "old": 1.707,
+   "tokens_ratio": 0.513
+  },
+  "SQL": {
+   "new": 2.971,
+   "old": 1.505,
+   "tokens_ratio": 0.506
+  },
+  "Shell": {
+   "new": 2.993,
+   "old": 1.627,
+   "tokens_ratio": 0.544
+  },
+  "Swift": {
+   "new": 3.317,
+   "old": 1.644,
+   "tokens_ratio": 0.496
+  },
+  "TypeScript": {
+   "new": 3.25,
+   "old": 1.686,
+   "tokens_ratio": 0.519
+  },
+  "auto_math_text": {
+   "new": 4.256,
+   "old": 2.123,
+   "tokens_ratio": 0.499
+  },
+  "finemath": {
+   "new": 3.48,
+   "old": 1.957,
+   "tokens_ratio": 0.562
+  },
+  "khanacademy": {
+   "new": 4.364,
+   "old": 2.164,
+   "tokens_ratio": 0.496
+  },
+  "openstax": {
+   "new": 4.977,
+   "old": 2.182,
+   "tokens_ratio": 0.438
+  },
+  "stanford": {
+   "new": 5.246,
+   "old": 2.241,
+   "tokens_ratio": 0.427
+  },
+  "stories": {
+   "new": 4.965,
+   "old": 2.24,
+   "tokens_ratio": 0.451
+  },
+  "web_samples_v1": {
+   "new": 5.291,
+   "old": 2.215,
+   "tokens_ratio": 0.419
+  },
+  "web_samples_v2": {
+   "new": 5.468,
+   "old": 2.278,
+   "tokens_ratio": 0.417
+  },
+  "wikihow": {
+   "new": 4.984,
+   "old": 2.223,
+   "tokens_ratio": 0.446
+  }
+ },
+ "overall": {
+  "new": 4.118,
+  "old": 1.976,
+  "tokens_ratio": 0.48
+ }
+}
