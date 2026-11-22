@@ -22,6 +22,38 @@ cmake --build --preset release
 For another GPU: `cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="86;89"`. A debug build uses
 `--preset debug`.
 
+## Quality gate
+
+One command before every commit: format check, lint, the production build with warnings as errors, tests.
+
+```bash
+scripts/gate.sh             # = cmake --workflow --preset gate (in the toolchain container when tools are missing)
+scripts/gate.sh format      # rewrite the sources with clang-format first
+```
+
+It needs nvcc, clang 20 (`clang++-20`, `clang-tidy-20`, `clang-format-20`), cppcheck, CMake and Ninja. Without them,
+`gate.sh` runs inside `docker/builder.Dockerfile` (built on first use, no GPU needed). A first run takes about 5
+minutes; a re-run lints only the files that changed (about 25 s).
+
+| Layer | What it catches | Where |
+|---|---|---|
+| clang-format | style drift; every `if` / `for` braced | `.clang-format` |
+| nvcc + GCC `-Werror` | shadowing, format strings, fallthrough, null dereference, VLAs, cross-space calls; `-Wdouble-promotion` in the kernel sources | `cmake/Warnings.cmake` |
+| clang as the CUDA compiler, `-Werror` | its stricter warnings on host and device code (`-Wcomma`, `-Wloop-analysis`, unreachable code) | preset `lint` |
+| clang-tidy, host profile | bug-prone patterns, CERT rules (unchecked `fclose`, `atoi`, truncating `snprintf`), C++ Core Guidelines (uninitialized variables and members, narrowing, rule of five), the clang static analyzer, unchecked CUDA / cuBLAS statuses | `.clang-tidy` |
+| clang-tidy, CUDA profile | the kernel library and every device half: 32-bit index products widened to pointers (overflow past 2^31 elements), truncations, uninitialized registers, the analyzer | `cuda.clang-tidy` |
+| cppcheck | a second analyzer on the host sources | `cmake/Quality.cmake` |
+| hardening | `_FORTIFY_SOURCE=3`, libstdc++ bounds assertions, stack protector, stack-clash and CET protection, full RELRO, in every build | `LBC_HARDEN` |
+
+Run-time memory checks, both of which need a GPU:
+- `--preset asan`: AddressSanitizer and UndefinedBehaviorSanitizer on the host code.
+- compute-sanitizer: memcheck, racecheck, synccheck and initcheck on the kernels. Point the tests at data first:
+  `-DLBC_TEST_RUN=<run dir> -DLBC_SANITIZER_TESTS=ON` (and `LBC_TEST_CALCX_DIR` / `LBC_TEST_TOKENIZER` for the
+  Calc-X oracles), then `ctest --preset gate`.
+
+Exceptions to a rule are written at the line as `// NOLINT(check): reason`. Disabled checks are listed with their
+reason at the top of each profile.
+
 ## Layout
 
 ```
