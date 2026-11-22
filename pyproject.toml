@@ -20,7 +20,14 @@ dependencies = [
     "triton-xpu==3.7.1",
     "tqdm>=4.66.0",
     "rich>=15.0.0",
+    # the web chat (webchat/): async HTTP server, its ASGI runner, the server <-> worker message format
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "msgpack>=1.0",
 ]
+
+[dependency-groups]
+dev = ["httpx>=0.27"]  # FastAPI's TestClient (tests/test_webchat.py)
 
 [project.scripts]
 model = "model.cli:main"
