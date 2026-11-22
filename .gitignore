@@ -54,3 +54,6 @@ studies/*.pdf
 # Web chat page: npm packages and the build (`cd webchat/ui && npm run build`)
 webchat/ui/node_modules/
 webchat/ui/dist/
+
+# remote-pod: the current pod and its access token (never commit)
+.remote-pod/
