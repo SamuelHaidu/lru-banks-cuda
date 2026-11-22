@@ -129,8 +129,12 @@ void visit(V& v, RC& c) {
     v.begin("data");
     v("dataset", c.data.dataset);
     v("batch_size", c.data.batch_size);
+    v("micro_batch_size", c.data.micro_batch_size);
     v("epoch_passes", c.data.epoch_passes);
     v("seed", c.data.seed);
+    v("validation_dataset", c.data.validation_dataset);
+    v("mix_datasets", c.data.mix_datasets);
+    v("mix_fractions", c.data.mix_fractions);
     v.end();
     v.begin("training");
     v("learning_rate", c.training.learning_rate);
@@ -139,6 +143,7 @@ void visit(V& v, RC& c) {
     v("lr_decay_steps", c.training.lr_decay_steps);
     v("lr_min_ratio", c.training.lr_min_ratio);
     v("lr_decay_shape", c.training.lr_decay_shape);
+    v("lr_cycles", c.training.lr_cycles);
     v("weight_decay", c.training.weight_decay);
     v("beta_1", c.training.beta_1);
     v("beta_2", c.training.beta_2);
@@ -147,6 +152,7 @@ void visit(V& v, RC& c) {
     v("epochs", c.training.epochs);
     v("validation_steps", c.training.validation_steps);
     v("checkpoint_every", c.training.checkpoint_every);
+    v("init_from", c.training.init_from);
     v.end();
     v.begin("runtime");
     v("bank_chunk", c.runtime.bank_chunk);
@@ -210,11 +216,26 @@ void RunConfig::validate() const {
         check(n >= 2 && n <= SLOTS, "arch_params.bank_slots", "entries must be in [2, " + std::to_string(SLOTS) + "]");
     check(a.topk == 2, "arch_params.topk", "is fixed at 2 by the kernels");
     check(data.batch_size >= 1, "data.batch_size", "must be at least 1");
+    check(data.micro_batch_size == 0 || (data.micro_batch_size >= 1 && data.batch_size % data.micro_batch_size == 0),
+          "data.micro_batch_size", "must be 0 or divide data.batch_size");
+    check(data.mix_datasets.size() == data.mix_fractions.size(), "data.mix_fractions", "needs one entry per mix dataset");
+    {
+        int mixed = 0;
+        for (double f : data.mix_fractions) {
+            const int r = int(std::lround(f * data.batch_size));
+            check(f > 0 && r >= 1, "data.mix_fractions", "entries must give at least one row of the batch");
+            mixed += r;
+        }
+        check(mixed < data.batch_size, "data.mix_fractions", "must leave rows for data.dataset");
+        check(data.mix_datasets.empty() || data.validation_dataset.empty(), "data.mix_datasets",
+              "and data.validation_dataset cannot be combined");
+    }
     check(data.epoch_passes > 0, "data.epoch_passes", "must be positive");
     const TrainCfg& t = training;
     check(t.learning_rate > 0, "training.learning_rate", "must be positive");
     check(t.warmup_steps >= 0 && t.lr_decay_start >= 0 && t.lr_decay_steps >= 0, "training.warmup_steps / lr_decay_*",
           "must be >= 0");
+    check(t.lr_cycles >= 1, "training.lr_cycles", "must be at least 1");
     check(t.lr_min_ratio >= 0 && t.lr_min_ratio <= 1, "training.lr_min_ratio", "must be in [0, 1]");
     check(t.lr_decay_shape == "linear" || t.lr_decay_shape == "cosine", "training.lr_decay_shape",
           "must be \"linear\" or \"cosine\"");
@@ -245,7 +266,7 @@ Config RunConfig::model_config() const {
     c.N = arch.lru_dim;
     c.H = arch.num_heads;
     c.F = ffn_dim();
-    c.B = data.batch_size;
+    c.B = data.micro_batch_size > 0 ? data.micro_batch_size : data.batch_size;  // rows per forward/backward
     c.T = arch.window_size;
     c.bank_chunk = runtime.bank_chunk;
     c.ce_chunk = runtime.ce_chunk;
@@ -255,6 +276,7 @@ Config RunConfig::model_config() const {
     c.decay_steps = training.lr_decay_steps;
     c.min_ratio = float(training.lr_min_ratio);
     c.cosine = training.lr_decay_shape == "cosine";
+    c.cycles = training.lr_cycles;
     c.wd = float(training.weight_decay);
     c.beta1 = float(training.beta_1);
     c.beta2 = float(training.beta_2);
@@ -327,6 +349,12 @@ DatasetMeta DatasetMeta::load(const std::string& dir) {
     if (const json::Value* sp = m.find("score_prev_token"); sp && sp->type == json::Value::Number)
         d.score_prev_token = int(sp->num);
     if (const json::Value* rl = m.find("row_length"); rl && rl->type == json::Value::Number) d.row_length = int(rl->num);
+    if (const json::Value* ls = m.find("loss_spans"); ls && ls->type == json::Value::Array && !ls->arr.empty()) {
+        if (ls->arr.size() != 1 || ls->arr[0].type != json::Value::Array || ls->arr[0].arr.size() != 2)
+            throw std::runtime_error(dir + "/metadata.json: loss_spans: one [open, close] pair is supported");
+        d.span_open = int(ls->arr[0].arr[0].num);
+        d.span_close = int(ls->arr[0].arr[1].num);
+    }
     double avg = 0.0;
     if (const json::Value* a = m.find("avg_chars_per_token"); a && a->type == json::Value::Number) avg = a->num;
     auto split = [&](const char* s, std::string& file, double& cpt) {

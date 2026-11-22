@@ -59,18 +59,39 @@ bool scored_at(const uint16_t* tok, size_t start, int marker, int score_after) {
     return false;
 }
 
+// whether a row starting at `start` begins inside a loss span: the last open tag, close tag or marker before it is
+// the open tag (scanning back at most a million tokens)
+bool in_span_at(const uint16_t* tok, size_t start, int marker, Span span) {
+    if (span.open < 0) return true;
+    for (size_t p = start, k = 0; p > 0 && k < (1u << 20); --p, ++k) {
+        const int x = tok[p - 1];
+        if (x == span.open) return true;
+        if (x == span.close || x == marker) return false;
+    }
+    return false;
+}
+
 // one row of T tokens from `start` (positions past n read as the marker); returns the scored targets. score_prev >= 0:
-// only targets whose input token follows that token are scored (a recall task's query marker: `? key` -> value)
+// only targets whose input token follows that token are scored (a recall task's query marker: `? key` -> value).
+// span (the dataset's loss_spans, as the Python pipeline): a target counts when the last open / close tag before it
+// is the open tag, so the span's tokens and its close tag count, the open tag and everything outside do not; the
+// marker closes any span
 int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int score_after, int score_prev, int* ids,
-             int* y, uint8_t* reset) {
+             int* y, uint8_t* reset, Span span) {
     bool on = scored_at(tok, start, marker, score_after);
+    bool in = in_span_at(tok, start, marker, span);
     int targets = 0;
     for (int t = 0; t < T; ++t) {
         const size_t p = start + size_t(t);
         const int x = p < n ? tok[p] : marker, nx = p + 1 < n ? tok[p + 1] : marker;
         if (x == marker) on = score_after < 0;
         if (x == score_after) on = true;
-        const bool scored = nx != marker && on && (score_prev < 0 || (p > 0 && p - 1 < n && tok[p - 1] == score_prev));
+        if (span.open >= 0) {
+            if (x == span.open) in = true;
+            else if (x == span.close || x == marker) in = false;
+        }
+        const bool scored = nx != marker && on && in &&
+                            (score_prev < 0 || (p > 0 && p - 1 < n && tok[p - 1] == score_prev));
         ids[t] = x;
         y[t] = scored ? nx : -1;
         reset[t] = x == marker;
@@ -82,8 +103,8 @@ int fill_row(const uint16_t* tok, size_t n, size_t start, int T, int marker, int
 }  // namespace
 
 Loader::Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker, uint64_t start_batch, int score_after,
-               int score_prev, bool aligned, int slots)
-    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), score_prev_(score_prev),
+               int score_prev, bool aligned, int slots, Span span)
+    : file_(file), B_(B), T_(T), marker_(marker), score_after_(score_after), score_prev_(score_prev), span_(span),
       aligned_(aligned), seed_(seed), next_batch_(start_batch),
       steps_per_pass_(steps_per_pass(file.size(), B, T)), slots_(size_t(slots)) {
     if (steps_per_pass_ == 0)
@@ -132,7 +153,8 @@ void Loader::fill(HostBatch& hb) {
     for (int b = 0; b < B_; ++b) {
         const size_t start = offset_ + size_t(order_[j * B_ + b]) * T_;
         const size_t o = size_t(b) * T_;
-        targets += fill_row(tok, n, start, T_, marker_, score_after_, score_prev_, hb.ids + o, hb.y + o, hb.reset + o);
+        targets += fill_row(tok, n, start, T_, marker_, score_after_, score_prev_, hb.ids + o, hb.y + o, hb.reset + o,
+                            span_);
     }
     hb.n_targets = targets;
     *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);
@@ -184,8 +206,62 @@ void Loader::release(HostBatch* hb, cudaStream_t stream) {
     cv_.notify_all();
 }
 
+MixLoader::MixLoader(std::vector<std::unique_ptr<Loader>> sources, std::vector<int> rows, int T)
+    : src_(std::move(sources)), rows_(std::move(rows)), T_(T), targets_(src_.size(), 0) {
+    if (src_.empty() || src_.size() != rows_.size()) throw std::runtime_error("MixLoader: one row count per source");
+    for (int r : rows_) B_ += r;
+    const size_t n = size_t(B_) * T_;
+    for (int i = 0; i < 2; ++i) {
+        LBC_CUDA(cudaHostAlloc(&buf_[i].ids, n * sizeof(int), cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&buf_[i].y, n * sizeof(int), cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&buf_[i].reset, n, cudaHostAllocDefault));
+        LBC_CUDA(cudaHostAlloc(&buf_[i].inv_n, sizeof(float), cudaHostAllocDefault));
+        LBC_CUDA(cudaEventCreateWithFlags(&done_[i], cudaEventDisableTiming));
+    }
+    LBC_CUDA(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
+}
+
+MixLoader::~MixLoader() {
+    for (int i = 0; i < 2; ++i) {
+        cudaFreeHost(buf_[i].ids);
+        cudaFreeHost(buf_[i].y);
+        cudaFreeHost(buf_[i].reset);
+        cudaFreeHost(buf_[i].inv_n);
+        cudaEventDestroy(done_[i]);
+    }
+    cudaStreamDestroy(side_);
+}
+
+HostBatch* MixLoader::next() {
+    const int k = k_++ % 2;
+    HostBatch& out = buf_[k];
+    if (recorded_[k]) LBC_CUDA(cudaEventSynchronize(done_[k]));  // the copies from this buffer have been done
+    size_t row = 0;
+    int targets = 0;
+    for (size_t i = 0; i < src_.size(); ++i) {
+        HostBatch* h = src_[i]->next();
+        const size_t o = row * T_, n = size_t(rows_[i]) * T_;
+        std::memcpy(out.ids + o, h->ids, n * sizeof(int));
+        std::memcpy(out.y + o, h->y, n * sizeof(int));
+        std::memcpy(out.reset + o, h->reset, n);
+        targets += h->n_targets;
+        targets_[i] += h->n_targets;
+        src_[i]->release(h, side_);  // copied on the CPU: free at once (the side stream is idle)
+        row += size_t(rows_[i]);
+    }
+    out.n_targets = targets;
+    *out.inv_n = 1.f / float(targets > 0 ? targets : 1);
+    return &out;
+}
+
+void MixLoader::release(HostBatch* hb, cudaStream_t stream) {
+    const int k = hb == &buf_[0] ? 0 : 1;
+    LBC_CUDA(cudaEventRecord(done_[k], stream));
+    recorded_[k] = true;
+}
+
 ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker,
-                             int score_after, int score_prev, bool aligned) {
+                             int score_after, int score_prev, bool aligned, Span span) {
     const size_t n = file.size();
     const uint16_t* tok = file.data();
     std::vector<size_t> starts;
@@ -208,7 +284,8 @@ ValidationSet::ValidationSet(const TokenFile& file, int B, int T, int steps, uin
         for (int b = 0; b < B; ++b) {
             const size_t start = starts[rng() % starts.size()];
             const size_t o = size_t(b) * T;
-            targets += fill_row(tok, n, start, T, marker, score_after, score_prev, hb.ids + o, hb.y + o, hb.reset + o);
+            targets += fill_row(tok, n, start, T, marker, score_after, score_prev, hb.ids + o, hb.y + o, hb.reset + o,
+                                span);
         }
         hb.n_targets = targets;
         *hb.inv_n = 1.f / float(targets > 0 ? targets : 1);

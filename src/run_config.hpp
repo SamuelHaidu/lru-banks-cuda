@@ -46,8 +46,15 @@ struct ArchCfg {
 struct DataCfg {
     std::string dataset;         // directory with metadata.json and the split files
     int batch_size = 64;
+    int micro_batch_size = 0;    // rows per forward/backward (0: batch_size); fewer: gradient accumulation, the
+                                 // exact gradient of the whole batch (normalized by its target count)
     double epoch_passes = 0.02;  // one epoch = this fraction of a pass over the train split (random windows)
     int seed = 42;               // data order, validation rows and the initialization
+    std::string validation_dataset;  // val_loss on this dataset's validation split (the training dataset's own split
+                                     // is then logged as val_data_loss): e.g. pretraining text during a fine-tune
+    std::vector<std::string> mix_datasets;  // more training sources, each a fixed share of every batch's rows
+    std::vector<double> mix_fractions;      // (round(fraction x batch_size) rows; `dataset` gets the rest); the first
+                                            // one's validation split is logged as val_mix_loss
 };
 
 struct TrainCfg {
@@ -56,11 +63,13 @@ struct TrainCfg {
     int lr_decay_start = 0, lr_decay_steps = 0;  // warmup-stable-decay: linear to lr_min_ratio x (0 steps: none)
     double lr_min_ratio = 0.1;
     std::string lr_decay_shape = "linear";  // "linear" or "cosine"
+    int lr_cycles = 1;           // > 1: the decay repeats lr_cycles times (each restart warms up over warmup_steps)
     double weight_decay = 0.1, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-7;
     double global_clipnorm = 1.0;  // 0 or null: off
     int epochs = 100;
     int validation_steps = 50;   // batches of validation rows at every epoch end (0: no validation)
     int checkpoint_every = 1;    // numbered checkpoints every N epochs (0: none); latest and best always
+    std::string init_from;       // a checkpoint whose weights start a new run (fresh optimizer, step 0; not on resume)
 };
 
 struct RuntimeCfg {
@@ -98,6 +107,7 @@ struct DatasetMeta {
     int score_after_token = -1;  // >= 0: only targets after this token in a document are scored (synthetic tasks)
     int score_prev_token = -1;   // >= 0: only targets whose input follows this token are scored (recall queries)
     int row_length = 0;          // > 0: the splits are whole packed rows of this length (window_size must match)
+    int span_open = -1, span_close = -1;  // loss_spans [[open, close]]: only targets inside the spans are scored
     static DatasetMeta load(const std::string& dir);
 };
 

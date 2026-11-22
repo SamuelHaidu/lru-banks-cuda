@@ -8,6 +8,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -33,6 +34,10 @@ class TokenFile {
     size_t n_ = 0;
 };
 
+struct Span {  // a dataset's loss span (loss_spans [[open, close]]): -1, no span (every target)
+    int open = -1, close = -1;
+};
+
 struct HostBatch {
     int* ids = nullptr;        // [B * T]
     int* y = nullptr;          // [B * T]
@@ -49,7 +54,7 @@ class Loader {
     // aligned: the file is made of whole rows of T tokens (documents never cross a row boundary): every pass cuts the
     // windows at offset 0 instead of a random one
     Loader(const TokenFile& file, int B, int T, uint64_t seed, int marker = 0, uint64_t start_batch = 0,
-           int score_after = -1, int score_prev = -1, bool aligned = false, int slots = 3);
+           int score_after = -1, int score_prev = -1, bool aligned = false, int slots = 3, Span span = {});
     // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
     static size_t steps_per_pass(size_t tokens, int B, int T) { return tokens > size_t(T) ? (tokens - T) / T / B : 0; }
     ~Loader();
@@ -67,6 +72,7 @@ class Loader {
 
     const TokenFile& file_;
     int B_, T_, marker_, score_after_, score_prev_;
+    Span span_;
     bool aligned_;
     uint64_t seed_;
     uint64_t next_batch_, pass_ = ~uint64_t(0), steps_per_pass_;
@@ -87,6 +93,31 @@ class Loader {
     double wait_ms_ = 0.0, fill_ms_ = 0.0;
 };
 
+// Batches mixing several token files at fixed row counts: every batch holds rows[i] rows of source i, each source
+// with its own Loader (its own passes and shuffled order, so a source's sampling is the same as alone), so the mix
+// is exactly the same at every step. inv_n: 1 / the whole batch's targets. With one source it is that Loader.
+class MixLoader {
+  public:
+    MixLoader(std::vector<std::unique_ptr<Loader>> sources, std::vector<int> rows, int T);
+    ~MixLoader();
+    MixLoader(const MixLoader&) = delete;
+    MixLoader& operator=(const MixLoader&) = delete;
+    HostBatch* next();                                  // blocks until every source's next batch is ready
+    void release(HostBatch* hb, cudaStream_t stream);   // after queuing its copies on `stream`
+    const std::vector<long long>& targets() const { return targets_; }  // scored targets per source so far
+
+  private:
+    std::vector<std::unique_ptr<Loader>> src_;
+    std::vector<int> rows_;
+    int T_, B_ = 0;
+    HostBatch buf_[2];
+    cudaEvent_t done_[2] = {nullptr, nullptr};
+    bool recorded_[2] = {false, false};
+    int k_ = 0;
+    cudaStream_t side_ = nullptr;
+    std::vector<long long> targets_;
+};
+
 // Validation rows, the same every epoch (as the Python pipeline's dense validation, `fixed` rows): `steps` batches of
 // B rows of T tokens, each row from a random document start (seeded per batch); past the end of the file the rows
 // are padded with the marker (no target). Built once into pinned memory.
@@ -94,7 +125,7 @@ class ValidationSet {
   public:
     // aligned: rows start at multiples of T (whole packed rows) instead of at random document starts
     ValidationSet(const TokenFile& file, int B, int T, int steps, uint64_t seed, int marker = 0, int score_after = -1,
-                  int score_prev = -1, bool aligned = false);
+                  int score_prev = -1, bool aligned = false, Span span = {});
     ~ValidationSet();
     ValidationSet(const ValidationSet&) = delete;
     ValidationSet& operator=(const ValidationSet&) = delete;
