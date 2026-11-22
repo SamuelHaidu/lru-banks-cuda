@@ -818,11 +818,18 @@ single-target, so `val_loss` is comparable with every other run.
 ## Web chat
 
 ```bash
-uv run python webchat/server.py [--port 8000] [--device xpu|cpu]    # open http://localhost:8000
+cd webchat/ui && npm install && npm run build                     # once, and after UI changes (needs Node)
+uv run python -m webchat.server [--port 8000] [--device xpu|cpu]   # open http://localhost:8000
 ```
 
-A local page (stdlib server, `webchat/server.py` + `webchat/index.html`) to chat with any run / checkpoint: tokens
-stream to the page (server-sent events). The sidebar builds the document as in training: a system prompt (the
+A local page to chat with any run / checkpoint: tokens stream to the page (server-sent events). Layout:
+`webchat/server.py` (FastAPI: the page, the tools, the catalogs), `webchat/worker.py` (the inference process the server
+starts: model loading, generation, the Inspect computations), `webchat/ipc.py` (their messages: a Unix socket, frames
+of a 4-byte length then msgpack; streamed replies; cancel), `tools.py` / `catalog.py` / `models.py` / `inspection.py`
+(the pieces both use), `webchat/ui/` (the page: React + TypeScript, built by Vite with vite-plugin-singlefile into one
+`dist/index.html`; `npm run dev` serves it with hot reload against a running server). Closing or stopping a reply
+cancels it in the worker; for recurrent models the worker keeps the state after a reply, so the next chat turn feeds
+only its new text (`model.generation.Session`). The sidebar builds the document as in training: a system prompt (the
 training prompts of `build_agent_mix_v2.SYSTEM`, editable), tool lists (the training tool lines, presets, unneeded
 tools), example requests (written ones plus first user messages of the run's validation data, by category).
 The model's `<call>`s run for real and their `<result>` is appended, then the model continues (up to "tool rounds"):

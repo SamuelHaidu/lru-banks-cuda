@@ -194,9 +194,12 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
   - `rope-state-memory` (SYCL kernels, fp16 assembly GEMM on the XPU);
   - `min-gru` / `min-gru-cuda` (static memory);
   - `gated-deltanet` (+ MoE, its CUDA optimization history is the template for this work).
-- **Web chat:** `uv run python webchat/server.py [--port 8000]`, at http://localhost:8000. Chat with tool execution,
-  Complete for plain-text runs, Inspect (lru-banks: read weights over past positions). For the math models: clear the
-  system prompt, tick only `calculator`.
+- **Web chat:** build the page once (`cd webchat/ui && npm install && npm run build`, needs Node), then
+  `uv run python -m webchat.server [--port 8000] [--device xpu|cpu]`, at http://localhost:8000. Chat with tool
+  execution, Complete for plain-text runs, Inspect (lru-banks: read weights over past positions). For the math models:
+  clear the system prompt, tick only `calculator`. Two processes: a FastAPI server (`webchat/server.py`: page, tools,
+  catalogs) and an inference worker it starts (`webchat/worker.py`), over a Unix socket with msgpack frames
+  (`webchat/ipc.py`). The page is React + TypeScript (`webchat/ui/`), built into one self-contained HTML file.
 - **Reports, per architecture** (`model/reports/`): `model report --run-name X` lists the reports for X's
   architecture; `model report <name> --run-name X` writes one as HTML under `runs/X/reports/`. A report declares
   `ARCHS` (architectures, a family such as `dual-tables`, `"any"` or `"no-run"`); add one by dropping a module there.
