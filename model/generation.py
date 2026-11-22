@@ -13,7 +13,7 @@ project-standard evaluation setting: sampling knobs are for exploration and
 must be requested explicitly, never applied silently.
 """
 
-from typing import Any, Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -69,42 +69,40 @@ def _filter_top_p(logits: np.ndarray, top_p: float) -> None:
     logits[order[cutoff]] = -np.inf
 
 
-def generate(
+class Session:
+    """A recurrent model's state over the ids fed into it so far (`stateful_generation` archs only), so that a later
+    call whose ids extend `ids` feeds only the new ones (a chat turn costs its new text, not the conversation)."""
+
+    def __init__(self) -> None:
+        self.ids: List[int] = []
+        self.state: Any = None
+
+    def clear(self) -> None:
+        self.ids, self.state = [], None
+
+
+def stream(
     model: Any,
-    prompt: Union[str, Sequence[int], np.ndarray],
-    tokenizer: Any = None,
+    ids: Sequence[int],
     max_new_tokens: int = 256,
     temperature: float = 0.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
     repetition_penalty: float = 1.0,
-    stop_tokens: Optional[List[str]] = None,
-    on_token: Optional[Callable[[int], None]] = None,
-) -> str:
-    """Generates a continuation.
+    stop_ids: Sequence[int] = (),
+    session: Optional[Session] = None,
+    cancel: Any = None,
+) -> Iterator[int]:
+    """Yields each new token id as soon as it is chosen (the stop token included), for prompt `ids`.
 
-    Args:
-        model: Any `BaseLM`; only `context_length` and `call()` are used.
-        prompt: A string (requires `tokenizer`) or a sequence of token ids.
-        max_new_tokens: Number of tokens to append.
-        temperature: `0.0` means greedy argmax. Above zero, logits are scaled
-            and sampled after optional top-k / top-p filtering.
-        stop_tokens: Strings whose final token id ends generation early.
-        on_token: Called with each new token id as soon as it is chosen (streaming), the stop token included.
+    `session` (stateful archs): continue from its state when `ids` extend the ids it covers, and leave it covering the
+    prompt and every yielded token. `cancel`: anything with `is_set()` (a `threading.Event`), checked before each
+    token."""
+    import torch
 
-    Returns:
-        The decoded prompt + continuation, or a space-joined id list when no
-        tokenizer was supplied.
-    """
-    ids = _encode(prompt, tokenizer)
+    ids = list(ids)
     context = int(model.context_length)
-
-    stop_ids = set()
-    for text in stop_tokens or []:
-        encoded = tokenizer.encode(text).ids if tokenizer is not None else []
-        if encoded:
-            stop_ids.add(encoded[-1])
-
+    stop = set(stop_ids)
     # Recurrent archs (`stateful_generation`) carry their state from token to token: the whole text is the
     # context, O(1) per token. The prompt starts a fresh document, as every training row does.
     stateful = bool(getattr(model, "stateful_generation", False))
@@ -113,13 +111,24 @@ def generate(
     reset = getattr(model, "reset_token", None)
     if stateful and reset is not None and feed[0] != reset:
         feed = [reset] + feed
+    fed: List[int] = []
+    if stateful and session is not None:
+        n = len(session.ids)
+        if session.state is not None and 0 < n < len(feed) and feed[:n] == session.ids:
+            fed, state, feed = list(session.ids), session.state, feed[n:]
+        else:
+            session.clear()
 
+    next_id = None
     for _ in range(max_new_tokens):
+        if cancel is not None and cancel.is_set():
+            break
         if stateful:
-            import torch
-
             with torch.no_grad():
                 out, state = model.advance(ops.convert_to_tensor(np.asarray([feed], dtype=np.int32)), state)
+            fed += feed
+            if session is not None:
+                session.ids, session.state = list(fed), state
             logits = np.asarray(ops.convert_to_numpy(out)[0], dtype=np.float64)
         else:
             window = ids[-context:]
@@ -146,10 +155,53 @@ def generate(
 
         ids.append(next_id)
         feed = [next_id]
+        yield next_id
+        if next_id in stop:
+            break
+    if stateful and session is not None and next_id is not None and session.ids[-1:] != [next_id]:
+        with torch.no_grad():  # the last token too, so the session covers everything that was yielded
+            _, state = model.advance(ops.convert_to_tensor(np.asarray([[next_id]], dtype=np.int32)), state)
+        session.ids, session.state = fed + [next_id], state
+
+
+def generate(
+    model: Any,
+    prompt: Union[str, Sequence[int], np.ndarray],
+    tokenizer: Any = None,
+    max_new_tokens: int = 256,
+    temperature: float = 0.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    repetition_penalty: float = 1.0,
+    stop_tokens: Optional[List[str]] = None,
+    on_token: Optional[Callable[[int], None]] = None,
+) -> str:
+    """Generates a continuation.
+
+    Args:
+        model: Any `BaseLM`; only `context_length` and `call()` are used (`advance` for stateful archs).
+        prompt: A string (requires `tokenizer`) or a sequence of token ids.
+        max_new_tokens: Number of tokens to append.
+        temperature: `0.0` means greedy argmax. Above zero, logits are scaled
+            and sampled after optional top-k / top-p filtering.
+        stop_tokens: Strings whose final token id ends generation early.
+        on_token: Called with each new token id as soon as it is chosen (streaming), the stop token included.
+
+    Returns:
+        The decoded prompt + continuation, or a space-joined id list when no
+        tokenizer was supplied.
+    """
+    ids = _encode(prompt, tokenizer)
+    stop_ids = set()
+    for text in stop_tokens or []:
+        encoded = tokenizer.encode(text).ids if tokenizer is not None else []
+        if encoded:
+            stop_ids.add(encoded[-1])
+    for next_id in stream(model, ids, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
+                          top_p=top_p, repetition_penalty=repetition_penalty, stop_ids=stop_ids):
+        ids.append(next_id)
         if on_token is not None:
             on_token(next_id)
-        if next_id in stop_ids:
-            break
 
     if tokenizer is None:
         return " ".join(str(i) for i in ids)
