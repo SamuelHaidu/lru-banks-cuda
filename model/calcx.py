@@ -1,5 +1,5 @@
 """The Calc-X calculator task (`datasets/build_calc_x.py`): questions, the answer check, and the batched agent loop
-(`rollout`) shared by the evaluation (`ad hoc scripts/calc_x_eval.py`) and the RL trainer (`model/grpo.py`).
+(`rollout`) shared by the evaluation (`ad_hoc_scripts/calc_x_eval.py`) and the RL trainer (`model/grpo.py`).
 
 A question is asked as in training (the calculator tool listed, `<user>question</user><assistant>`); the model writes,
 every `<call>calculator(expression="...")</call></assistant>` is executed and its result fed back

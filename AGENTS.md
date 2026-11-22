@@ -89,10 +89,10 @@ model create --run-name Y --init-from X [--init-checkpoint best]              # 
   their inverses, which is wrong in bf16.
 - **Tests:** `tests/test_arch_lru_banks.py` (row == generation, kernels vs the float64 reference: values and gradients)
   and `tests/test_bank_memory.py`. They are the oracle for any new kernel.
-- **Benchmark:** `uv run python "ad hoc scripts/bench_lru_banks.py" [--batch N] [--window T] [--set k=v] [--profile]`
+- **Benchmark:** `uv run python ad_hoc_scripts/bench_lru_banks.py [--batch N] [--window T] [--set k=v] [--profile]`
   (step time, tokens/s, TFLOPS, GPU-time split, peak memory). Its `--set` takes scalars only: the per-layer `hops`
   list needs a small change first.
-- **Inspection:** `ad hoc scripts/lru_banks_layer_use.py` (per layer: output size, gate mean, loss when silenced) and
+- **Inspection:** `ad_hoc_scripts/lru_banks_layer_use.py` (per layer: output size, gate mean, loss when silenced) and
   `lru_banks_weight_stats.py`. Web chat Inspect: Loss / Stored / Recall / Gate, the exact read weights over past
   positions.
 
@@ -121,7 +121,7 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
 | `lru-banks-6L-512-grpo-b1024` | GRPO, binary reward, 1024 x 8 per update | best 24.1% (test sample) |
 | `lru-banks-6L-512-grpo-pc` | GRPO with partial step credit (0.5, `--no-std`) | **best math checkpoint**, `checkpoints/best.keras`, 25.3% (test sample) |
 
-- **Calc-X evaluation:** `uv run python "ad hoc scripts/calc_x_eval.py" --run-name X [--checkpoint best] [--limit N]
+- **Calc-X evaluation:** `uv run python ad_hoc_scripts/calc_x_eval.py --run-name X [--checkpoint best] [--limit N]
   [--device xpu|cuda]` (agent loop with the calculator; `model/calcx.py`).
 - **RL:** `python -m model.grpo --run-name Y --init-run X [--partial-credit 0.5 --no-std ...]` (`model/grpo.py`).
 - **Every training stage of the current 4-layer model** (pretraining, context 1024, Toucan anneals, Calc-X SFT, RL) with its exact config and results: `docs/training-recipes.md`.

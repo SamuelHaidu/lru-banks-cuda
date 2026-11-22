@@ -109,7 +109,7 @@ cmd_push() {
     connect
     $SSH "$HOST" "mkdir -p $REMOTE_DIR $RUNS_DIR && ln -sfn $RUNS_DIR $REMOTE_DIR/runs"
     cd "$ROOT"
-    local code=(model tests "ad hoc scripts" webchat pyproject.toml uv.lock AGENTS.md CLAUDE.md README.md pod.sh)
+    local code=(model tests ad_hoc_scripts webchat pyproject.toml uv.lock AGENTS.md CLAUDE.md README.md pod.sh)
     local builders=(datasets/*.py)
     # -R keeps the relative paths; -rlptD (not -a): no owner/group (the pod's root can't match our uid anyway)
     rsync -rlptDzR --info=stats1 -e "$SSH" --exclude "__pycache__/" --exclude "*.pyc" \

@@ -511,7 +511,7 @@ Choice, from the availability seen this week:
    - The LRU still updates its state at every token (it is cheap). Keys and writes are unaffected by read skipping.
 6. **Removing the LRU input gate.** That gate is the LRU's selective decay (g = 0 freezes the state, like Mamba's
    step size), not a memory gate. Removing it makes the LRU time-invariant between resets.
-   - Its value is measurable with `ad hoc scripts/lru_banks_layer_use.py` (it reports the gate mean per layer). Add
+   - Its value is measurable with `ad_hoc_scripts/lru_banks_layer_use.py` (it reports the gate mean per layer). Add
      the loss with the gate fixed at its mean.
    - Test the removal rather than assume it. The read / write gates do a different job (what enters and leaves the
      banks), so they do not replace the LRU gate by construction.

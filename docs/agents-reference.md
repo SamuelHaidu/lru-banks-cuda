@@ -149,7 +149,7 @@ these options load as `"add"` / their saved `mlp_residual`. `tie_embeddings` (de
 `logits = RMSNorm(y) E^T`. Pre-norm (`pre_norm`, default true): RMSNorm on each layer input and before the
 readout. Embedding std 0.02. `num_layers` stacks layers. Runs saved before these options load as `"add"` / their
 saved `mlp_residual`.
-`uv run python "ad hoc scripts/rsm_gate_retention.py" --run-name X` reports the learned decays, bank use and the
+`uv run python ad_hoc_scripts/rsm_gate_retention.py --run-name X` reports the learned decays, bank use and the
 read gate; `rsm_name_recall.py` tests recall of rare multi-token names.
 `model scripts rsm-bank-stepper --run-name X [--text "..."] [--name " Roxy"]` writes an interactive page
 (`reports/rsm_bank_stepper.html`, open at a step with `#doc=0&t=79&bank=71`): the read as exact attention over
@@ -162,8 +162,8 @@ On the XPU it trains through custom SYCL kernels (`model/kernels/rsm_scan.sycl`,
 scans), fused RMSNorm / L2-normalize / bias+GELU passes around oneDNN matmuls. Elsewhere, or with dims the kernels
 do not cover (dim and key_dim in 16..128, multiples of 64 for the fused norms), it falls back to the chunked torch
 path, which is what the kernels are tested against (`tests/test_arch_rope_state_memory.py`).
-`uv run python "ad hoc scripts/bench_rope_state_memory.py" --layers 1 2 4 [--profile]` times a training step;
-`bash "ad hoc scripts/disasm_rsm_kernels.sh"` AOT-compiles the kernels for `tgllp` and disassembles each with
+`uv run python ad_hoc_scripts/bench_rope_state_memory.py --layers 1 2 4 [--profile]` times a training step;
+`bash ad_hoc_scripts/disasm_rsm_kernels.sh` AOT-compiles the kernels for `tgllp` and disassembles each with
 `iga64 -p=12p1` (`$IGA64`, else PATH, else `~/projects/tiny-lm/.toolchain/igc-tools/usr/bin/iga64`), plus SIMD width,
 GRF and spill sizes from the zebin.
 
@@ -177,7 +177,7 @@ mix run only at positions with a target (`dense_hidden_valid`: that output feeds
 is joined to the state by one fused kernel (`join_read`). `arch_params.mlp_recompute false` keeps the MLP
 pre-activations (rows x mlp_hidden floats per layer) instead of recomputing them in the backward pass.
 Throughput at 1 x 16384: 3.75 s per row, ~4,400 tokens/s (~2,100 targets/s on agent-mix-nemotron), peak 4.8 GiB;
-matmuls are ~68% of it (fp32 at 1.74 TFLOPS). `uv run python "ad hoc scripts/bench_rsm_run.py" --run-name X
+matmuls are ~68% of it (fp32 at 1.74 TFLOPS). `uv run python ad_hoc_scripts/bench_rsm_run.py --run-name X
 [--batch N] [--window T] [--profile]` times full steps of a run's config on real batches (writes nothing).
 Iris Xe torch quirks: the embedding backward fails for 1025..2048 ids and the backward of boolean-mask indexing at
 some shapes (work-groups over 512): the arch gathers with `index_select` instead.
@@ -213,7 +213,7 @@ cached in `.kernel_build/hgemm/`): iga64 assembles the generator's output, ocloc
 for the assembly, and the zebin is loaded through Level Zero into torch's SYCL queue (`hgemm.sycl`), checking that the
 driver runs our code. Needs `iga64` ($IGA64, PATH or ~/projects/tiny-lm/.toolchain) and the driver's `ocloc`.
 Operands are packed to fp16 panels by one pass each (`pack`, `pack_rows`: bandwidth-bound, ~1.6 s of the step).
-`ad hoc scripts/hgemm/`: `build.sh` + `hgemm.cpp` (the SYCL prototype, ISA stats), `zeload.cpp` (loading check),
+`ad_hoc_scripts/hgemm/`: `build.sh` + `hgemm.cpp` (the SYCL prototype, ISA stats), `zeload.cpp` (loading check),
 `hgemm_bench.cpp` (the assembly kernel standalone). `RSM_HGEMM=0` disables it (the arch then raises if `mlp_fp16`).
 
 ## minGRU stack (`min-gru`)
@@ -221,7 +221,7 @@ Operands are packed to fp16 panels by one pass each (`pack`, `pack_rows`: bandwi
 ```bash
 model create --run-name X --arch min-gru --dataset agent-mix-bpe1024
 model train --run-name X
-uv run python "ad hoc scripts/mingru_inspect.py" --run-name X [--text "..."]   # what the states hold
+uv run python ad_hoc_scripts/mingru_inspect.py --run-name X [--text "..."]   # what the states hold
 ```
 
 minGRU layers (Feng et al. 2024) writing into a residual stream through tanh, plain PyTorch (`model/archs/min_gru.py`,
@@ -238,7 +238,7 @@ tokens/s at rows of 512 to 16384 with the same tokens per step and the same memo
 at 4 x 16384, 1.3x the time). Defaults (dim 128, hidden 256, 4 layers, 0.66M params): ~85k tokens/s at 16 x 1024 on
 the Iris Xe (191-194 ms per step), fp32, ~44 GFLOP per step (~0.23 TFLOPS: bandwidth-bound elementwise passes, the
 matmuls are ~18% of the time). RMSNorm has a hand-written backward (`RMSNorm`, ~30% faster than autograd's).
-`uv run python "ad hoc scripts/profile_min_gru.py" [--step-only] [--set key=value ...]` times the real train step on
+`uv run python ad_hoc_scripts/profile_min_gru.py [--step-only] [--set key=value ...]` times the real train step on
 agent-mix batches and each part alone. (The paper's log-space scan with `torch.logcumsumexp` was 15x slower here: the
 Iris Xe's `logcumsumexp` is ~100x a `cumsum`; removed.)
 Agent data: the loss covers only `loss_spans` (training and validation: prompts, tool lists and results are read,
@@ -286,7 +286,7 @@ training. The scan is one parallel associative scan (torch's `associative_scan` 
 forward vs 1.7 ms for the chunked scan at 32 x 512 x 256 on an RTX A5000), its backward the same scan from the end
 (`ParallelScan`); shapes are padded to buckets (one compile each). On the A5000 with the static memory: 47 ms per step
 (`min-gru`: 54), ~2 min per pass; the GPU is busy ~25 ms of it (the rest is launch / Python overhead).
-Tests: `tests/test_arch_min_gru_cuda.py` (CUDA only). `ad hoc scripts/bench_scan.py` compares the scans;
+Tests: `tests/test_arch_min_gru_cuda.py` (CUDA only). `ad_hoc_scripts/bench_scan.py` compares the scans;
 `profile_min_gru.py --device cuda --arch min-gru-cuda` times the real step.
 
 ## Gated DeltaNet + MoE (`gated-deltanet`)
@@ -320,16 +320,16 @@ most of the time; batch 192: 192k tokens/s, 18.2 GiB). Memory: the backward pass
 GiB at 96 x 512); now ~11 KB (9.5 GiB): `activation_memory_budget` 0.5 (a global AOTAutograd setting: the compiled
 graphs recompute their elementwise parts), the experts save only input and pre-activation in bf16, routed rows and
 the gate in bf16. `arch_params.recompute true`: 2.5 GiB at +21% time.
-`ad hoc scripts/bench_gdn.py [--batch N] [--set dim=512 ...] [--profile]` times steps, TFLOPS against the peak and
+`ad_hoc_scripts/bench_gdn.py [--batch N] [--set dim=512 ...] [--profile]` times steps, TFLOPS against the peak and
 the GPU time by kind (tensor-core matmuls, fp32 SIMT matmuls, fla kernels, elementwise).
-`ad hoc scripts/gdn_moe_health.py --run-name X [--dataset D] [--docs N] [--per-layer]`: expert load with / without the
+`ad_hoc_scripts/gdn_moe_health.py --run-name X [--dataset D] [--docs N] [--per-layer]`: expert load with / without the
 router bias, how many choices the bias overrides, gates, expert output similarity, routing ablations (in
 `gdn-16L-256-moe6-*` the routers of layers 0-10 send 75-100% of tokens to one expert and the bias does the routing;
-layers 0-3's MoE is worth ~0.05 nats). `ad hoc scripts/gdn_subword_trace.py --run-name X [--dataset D]`: how words are
+layers 0-3's MoE is worth ~0.05 nats). `ad_hoc_scripts/gdn_subword_trace.py --run-name X [--dataset D]`: how words are
 assembled from BPE pieces (logit lens by depth inside a word, MoE / mixer / conv ablations, first-piece probes,
 routing by piece position). Found: layer 0's heads have half-lives of 0.1-1.9 tokens (a window of the last pieces;
 its mixer is worth ~2.6 nats), layers 1-3 are nearly idle (~0.11 nats together), layers 4-11 complete words gradually,
-12-15 choose the word and the next one. `ad hoc scripts/gdn_logit_attribution.py --run-name X --text-file F (--pos N |
+12-15 choose the word and the next one. `ad_hoc_scripts/gdn_logit_attribution.py --run-name X --text-file F (--pos N |
 --at TOKEN) [--a A --b B]`: exact direct logit attribution of logit(A) - logit(B) at one position (the final rms and
 each head's read rms fixed): the embedding, each layer's mixer and MoE, each head, and each past position through the
 unrolled read (the votes sum to the logit difference, printed as a check). Tests:
@@ -365,7 +365,7 @@ CUDA training path (`model/archs/bank_kernels.py`, `LRU_BANKS_FUSED=0` disables 
   over the two largest equals the renormalized top-2 of the full softmax: no softmax over 128 slots, no topk).
 - on CUDA the torch path (generation) runs in fp32: its chunked forms multiply factors up to e^30 and their
   inverses, exact in fp32, not in bf16. `gated_deltanet.py` turns TF32 on globally when imported.
-Speed on the A5000, batch 64 x 512 (`ad hoc scripts/bench_lru_banks.py [--batch N] [--profile]`): first version
+Speed on the A5000, batch 64 x 512 (`ad_hoc_scripts/bench_lru_banks.py [--batch N] [--profile]`): first version
 752 ms per step, 43.6k tokens/s, 16.6 GiB (44% of the GPU time unfused elementwise: fp32 adds, bf16 casts, the
 routing softmax + topk); compiled pieces + top-2 shortcut: 582 ms, 56.3k tokens/s, 11.3 GiB; keeping w for the
 backward: 566 ms, 57.9k tokens/s, 12.1 GiB (batch 96: 58.2k, 18.1 GiB; 128 does not fit). Now ~48% of the GPU time is
@@ -407,7 +407,7 @@ Target: ~2.2 nats per token = 0.72 bits per character at 4.38 characters per tok
 ./pod.sh status | stop | start | rm
 ```
 
-Scheduled pulls: `ad hoc scripts/pull_checkpoints.sh <run>` pulls, checks the copies' zips (a pull that met the pod
+Scheduled pulls: `ad_hoc_scripts/pull_checkpoints.sh <run>` pulls, checks the copies' zips (a pull that met the pod
 mid-save gets a truncated file: it pulls again after 30 s) and logs one line to `logs/pull_<run>.log`. A user crontab
 entry runs it every 5 min for `lru-banks-4L-512` (before: `gdn-16L-256-moe6-mix`) (with `PATH` including `~/.local/bin` for runpodctl, `flock`
 against overlaps); remove it (`crontab -e`) when the pod is stopped.
@@ -611,7 +611,7 @@ recurrence (chunked matmuls, one state per chunk boundary). `tests/test_bank_mem
 gradients, float64, 1e-10, resets, every chunk size and norm), carried state, the read not feeding back, routing, the
 layer row-wise vs position by position. The torch chunks materialize (B, H, M, C, C) decay masks: a reference for
 fla's `chunk_gsa`-style kernel, not for 512 slots at scale.
-`ad hoc scripts/bank_recall_demo.py [--arch bank|lru|gdn|all]`: MQAR (key -> value pairs, then keys asked again), one
+`ad_hoc_scripts/bank_recall_demo.py [--arch bank|lru|gdn|all]`: MQAR (key -> value pairs, then keys asked again), one
 layer, CPU. 16 pairs, 64 slots: bank 98.9% recall at step 200, 100% at 800; LRU alone 4.1% (chance 1.6%); one
 `gated-deltanet` layer (2 heads x 32) 2.6% / 66% / 94.5% / 97.4% at steps 200 / 400 / 600 / 800. 48 pairs in 64 slots:
 bank 99.8% at step 600. `--task induction` (the textbook test: 24 distinct random tokens of 128, then the same again;
@@ -747,7 +747,7 @@ also appear first), mixed question depths, one question per row.
 Why it works where two layers stalled: both hops query the same key space (the key is "the context was X"), so the
 FFN only has to map the retrieved value b to the query for "the context was b". In two layers, layer 1's keys came
 from its own LRU over a different stream. Phase change between steps 500 and 750, as in induction-head formation.
-Needle in a haystack (`ad hoc scripts/niah_bank.py`: filler tokens from their own vocabulary, needles "KEY k v" at
+Needle in a haystack (`ad_hoc_scripts/niah_bank.py`: filler tokens from their own vocabulary, needles "KEY k v" at
 random depths, questions "ASK k"; `--task twohop`: "KEY k1 k2" + "KEY k2 v", ASK k1 -> v, 4 chains per row (3
 distractors: picking a chain = 25%), plus a never-asked "KEY v x" per chain so the end is also a key; trained on
 haystacks of 16-96; weights `runs/_synthetic/niah/twohop_bank2_s0.pt`). One bank layer x 2 hops, 64 slots, 1,000
@@ -781,7 +781,7 @@ LRU init) for pair-structured recall.
 Order, not a bag of words: the LRU state is `h_t = sum_j lambda^j b_{t-j}`; swapping the tokens at offsets i, j changes
 it by exactly `(lambda^i - lambda^j)(b_x - b_y)` (a bag is lambda = 1). `tests/test_bank_memory.py` checks the
 identity and that all 120 orders of 5 tokens give distinct states (one state at lambda = 1).
-`ad hoc scripts/lru_order_probe.py [--ckpt X]` measures how much order survives. On the trained copy layer (half-lives
+`ad_hoc_scripts/lru_order_probe.py [--ckpt X]` measures how much order survives. On the trained copy layer (half-lives
 0.7-19, median 2.4), a linear probe on the state gives the token at offset 0 / 1 / 2 / 3 / 4 / 6 / 9 with 1.00 /
 1.00 / 0.94 / 0.74 / 0.54 / 0.28 / 0.14 accuracy mid-sequence (chance 0.03). After 8 distinct tokens, a bag scores
 at most 0.125 at any offset; the state scores 1.00 / 1.00 / 0.97 / 0.82 / 0.65 / 0.49 / 0.36 / 0.30, and the key

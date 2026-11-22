@@ -34,7 +34,7 @@ activations in the backward pass).
 
 Interpretable by construction: each layer's state is `hidden_size` numbers in -1..1, each channel with its own
 timescale (`update_gate` near 0: keeps; near 1: overwrites). `inspect(ids)` returns every gate, candidate, state and
-write per position; `ad hoc scripts/mingru_inspect.py` prints them for a text.
+write per position; `ad_hoc_scripts/mingru_inspect.py` prints them for a text.
 
 Agent data: the dataset's `loss_spans` make every non-assistant target ignored (-1). The dense train step then
 reads out only the positions with a target, and the last layer's write runs at those positions only

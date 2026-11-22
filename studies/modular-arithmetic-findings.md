@@ -1,9 +1,9 @@
 # Modular arithmetic (`modular-arithmetic-97`) findings
 
-Scripts: `ad hoc scripts/modarith_operation_accuracy.py`,
-`ad hoc scripts/modarith_addition_mechanism.py`,
-`ad hoc scripts/modarith_addition_mechanism_over_time.py`,
-`ad hoc scripts/modarith_multiplication_mechanism.py`. Runs:
+Scripts: `ad_hoc_scripts/modarith_operation_accuracy.py`,
+`ad_hoc_scripts/modarith_addition_mechanism.py`,
+`ad_hoc_scripts/modarith_addition_mechanism_over_time.py`,
+`ad_hoc_scripts/modarith_multiplication_mechanism.py`. Runs:
 `modarith-baseline` (lr=0.001, batch=512, trained slowly),
 `modarith-baseline-v2` (same config except lr=0.1 fixed for the entire run,
 batch=16384 -- see below).
@@ -175,7 +175,7 @@ stopped. **Epoch 24 is the last good state**
 (`checkpoints/checkpoint_00024.keras`) -- it's also the epoch quoted
 throughout findings #4-9 above (88.3% `*` exact-match, 99.7%/99.8% `+`/`-`).
 `model.keras` (what `load_checkpoint(..., "latest")` reads) is now the
-corrupted post-divergence state, so **every `ad hoc scripts/modarith_*`
+corrupted post-divergence state, so **every `ad_hoc_scripts/modarith_*`
 script that targets `modarith-baseline-v2` has been pinned to
 `CHECKPOINT = 24` explicitly** rather than `"latest"`. Root cause not yet
 investigated (lr=0.1 the whole run is a plausible suspect -- see the open

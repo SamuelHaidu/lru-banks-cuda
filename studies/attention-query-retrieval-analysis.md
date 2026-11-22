@@ -326,7 +326,7 @@ softmax here is bounded by however many distinct token ids actually occur in
 a given 128-token window, not by vocabulary size, so Finding 2's
 "near-uniform over the full vocabulary" framing does not directly transfer.
 
-`ad hoc scripts/gpu_retriver_tokenid_softmax_mass.py` measures concentration
+`ad_hoc_scripts/gpu_retriver_tokenid_softmax_mass.py` measures concentration
 directly: for each of 2,048 real validation examples (8 batches of 256,
 sampled the same way `build_full_eval_dataset` samples for `model
 evaluate`), it scatters the trace's per-position softmax weights by token id
@@ -363,7 +363,7 @@ and would need the token-id equivalent, `retrieval-ablation-loss-tokenid`.
 
 ### Eyeball check: 5 sampled generations at temperature 0.5
 
-`ad hoc scripts/gpu_retriver_tokenid_generate_sample.py` generates from the
+`ad_hoc_scripts/gpu_retriver_tokenid_generate_sample.py` generates from the
 same checkpoint (`gpu-retriver-tokenid`, `latest`, eval loss 2.1969, top-1
 49.04%) by calling `model.generation.generate` directly rather than the
 `model generate` CLI, because the CLI does not expose `stop_tokens` or a
