@@ -106,6 +106,7 @@ Measured performance and its history are in `RESEARCH_LOG.md` (current standing 
 | `calc-x-bpe32768` | Calc-X (gsm8k, ape210k, math_qa, aqua_rat, mawps, asdiv_a, svamp) with `calculator` tool calls | `loss_spans` (assistant turns); test split for the evaluation |
 | `calc-x-mix-bpe32768` | Calc-X weighted + 30% pretraining documents (`datasets/build_calc_x_mix.py`) | every token scored, `"chat": true` so the web chat offers Chat |
 | `kodcode-agent-bpe32768` | KodCode-V1 (CC BY-NC 4.0) as tool-use coding (write / run pytest / edit), 35k train docs, 28.3M tokens; solve and fix | built with a sandboxed runner (`datasets/build_kodcode_agent.py`); not trained on yet |
+| `toucan-bpe32768` | Toucan-1.5M (Apache 2.0, arXiv 2510.01179): tool-agent trajectories over 495 real MCP servers (Kimi-K2 / OSS / Qwen3 generations, SFT subset for unseen uuids), converted to our tags (`<tools>` signatures, `<call>name(k=<JSON>)</call>`, `<result>`, OSS reasoning as `<think>`); artifacts dropped (bad call JSON, no final answer, tag text in content), non-Latin script > 0.5% of letters dropped; 6.13B train tokens, 1.32M docs, validation / test ~1.2k docs | `datasets/build_toucan.py`; stored as `datasets/toucan-bpe32768.tar.zst` (train as `train.npy.zst`, multi-frame); for long-sequence fine-tuning; loss_spans = assistant turns |
 
 Packed rows (`PackedDocumentDataset`, `model/data.py`): `<bos>doc<eos>` documents concatenated, random windows (one
 pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outside `loss_spans`. Older datasets
@@ -123,6 +124,8 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
 - **Calc-X evaluation:** `uv run python "ad hoc scripts/calc_x_eval.py" --run-name X [--checkpoint best] [--limit N]
   [--device xpu|cuda]` (agent loop with the calculator; `model/calcx.py`).
 - **RL:** `python -m model.grpo --run-name Y --init-run X [--partial-credit 0.5 --no-std ...]` (`model/grpo.py`).
+- **Every training stage of the current 4-layer model** (pretraining, context 1024, Toucan anneals, Calc-X SFT, RL) with its exact config and results: `docs/training-recipes.md`.
+- **RL in C++ (lru-banks-cuda, no Python):** `lbc grpo RUN_DIR` with `RUN_DIR/grpo.json` (init_from, Calc-X docs, tokenizer, mode `grpo` | `raft`, group, questions, ppo_epochs, tis_cap, save, ...); ~3 s per update of 512 x 8 rollouts on the 4090 (log P54, T08, T27-T30). Checks: `lbc test-calcx` (tokenizer / calculator / reward oracles), `lbc decode-check` (incremental decoder vs the training forward). Collapse guards (log T39-T43): `max_repeat`, `unique`, `replay_rows` / `replay_coef`, `novelty`; use them (RAFT without them collapses, plain GRPO converges on one solution).
 
 ## RunPod (`pod.sh`)
 
@@ -143,6 +146,10 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
   - Upload only code and the needed datasets; never `.env`, `credentials.txt`, venvs or `runs/`.
   - Evaluations run on the pod, not locally; with `OMP_NUM_THREADS=3` and nice 19 while the GPU trains.
   - Remove any crontab pull entry when the pod stops.
+  - `/workspace` has a 20 GB quota (`df` shows the shared filesystem, not the quota): a full volume kills a run at its
+    next checkpoint write (log P55, P59). Keep only `model.lbc` + `best.lbc` on the pod; the cron sync
+    (`sync_run.sh`, never deletes locally) keeps the rest; delete on the pod only after an md5 match.
+  - Watch every long run (a 5-minute check: process alive, volume use, eval answered / accuracy).
 - **SSH:** `push` and `pull` need full SSH (rsync), so a community pod must have a public IP (`--public-ip`, port
   22/tcp). RunPod's proxy SSH (`ssh.runpod.io`) is interactive only.
 - **Known problem (2026-11-17 to 11-20):**
