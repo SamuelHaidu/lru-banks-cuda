@@ -50,3 +50,7 @@ node_modules/
 
 # Third-party papers kept for reference
 studies/*.pdf
+
+# Web chat page: npm packages and the build (`cd webchat/ui && npm run build`)
+webchat/ui/node_modules/
+webchat/ui/dist/
