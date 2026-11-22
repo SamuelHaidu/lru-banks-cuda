@@ -143,7 +143,7 @@ cmd_train() {
     remote "mkdir -p runs/$run && setsid -f nohup model train --run-name $run $extra >>runs/$run/train.log 2>&1 </dev/null; sleep 5; tail -c 400 runs/$run/train.log; echo; echo started" </dev/null
 }
 
-cmd_log() { remote "tail -n 40 -f runs/${1:?run name}/train.log"; }
+cmd_log() { remote "tail -n 40 -f /workspace/runs/${1:?run name}/train.log"; }  # runs/ links there
 
 cmd_pull() {
     local all=0 args=()
