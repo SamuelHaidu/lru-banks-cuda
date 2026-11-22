@@ -121,4 +121,21 @@ void load_checkpoint(const std::string& path, Model& model, cudaStream_t s) {
     LBC_CUDA(cudaStreamSynchronize(s));
 }
 
+void load_weights(const std::string& path, Model& model, cudaStream_t s) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot read " + path);
+    const Header hd = read_header(path, f);
+    const json::Value* tensors = hd.h.find("tensors");
+    if (!tensors || *tensors != manifest(model))
+        throw std::runtime_error(path + ": its tensors (names, shapes, layout) differ from this model's");
+    std::vector<float> buf(model.num_params());
+    f.seekg(std::streamoff(hd.data_offset));
+    f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size() * 4));
+    if (!f) throw std::runtime_error(path + ": truncated data");
+    LBC_CUDA(cudaStreamSynchronize(s));
+    LBC_CUDA(cudaMemcpy(model.params(), buf.data(), buf.size() * 4, cudaMemcpyHostToDevice));
+    model.prepare_weights(s);
+    LBC_CUDA(cudaStreamSynchronize(s));
+}
+
 }  // namespace lbc

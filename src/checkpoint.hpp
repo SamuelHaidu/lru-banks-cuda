@@ -25,5 +25,7 @@ void save_checkpoint(const std::string& path, Model& model, const json::Value& c
 CheckpointInfo read_checkpoint_info(const std::string& path);
 // parameters, moments and step count into `model` (the tensor list must match), then the bf16 weight copies
 void load_checkpoint(const std::string& path, Model& model, cudaStream_t s);
+// the parameters only (the tensor list must match): a new run from trained weights, fresh optimizer, step 0
+void load_weights(const std::string& path, Model& model, cudaStream_t s);
 
 }  // namespace lbc
