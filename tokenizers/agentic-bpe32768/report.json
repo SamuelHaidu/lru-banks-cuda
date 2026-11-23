@@ -1,0 +1,99 @@
+{
+ "name": "agentic-bpe32768",
+ "vocab_size": 32768,
+ "merges": 32496,
+ "sample_bytes": 1988686317,
+ "source": "/work/text/_all",
+ "chars_per_token": {
+  "nemotron-agentic/interactive_agent": {
+   "new": 4.171,
+   "old": 4.057,
+   "tokens_ratio": 0.973
+  },
+  "nemotron-agentic/tool_calling": {
+   "new": 4.113,
+   "old": 4.07,
+   "tokens_ratio": 0.99
+  },
+  "nemotron-opencode/data": {
+   "new": 4.007,
+   "old": 3.593,
+   "tokens_ratio": 0.897
+  },
+  "nemotron-swe/r2e_gym": {
+   "new": 4.041,
+   "old": 3.456,
+   "tokens_ratio": 0.855
+  },
+  "open-swe-traces/claudecode": {
+   "new": 3.577,
+   "old": 3.232,
+   "tokens_ratio": 0.904
+  },
+  "open-swe-traces/minisweagent": {
+   "new": 3.442,
+   "old": 3.014,
+   "tokens_ratio": 0.876
+  },
+  "open-swe-traces/opencode": {
+   "new": 3.486,
+   "old": 3.189,
+   "tokens_ratio": 0.915
+  },
+  "open-swe-traces/openhands": {
+   "new": 3.599,
+   "old": 3.264,
+   "tokens_ratio": 0.907
+  },
+  "open-swe-traces/sweagent": {
+   "new": 3.62,
+   "old": 3.208,
+   "tokens_ratio": 0.886
+  },
+  "openmath-tir/data": {
+   "new": 2.84,
+   "old": 2.763,
+   "tokens_ratio": 0.973
+  },
+  "terminal-corpus/dataset_adapters": {
+   "new": 3.487,
+   "old": 3.309,
+   "tokens_ratio": 0.949
+  },
+  "terminal-corpus/skill_based/easy": {
+   "new": 3.664,
+   "old": 3.393,
+   "tokens_ratio": 0.926
+  },
+  "terminal-corpus/skill_based/medium": {
+   "new": 3.599,
+   "old": 3.348,
+   "tokens_ratio": 0.93
+  },
+  "terminal-corpus/skill_based/mixed": {
+   "new": 3.668,
+   "old": 3.328,
+   "tokens_ratio": 0.907
+  },
+  "toucan/Kimi-K2": {
+   "new": 3.752,
+   "old": 3.507,
+   "tokens_ratio": 0.935
+  },
+  "toucan/OSS": {
+   "new": 3.5,
+   "old": 3.146,
+   "tokens_ratio": 0.899
+  },
+  "toucan/Qwen3": {
+   "new": 3.71,
+   "old": 3.405,
+   "tokens_ratio": 0.918
+  }
+ },
+ "overall": {
+  "new": 3.396,
+  "old": 3.14,
+  "tokens_ratio": 0.925
+ }
+}
