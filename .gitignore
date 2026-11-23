@@ -23,6 +23,7 @@ dist/
 runs/
 datasets/*
 !datasets/*.py
+!datasets/agentic/
 *.keras
 *.npy
 *.npz
