@@ -120,6 +120,8 @@ type CreateInput struct {
 	VolumeGB  int    // /workspace volume (0: none)
 	Env       map[string]string
 	Ports     string // "8080/http"
+	// DockerArgs replaces the image's command (empty: the image's own); used to start the agent on a public image
+	DockerArgs string
 }
 
 // Pod is what the API reports about a pod.
@@ -149,6 +151,9 @@ func (c *Client) Create(ctx context.Context, in CreateInput) (string, error) {
 		"containerDiskInGb": in.DiskGB, "volumeInGb": in.VolumeGB, "ports": in.Ports, "env": env,
 		"volumeMountPath": "/workspace",
 	}}
+	if in.DockerArgs != "" {
+		vars["input"].(map[string]any)["dockerArgs"] = in.DockerArgs
+	}
 	var d struct {
 		Pod struct {
 			ID string `json:"id"`
@@ -250,6 +255,9 @@ func (c *Client) CreateCPU(ctx context.Context, in CreateInput, instanceID strin
 		"instanceId": instanceID, "cloudType": "SECURE", "containerDiskInGb": in.DiskGB, "imageName": in.Image,
 		"name": in.Name, "ports": in.Ports, "env": env,
 	}}
+	if in.DockerArgs != "" {
+		vars["input"].(map[string]any)["dockerArgs"] = in.DockerArgs
+	}
 	var d struct {
 		Pod struct {
 			ID string `json:"id"`

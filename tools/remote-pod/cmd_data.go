@@ -376,7 +376,7 @@ progress; Ctrl-C only stops following (the run goes on): resume with remote-pod 
 			token, ref := newToken(), imageRef(cfg, image)
 			env := map[string]string{"REMOTE_POD_TOKEN": token, "REMOTE_POD_IDLE_MIN": "20",
 				"REMOTE_POD_JOB": base64.StdEncoding.EncodeToString(specJSON)}
-			id, err := createPod(ctx, c, cfg, gpuID, cloud, ref, disk, 0, env, "train-"+run)
+			id, err := createPod(ctx, c, cfg, gpuID, cloud, ref, disk, 0, env, "train-"+run, "")
 			if err != nil {
 				return err
 			}

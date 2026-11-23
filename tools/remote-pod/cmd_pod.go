@@ -80,7 +80,7 @@ func resolveGPU(ctx context.Context, c *runpod.Client, want string) (string, err
 
 // createPod tries community then secure (cloud "any"), with our image and the agent's environment.
 func createPod(ctx context.Context, c *runpod.Client, cfg *config.Config, gpu, cloud, image string, disk, volume int,
-	env map[string]string, name string) (string, error) {
+	env map[string]string, name, dockerArgs string) (string, error) {
 	clouds := map[string][]string{"any": {"COMMUNITY", "SECURE"}, "community": {"COMMUNITY"}, "secure": {"SECURE"}}[cloud]
 	if clouds == nil {
 		return "", fmt.Errorf("--cloud is community, secure or any (got %q)", cloud)
@@ -95,7 +95,7 @@ func createPod(ctx context.Context, c *runpod.Client, cfg *config.Config, gpu, c
 	for _, cl := range clouds {
 		ui.Note("asking for a %s %s pod", strings.ToLower(cl), gpu)
 		id, err := c.Create(ctx, runpod.CreateInput{Name: name, Image: image, GPUTypeID: gpu, Cloud: cl, DiskGB: disk,
-			VolumeGB: volume, Env: env, Ports: fmt.Sprintf("%d/http", config.AgentPort)})
+			VolumeGB: volume, Env: env, Ports: fmt.Sprintf("%d/http", config.AgentPort), DockerArgs: dockerArgs})
 		if err == nil {
 			return id, nil
 		}
@@ -140,7 +140,7 @@ func resolveCPU(ctx context.Context, c *runpod.Client, want string, vcpus int) (
 }
 
 func createCPUPod(ctx context.Context, c *runpod.Client, cfg *config.Config, instance, image string, disk int,
-	env map[string]string, name string) (string, error) {
+	env map[string]string, name, dockerArgs string) (string, error) {
 	if cfg.HasR2() {
 		for k, v := range (store.Config{Endpoint: cfg.R2.Endpoint, Bucket: cfg.R2.Bucket, AccessKey: cfg.R2.AccessKey,
 			SecretKey: cfg.R2.SecretKey, Region: cfg.R2.Region}).EnvVars() {
@@ -149,7 +149,7 @@ func createCPUPod(ctx context.Context, c *runpod.Client, cfg *config.Config, ins
 	}
 	ui.Note("asking for a CPU pod %s", instance)
 	return c.CreateCPU(ctx, runpod.CreateInput{Name: name, Image: image, DiskGB: disk, Env: env,
-		Ports: fmt.Sprintf("%d/http", config.AgentPort)}, instance)
+		Ports: fmt.Sprintf("%d/http", config.AgentPort), DockerArgs: dockerArgs}, instance)
 }
 
 func imageRef(cfg *config.Config, image string) string {
@@ -180,7 +180,9 @@ downloading and cleaning data, training tokenizers, compressing datasets; then r
   remote-pod up --gpu 5090 --cloud secure --disk 80
   remote-pod up --gpu "RTX 4090" --image dev         nvcc, cmake, ninja, nsys / ncu: the optimization loop
   remote-pod up --cpu 16 --disk 200                  data work: 16 vCPUs, 64 GB RAM (general purpose)
-  remote-pod up --cpu 8 --flavor memory              8 vCPUs, 64 GB RAM (see remote-pod cpus)`,
+  remote-pod up --cpu 8 --flavor memory              8 vCPUs, 64 GB RAM (see remote-pod cpus)
+  remote-pod up --cpu 32 --image buildpack-deps:noble    any public image: the agent is fetched from R2 at boot
+  remote-pod up --gpu "RTX 4090" --image nvidia/cuda:12.8.1-devel-ubuntu24.04`,
 		GroupID: "pod",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, cfg, err := api()
@@ -197,26 +199,36 @@ downloading and cleaning data, training tokenizers, compressing datasets; then r
 			ctx := context.Background()
 			token := newToken()
 			env := map[string]string{"REMOTE_POD_TOKEN": token, "REMOTE_POD_IDLE_MIN": fmt.Sprint(idle)}
-			var id, gpuID, ref string
-			if cpus > 0 {
-				if !cmd.Flags().Changed("image") {
-					image = "cpu"
+			var id, gpuID, ref, dockerArgs string
+			if cpus > 0 && !cmd.Flags().Changed("image") {
+				image = "cpu"
+			}
+			ref = imageRef(cfg, image)
+			if !isOurImage(cfg, ref) { // a public image: the pod downloads the agent at boot
+				args, extra, err := bootstrap(ctx, cfg)
+				if err != nil {
+					return err
 				}
-				ref = imageRef(cfg, image)
+				dockerArgs = args
+				for k, v := range extra {
+					env[k] = v
+				}
+				ui.Note("public image %s: the pod downloads the agent from R2 at boot", ref)
+			}
+			if cpus > 0 {
 				f, err := resolveCPU(ctx, c, flavor, cpus)
 				if err != nil {
 					return err
 				}
 				gpuID = runpod.CPUInstanceID(f, cpus)
-				if id, err = createCPUPod(ctx, c, cfg, gpuID, ref, disk, env, name); err != nil {
+				if id, err = createCPUPod(ctx, c, cfg, gpuID, ref, disk, env, name, dockerArgs); err != nil {
 					return err
 				}
 			} else {
 				if gpuID, err = resolveGPU(ctx, c, gpu); err != nil {
 					return err
 				}
-				ref = imageRef(cfg, image)
-				if id, err = createPod(ctx, c, cfg, gpuID, cloud, ref, disk, volume, env, name); err != nil {
+				if id, err = createPod(ctx, c, cfg, gpuID, cloud, ref, disk, volume, env, name, dockerArgs); err != nil {
 					return err
 				}
 			}

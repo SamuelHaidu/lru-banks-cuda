@@ -89,6 +89,15 @@ func (s *Store) Exists(ctx context.Context, key string) bool {
 	return err == nil
 }
 
+// Presign is a URL that downloads key without credentials until ttl passes (the URL carries a signature, not the key).
+func (s *Store) Presign(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	u, err := s.mc.PresignedGetObject(ctx, s.bucket, key, ttl, nil)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
 func (s *Store) PutFile(ctx context.Context, key, path string) error {
 	_, err := s.mc.FPutObject(ctx, s.bucket, key, path, minio.PutObjectOptions{})
 	return err

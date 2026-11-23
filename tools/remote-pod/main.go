@@ -74,6 +74,7 @@ func main() {
 	root.AddCommand(dataCommands()...)
 	root.AddCommand(buildCommands()...)
 	root.AddCommand(agentCommand())
+	root.AddCommand(bootstrapEnvCommand())
 	root.SetHelpCommandGroupID("pod")
 	root.SetCompletionCommandGroupID("build")
 
