@@ -142,6 +142,8 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
         for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.hops_of(l); }
         f << "\nbank_slots ";
         for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slots_of(l); }
+        f << "\nslot_hl_max_layers ";
+        for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slot_hl_max_of(l); }
         f << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\n";
     }
     {

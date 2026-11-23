@@ -178,6 +178,11 @@ void Decoder::step(const int* ids,
         bank_step(bw, BankRead{q2_, gr2_, m.p(x.ltau2), 8, o_, nullptr, nullptr, nullptr, nullptr, nullptr}, d_map_,
                   d_tpos_, bank_[size_t(n)], false, s);
         m.mm(s, false, false, Rp, D, HD, o_, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
+        if (!c.ffn2_of(n)) { continue; }
+        rmsnorm_fwd(h_, xh_, rstd_, Rp, D, s);
+        m.mm(s, false, false, Rp, F, D, xh_, D, w.W1b, F, U_, F, Out::BF16, 0.f,
+             Epilogue{Epilogue::GeluAuxBias, w.b1b, nullptr, Z_, F});
+        m.mm(s, false, false, Rp, D, F, U_, F, w.W2b, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, m.p(x.b2b)});
     }
     rmsnorm_fwd(h_, xh_, rstd_, Rp, D, s);
     if (c.factorized) {

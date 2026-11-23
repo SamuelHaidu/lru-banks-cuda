@@ -29,7 +29,10 @@ struct ArchCfg {
     double ffn_mult = 4.0;                               // FFN width = ffn_mult x dim
     std::vector<double> lru_half_life = {1.0, 16.0};     // LRU decays at init, log-spaced
     std::vector<double> slot_half_life = {1.0, 1024.0};  // fixed slot decays, log-spaced
-    double tau = 8.0;                                    // read temperature at init
+    std::vector<double> slot_half_life_max;  // per layer, the longest slot half-life (overrides slot_half_life[1]);
+                                             // [] = slot_half_life[1] everywhere. E.g. a long-memory first layer
+    bool hop2_ffn = false;  // 2-hop layers get a second FFN after the second read (read, FFN, read, FFN)
+    double tau = 8.0;       // read temperature at init
     // initial gate logit biases. Measured (RESEARCH_LOG): trained write gates (2) learn as well as open ones; trained
     // read gates (2) collapse closed without a budget (a closed read gets no gradient), and with gate_budget 10 /
     // target 0.5 they trade loss for speed early on. Default: reads held open (20); read gating is gate_bias_read 2
@@ -49,6 +52,8 @@ struct DataCfg {
     int micro_batch_size = 0;        // rows per forward/backward (0: batch_size); fewer: gradient accumulation, the
                                      // exact gradient of the whole batch (normalized by its target count)
     double epoch_passes = 0.02;      // one epoch = this fraction of a pass over the train split (random windows)
+    double epoch_tokens = 0;         // > 0: one epoch = this many training tokens instead (whatever the dataset:
+                                     // stages that change the data or the context keep their epochs comparable)
     int seed = 42;                   // data order, validation rows and the initialization
     std::string validation_dataset;  // val_loss on this dataset's validation split (the training dataset's own split
                                      // is then logged as val_data_loss): e.g. pretraining text during a fine-tune
@@ -70,6 +75,14 @@ struct TrainCfg {
     int validation_steps = 50;  // batches of validation rows at every epoch end (0: no validation)
     int checkpoint_every = 1;   // numbered checkpoints every N epochs (0: none); latest and best always
     std::string init_from;      // a checkpoint whose weights start a new run (fresh optimizer, step 0; not on resume)
+    // A schedule of stages run one after the other without intervention: [{"name": "ctx64", "epochs": 8, "set":
+    // {"arch_params.window_size": 64, "data.batch_size": 1024, "data.micro_batch_size": 512, ...}}, ...]. Each stage
+    // is this config with its `set` keys changed (dotted, as `lbc config`); the run lasts the sum of the stages'
+    // epochs (training.epochs is then ignored). Between stages the trainer checkpoints and resumes: weights, Adam
+    // moments and the step carry over; the context, batch, data mix, learning rate and runtime may change. Of the
+    // architecture only window_size may. With constant tokens per update, the warmup-stable-decay schedule over
+    // the step count spans the whole run.
+    json::Value stages = json::Value::array();
 };
 
 struct RuntimeCfg {
@@ -88,6 +101,9 @@ struct RunConfig {
     static RunConfig from_json(const json::Value& v);  // unknown keys and invalid values throw std::runtime_error
     void validate() const;
     Config model_config() const;
+    // the config of stage i (training.stages[i]'s keys applied); the run's own config when there are no stages
+    RunConfig stage_config(size_t i) const;
+    int total_epochs() const;  // the sum of the stages' epochs, or training.epochs
     int ffn_dim() const;
 };
 

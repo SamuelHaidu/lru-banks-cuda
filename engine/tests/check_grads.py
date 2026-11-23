@@ -59,6 +59,8 @@ for line in (DUMP / "config.txt").read_text().split("\n"):
         k, v = line.split()
         if k in ("hops", "bank_slots"):
             cfg[k] = [int(x) for x in v.split(",")]
+        elif k == "slot_hl_max_layers":
+            cfg[k] = [float(x) for x in v.split(",")]
         else:
             cfg[k] = float(v) if "." in v or "e" in v else int(v)
 V, E0, D, L, N, H, F = (cfg[k] for k in ("V", "E0", "D", "L", "N", "H", "F"))
@@ -67,6 +69,7 @@ HOPS = cfg.get("hops", [2] * L)
 B, T, DH, SLOTS = cfg["B"], cfg["T"], cfg["DH"], cfg["SLOTS"]
 HD = H * DH
 BANK_SLOTS = cfg.get("bank_slots", [SLOTS] * L)
+HL_MAX = cfg.get("slot_hl_max_layers", [cfg["slot_hl_max"]] * L)
 
 params = read("params.bin", torch.float32).double()
 grads_c = read("grads.bin", torch.float32).double()
@@ -88,9 +91,9 @@ for n in range(L):
     for k in ("gw", "gr", "gr2"):
         dec[n][k] = dec[n][k].reshape(B, T, H)
 
-def slot_decays(ns):
+def slot_decays(ns, hl_max):
     """Half-lives log-spaced over the layer's ns slots; slots past it (never written) keep the slowest one."""
-    hl = torch.exp(torch.linspace(math.log(cfg["slot_hl_min"]), math.log(cfg["slot_hl_max"]), ns))
+    hl = torch.exp(torch.linspace(math.log(cfg["slot_hl_min"]), math.log(hl_max), ns))
     hl = torch.cat([hl, hl[-1:].expand(SLOTS - ns)])
     return torch.exp((math.log(0.5) / hl).float().double())  # the C++ keeps log decays in fp32
 
@@ -200,7 +203,7 @@ def reference():
         # hop 1, the FFN, then hop 2 (its query from the stream after the FFN)
         closed = d["gw"] == 0
         (o1,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q], [gr], [p_("log_tau")[0].exp()], closed, p1,
-                           slot_decays(BANK_SLOTS[n]))
+                           slot_decays(BANK_SLOTS[n], HL_MAX[n]))
         h = h + bf(o1) @ bf(p_("Wo"))
         z = bf(bf(bf(rms(h)) @ bf(p_("W1") * p_("ffn_norm").T)) + p_("b1")[0])
         h = h + bf(gelu(z)) @ bf(p_("W2")) + p_("b2")[0]
@@ -211,8 +214,11 @@ def reference():
         ar2 = G2[..., HD:HD + H] + p_("brg2")[0]
         gr2 = ste(d["gr2"], ar2, d["gr2"].bool())
         (o2,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q2], [gr2], [p_("log_tau2")[0].exp()], closed,
-                           p1, slot_decays(BANK_SLOTS[n]))
+                           p1, slot_decays(BANK_SLOTS[n], HL_MAX[n]))
         h = h + bf(o2) @ bf(p_("Wo2"))
+        if f"l{n}_W1b" in P:  # the second FFN (arch_params.hop2_ffn)
+            z = bf(bf(bf(rms(h)) @ bf(p_("W1b") * p_("ffn2_norm").T)) + p_("b1b")[0])
+            h = h + bf(gelu(z)) @ bf(p_("W2b")) + p_("b2b")[0]
 
     if FACTORIZED:
         hr = bf(bf(rms(h)) @ bf(P["W_out"] * P["final_norm"].T))

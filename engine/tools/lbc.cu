@@ -81,7 +81,8 @@ std::string with_commas(unsigned long long n) {
     return s;
 }
 
-// "--silence 0:2,3:1,1:ffn,2:all" (layer:1|2|ffn|all) -> per-layer bit masks (bit 1: hop 1, 2: hop 2, 4: the FFN)
+// "--silence 0:2,3:1,1:ffn,2:all" (layer:1|2|ffn|ffn2|all) -> per-layer bit masks (bit 1: hop 1, 2: hop 2, 4: the
+// FFN, 8: the second FFN)
 std::vector<int> parse_silence(const std::string& spec, int L) {
     std::vector<int> mask(size_t(L), 0);
     std::stringstream ss(spec);
@@ -98,10 +99,12 @@ std::vector<int> parse_silence(const std::string& spec, int L) {
             bits = 2;
         } else if (w == "ffn") {
             bits = 4;
+        } else if (w == "ffn2") {
+            bits = 8;
         } else if (w == "all") {
-            bits = 7;
+            bits = 15;
         }
-        if (l < 0 || l >= L || (bits == 0)) { die("--silence: no part " + item + " (layer:1|2|ffn|all)"); }
+        if (l < 0 || l >= L || (bits == 0)) { die("--silence: no part " + item + " (layer:1|2|ffn|ffn2|all)"); }
         mask[size_t(l)] |= bits;
     }
     return mask;
@@ -248,19 +251,8 @@ json::Value arch_without_window(const json::Value& config) {
     return a;
 }
 
-int cmd_train(int argc, char** argv) {
-    if (argc < 1) { usage(); }
-    const std::string run = argv[0];
-    int epochs_override = 0;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--epochs" && i + 1 < argc) {
-            epochs_override = parse_int(argv[++i], "--epochs");
-        } else {
-            usage();
-        }
-    }
-    const RunConfig rc = load_run_config(run);
+// Trains `run` with config `rc` until epoch `total_epochs` (resuming from its checkpoint if there is one).
+int train_segment(const std::string& run, const RunConfig& rc, int total_epochs, const std::string& stage) {
     if (rc.data.dataset.empty()) { die("data.dataset is empty (lbc config " + run + " data.dataset DIR)"); }
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
     if (meta.vocabulary_size != rc.arch.vocabulary_size) {
@@ -271,7 +263,6 @@ int cmd_train(int argc, char** argv) {
         die("the dataset is packed in rows of " + std::to_string(meta.row_length)
             + " tokens: set arch_params.window_size to it");
     }
-    const int total_epochs = epochs_override > 0 ? epochs_override : rc.training.epochs;
     const std::string latest = run + "/model.lbc", csv_path = run + "/metrics.csv";
     const std::string run_name = fs::path(run).lexically_normal().filename().string();
     const json::Value config_json = rc.to_json();
@@ -305,7 +296,13 @@ int cmd_train(int argc, char** argv) {
     const int batch_rows = rc.data.batch_size, accum = batch_rows / c.B;  // c.B: rows per forward/backward
     const size_t spp = Loader::steps_per_pass(train_file.size(), batch_rows, c.T);
     if (spp == 0) { die("the train split holds less than one batch"); }
-    const int spe = std::max(1, int(double(spp) * rc.data.epoch_passes));
+    const int spe = rc.data.epoch_tokens > 0
+                        ? std::max(1, int(std::lround(rc.data.epoch_tokens / (double(batch_rows) * c.T))))
+                        : std::max(1, int(double(spp) * rc.data.epoch_passes));
+    if (!stage.empty()) {
+        std::printf("== stage %s: epochs %d..%d, context %d, batch %d (micro %d), lr %.3g\n", stage.c_str(),
+                    initial_epoch + 1, total_epochs, c.T, batch_rows, c.B, rc.training.learning_rate);
+    }
     const auto seed = uint64_t(rc.data.seed);
     Model model(c, seed);
     if (resume) {
@@ -618,6 +615,38 @@ int cmd_train(int argc, char** argv) {
             << num(per_step * 1e3) << "," << num(step_tokens / per_step) << "," << num(epoch_s);
         if (two_val) { csv << "," << opt(bool(val2), val2_loss) << "," << opt(bool(val2), val2_acc); }
         csv << "\n";
+    }
+    return 0;
+}
+
+// lbc train RUN_DIR [--epochs N]: the run's stages one after the other (or the run's single config), each resuming
+// from the previous stage's checkpoint; --epochs N stops after epoch N.
+int cmd_train(int argc, char** argv) {
+    if (argc < 1) { usage(); }
+    const std::string run = argv[0];
+    int epochs_override = 0;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--epochs" && i + 1 < argc) {
+            epochs_override = parse_int(argv[++i], "--epochs");
+        } else {
+            usage();
+        }
+    }
+    const RunConfig rc = load_run_config(run);
+    const int total = epochs_override > 0 ? std::min(epochs_override, rc.total_epochs()) : rc.total_epochs();
+    if (rc.training.stages.arr.empty()) { return train_segment(run, rc, total, ""); }
+    int end = 0;
+    for (size_t i = 0; i < rc.training.stages.arr.size() && end < total; ++i) {
+        const json::Value& st = rc.training.stages.arr[i];
+        end = std::min(total, end + int(st.find("epochs")->num));
+        const json::Value* name = st.find("name");
+        const std::string label =
+            name != nullptr && name->type == json::Value::String ? name->str : std::to_string(i + 1);
+        const std::string latest = run + "/model.lbc";
+        const int done = fs::exists(latest) ? read_checkpoint_info(latest).epoch : 0;
+        if (done >= end) { continue; }  // a stage finished before a resume
+        if (const int rc_ = train_segment(run, rc.stage_config(i), end, label); rc_ != 0) { return rc_; }
     }
     return 0;
 }

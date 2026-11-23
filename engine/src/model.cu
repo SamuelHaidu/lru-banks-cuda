@@ -67,6 +67,13 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
             x.Wq2 = add(l + "Wq2", D, c.ldG2(), true);
             x.brg2 = add(l + "brg2", 1, H, false);
         }
+        if (c.ffn2_of(n)) {
+            x.ffn2_norm = add(l + "ffn2_norm", 1, D, false);
+            x.W1b = add(l + "W1b", D, F, true);
+            x.b1b = add(l + "b1b", 1, F, false);
+            x.W2b = add(l + "W2b", F, D, true);
+            x.b2b = add(l + "b2b", 1, D, false);
+        }
         li_.push_back(x);
     }
     P_ = alloc<float>(n_);
@@ -101,6 +108,11 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         w.W2 = alloc<bf16>(size_t(F) * D);
         if (two) { w.Wq2 = alloc<bf16>(size_t(D) * c.ldG2()); }
         w.b1 = alloc<bf16>(F);
+        if (c.ffn2_of(n)) {
+            w.W1b = alloc<bf16>(size_t(D) * F);
+            w.W2b = alloc<bf16>(size_t(F) * D);
+            w.b1b = alloc<bf16>(F);
+        }
         lw_.push_back(w);
         LayerA a{};
         a.xh1 = alloc<bf16>(size_t(M) * D);
@@ -131,6 +143,12 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
             a.ar2 = alloc<float>(size_t(M) * H);
             a.gr2 = alloc<uint8_t>(size_t(M) * H);
             a.o2 = alloc<bf16>(size_t(M) * HD);
+        }
+        if (c.ffn2_of(n)) {
+            a.xh4 = alloc<bf16>(size_t(M) * D);
+            a.rstd4 = alloc<float>(M);
+            a.Z2 = alloc<bf16>(size_t(M) * F);
+            a.U2 = alloc<bf16>(size_t(M) * F);
         }
         a.info = alloc<uint2>(size_t(M) * H);
         a.zpre = alloc<float>(size_t(M) * H * 2);
@@ -249,6 +267,13 @@ void Model::init(uint64_t seed) {
             normal(x.Wq2, 0.02f);
             fill(x.brg2, c_.gate_bias_r);
         }
+        if (c_.ffn2_of(n)) {
+            fill(x.ffn2_norm, 1.f);
+            normal(x.W1b, 0.02f);
+            fill(x.b1b, 0.f);
+            normal(x.W2b, out_std);
+            fill(x.b2b, 0.f);
+        }
     }
     for (const auto& t : tensors_) {
         if (t.decay) { std::fill(hd.begin() + t.off, hd.begin() + t.off + size_t(t.rows) * t.cols, 1); }
@@ -264,7 +289,7 @@ void Model::init(uint64_t seed) {
             const int mm = std::min(m, ns - 1);
             const double hl =
                 std::exp(std::log(double(c_.slot_hl_min))
-                         + (std::log(double(c_.slot_hl_max)) - std::log(double(c_.slot_hl_min))) * mm / (ns - 1));
+                         + (std::log(double(c_.slot_hl_max_of(n))) - std::log(double(c_.slot_hl_min))) * mm / (ns - 1));
             for (int h = 0; h < c_.H; ++h) { la[(size_t(n) * c_.H + h) * SLOTS + m] = float(std::log(0.5) / hl); }
         }
     }
@@ -294,6 +319,11 @@ void Model::prepare_weights(cudaStream_t s) {
         prep_weight(p(x.W1), p(x.ffn_norm), w.W1, D, F, s);
         prep_weight(p(x.W2), nullptr, w.W2, F, D, s);
         prep_weight(p(x.b1), nullptr, w.b1, 1, F, s);
+        if (c_.ffn2_of(n)) {
+            prep_weight(p(x.W1b), p(x.ffn2_norm), w.W1b, D, F, s);
+            prep_weight(p(x.W2b), nullptr, w.W2b, F, D, s);
+            prep_weight(p(x.b1b), nullptr, w.b1b, 1, F, s);
+        }
     }
 }
 
@@ -410,6 +440,16 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     if (silence_.size() <= size_t(n) || !((silence_[size_t(n)] & 2) != 0)) {
         mm(s, false, false, M, D, HD, a.o2, HD, w.Wo2, D, h_, D, Out::F32, 1.f);
     }
+    if (!c_.ffn2_of(n)) { return; }
+    // the second FFN, as the first: h += W2b gelu(W1b rms(h) + b1b) + b2b
+    tic(s, "norm+elementwise");
+    rmsnorm_fwd(h_, a.xh4, a.rstd4, M, D, s);
+    toc(s);
+    mm(s, false, false, M, F, D, a.xh4, D, w.W1b, F, a.U2, F, Out::BF16, 0.f,
+       Epilogue{Epilogue::GeluAuxBias, w.b1b, nullptr, a.Z2, F});
+    if (silence_.size() <= size_t(n) || !((silence_[size_t(n)] & 8) != 0)) {
+        mm(s, false, false, M, D, F, a.U2, F, w.W2b, D, h_, D, Out::F32, 1.f, Epilogue{Epilogue::Bias, p(x.b2b)});
+    }
 }
 
 void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
@@ -425,6 +465,20 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     // hop 2: h += o2 Wo2 (dhb = bf16(dh), written by the norm backward above). In a 1-hop layer the backward starts
     // at the FFN, and b2's gradient (the column sums of dh at the layer's output) came with the norm backward that
     // wrote dh (the next layer's norm1, or the final norm)
+    if (c_.ffn2_of(n)) {
+        mm(s, false, true, M, F, D, dhb_, D, w.W2b, D, dZ_, F, Out::BF16, 0.f,
+           Epilogue{Epilogue::DGeluBgrad, nullptr, db1b_, a.Z2, F});
+        mm(s, true, false, F, D, M, a.U2, F, dhb_, D, g(x.W2b), D, Out::F32, 1.f);
+        tic(s, "norm+elementwise");
+        add_to_f32(db1b_, g(x.b1b), F, s);
+        toc(s);
+        mm(s, false, true, M, D, F, dZ_, F, w.W1b, F, dxh_, D, Out::F32);
+        mm(s, true, false, D, F, M, a.xh4, D, dZ_, F, dWp_, F, Out::F32);
+        tic(s, "norm+elementwise");
+        unfold_grad(dWp_, p(x.W1b), p(x.ffn2_norm), g(x.W1b), g(x.ffn2_norm), D, F, s);
+        rmsnorm_bwd(dxh_, a.xh4, a.rstd4, dh_, dhb_, nullptr, M, D, true, s);  // Wo2's output has no bias
+        toc(s);
+    }
     if (two) {
         mm(s, false, true, M, HD, D, dhb_, D, w.Wo2, D, dO2_, HD, Out::F32);
         mm(s, true, false, HD, D, M, a.o2, HD, dhb_, D, g(x.Wo2), D, Out::F32, 1.f);
@@ -500,7 +554,11 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
 }
 
-float* Model::b2_colsum(int n) { return c_.hops_of(n) == 1 ? g(li_[n].b2) : nullptr; }
+// the bias at the layer's output: the FFN's in a 1-hop layer, the second FFN's in a 2-hop one with it, else none
+float* Model::b2_colsum(int n) {
+    if (c_.hops_of(n) == 1) { return g(li_[n].b2); }
+    return c_.ffn2_of(n) ? g(li_[n].b2b) : nullptr;
+}
 
 void Model::embed_fwd(const Batch& b, cudaStream_t s) {
     const int M = c_.M(), D = c_.D, E0 = c_.E0;

@@ -22,6 +22,8 @@ json::Value to_value(bool x) { return json::Value(x); }
 
 json::Value to_value(const std::string& x) { return json::Value(x); }
 
+json::Value to_value(const json::Value& x) { return x; }
+
 template <class T>
 json::Value to_value(const std::vector<T>& xs) {
     json::Value a = json::Value::array();
@@ -53,6 +55,11 @@ void from_value(const json::Value& v, bool& x, const std::string& key) {
 void from_value(const json::Value& v, std::string& x, const std::string& key) {
     if (v.type != json::Value::String) { bad(key, "must be a string"); }
     x = v.str;
+}
+
+void from_value(const json::Value& v, json::Value& x, const std::string& key) {
+    if (v.type != json::Value::Array) { bad(key, "must be a list"); }
+    x = v;
 }
 
 template <class T>
@@ -134,6 +141,8 @@ void visit(V& v, RC& c) {
     v("ffn_mult", c.arch.ffn_mult);
     v("lru_half_life", c.arch.lru_half_life);
     v("slot_half_life", c.arch.slot_half_life);
+    v("slot_half_life_max", c.arch.slot_half_life_max);
+    v("hop2_ffn", c.arch.hop2_ffn);
     v("tau", c.arch.tau);
     v("gate_bias_write", c.arch.gate_bias_write);
     v("gate_bias_read", c.arch.gate_bias_read);
@@ -149,6 +158,7 @@ void visit(V& v, RC& c) {
     v("batch_size", c.data.batch_size);
     v("micro_batch_size", c.data.micro_batch_size);
     v("epoch_passes", c.data.epoch_passes);
+    v("epoch_tokens", c.data.epoch_tokens);
     v("seed", c.data.seed);
     v("validation_dataset", c.data.validation_dataset);
     v("mix_datasets", c.data.mix_datasets);
@@ -171,6 +181,7 @@ void visit(V& v, RC& c) {
     v("validation_steps", c.training.validation_steps);
     v("checkpoint_every", c.training.checkpoint_every);
     v("init_from", c.training.init_from);
+    v("stages", c.training.stages);
     v.end();
     v.begin("runtime");
     v("bank_chunk", c.runtime.bank_chunk);
@@ -228,6 +239,12 @@ void RunConfig::validate() const {
               hl == &a.lru_half_life ? "arch_params.lru_half_life" : "arch_params.slot_half_life",
               "must be [min, max] with 0 < min <= max");
     }
+    check(a.slot_half_life_max.empty() || std::cmp_equal(a.slot_half_life_max.size(), a.num_layers),
+          "arch_params.slot_half_life_max",
+          "must have one entry per layer (num_layers " + std::to_string(a.num_layers) + "), or be []");
+    for (const double m : a.slot_half_life_max) {
+        check(m >= a.slot_half_life[0], "arch_params.slot_half_life_max", "entries must be >= slot_half_life[0]");
+    }
     check(a.tau > 0, "arch_params.tau", "must be positive");
     check(a.gate_budget >= 0, "arch_params.gate_budget", "must be >= 0");
     check(a.window_size >= 8 && a.window_size % 8 == 0, "arch_params.window_size", "must be a positive multiple of 8");
@@ -255,6 +272,33 @@ void RunConfig::validate() const {
               "and data.validation_dataset cannot be combined");
     }
     check(data.epoch_passes > 0, "data.epoch_passes", "must be positive");
+    check(data.epoch_tokens >= 0, "data.epoch_tokens", "must be >= 0 (0: data.epoch_passes)");
+    for (size_t i = 0; i < training.stages.arr.size(); ++i) {
+        const json::Value& st = training.stages.arr[i];
+        const std::string key = "training.stages[" + std::to_string(i) + "]";
+        check(st.is_object(), key, "must be an object {name, epochs, set}");
+        for (const auto& [k, x] : st.obj) {
+            check(k == "name" || k == "epochs" || k == "set", key + "." + k, "is not a known key (name, epochs, set)");
+        }
+        const json::Value* ep = st.find("epochs");
+        check(ep != nullptr && ep->type == json::Value::Number && ep->num >= 1 && ep->num == std::floor(ep->num),
+              key + ".epochs", "must be a positive integer");
+        const json::Value* set = st.find("set");
+        check(set == nullptr || set->is_object(), key + ".set", "must be an object of dotted keys");
+        if (set != nullptr) {
+            for (const auto& [k, x] : set->obj) {
+                check(!k.starts_with("training.stages") && k != "training.epochs" && k != "training.init_from"
+                          && (!k.starts_with("arch_params.") || k == "arch_params.window_size"),
+                      key + ".set." + k,
+                      "a stage may change the data, training (not stages, epochs, init_from), runtime and "
+                      "arch_params.window_size");
+            }
+        }
+    }
+    for (size_t i = 0; i < training.stages.arr.size(); ++i) {
+        (void)stage_config(i);
+    }  // every key exists, every value
+       // is valid
     const TrainCfg& t = training;
     check(t.learning_rate > 0, "training.learning_rate", "must be positive");
     check(t.warmup_steps >= 0 && t.lr_decay_start >= 0 && t.lr_decay_steps >= 0, "training.warmup_steps / lr_decay_*",
@@ -311,6 +355,8 @@ Config RunConfig::model_config() const {
     c.lru_hl_max = float(arch.lru_half_life[1]);
     c.slot_hl_min = float(arch.slot_half_life[0]);
     c.slot_hl_max = float(arch.slot_half_life[1]);
+    for (const double m : arch.slot_half_life_max) { c.slot_hl_max_layer.push_back(float(m)); }
+    c.ffn2 = arch.hop2_ffn;
     c.gate_bias_w = float(arch.gate_bias_write);
     c.gate_bias_r = float(arch.gate_bias_read);
     c.budget = float(arch.gate_budget);
@@ -348,6 +394,34 @@ RunConfig with_keys(const RunConfig& rc, const std::vector<std::pair<std::string
         json::set(v, dotted, std::move(x));
     }
     return RunConfig::from_json(v);
+}
+
+RunConfig RunConfig::stage_config(size_t i) const {
+    if (training.stages.arr.empty()) { return *this; }
+    const json::Value& st = training.stages.arr.at(i);
+    json::Value v = to_json();
+    if (const json::Value* set = st.find("set")) {
+        for (const auto& [dotted, x] : set->obj) {
+            if (!json::get(v, dotted)) {
+                throw std::runtime_error("config: training.stages[" + std::to_string(i) + "].set: no key " + dotted);
+            }
+            json::set(v, dotted, x);
+        }
+    }
+    json::set(v, "training.stages", json::Value::array());  // a stage's config is a plain config (and validating it
+                                                            // does not recurse into the stages)
+    try {
+        return RunConfig::from_json(v);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("training.stages[" + std::to_string(i) + "]: " + e.what());
+    }
+}
+
+int RunConfig::total_epochs() const {
+    if (training.stages.arr.empty()) { return training.epochs; }
+    int n = 0;
+    for (const auto& st : training.stages.arr) { n += int(st.find("epochs")->num); }
+    return n;
 }
 
 RunConfig with_key(const RunConfig& rc, const std::string& dotted, const std::string& raw) {

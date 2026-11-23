@@ -48,6 +48,8 @@ struct Config {
     bool cosine = false;  // the decay's shape: half a cosine (else linear)
     int cycles = 1;       // decay cycles (warm restarts)
     float tau = 8.f, lru_hl_min = 1.f, lru_hl_max = 16.f, slot_hl_min = 1.f, slot_hl_max = 1024.f;
+    std::vector<float> slot_hl_max_layer;  // per layer, the longest slot half-life (empty: slot_hl_max everywhere)
+    bool ffn2 = false;                     // 2-hop layers: a second FFN after the second read
     float gate_bias_w = 2.f, gate_bias_r = 2.f;  // initial gate logit biases (how many gates start open)
     float budget = 0.f, budget_target = 0.5f;
 
@@ -56,6 +58,10 @@ struct Config {
     int hops_of(int n) const { return hops.empty() ? 2 : hops[size_t(n)]; }
 
     int slots_of(int n) const { return slots.empty() ? SLOTS : slots[size_t(n)]; }
+
+    float slot_hl_max_of(int n) const { return slot_hl_max_layer.empty() ? slot_hl_max : slot_hl_max_layer[size_t(n)]; }
+
+    bool ffn2_of(int n) const { return ffn2 && hops_of(n) == 2; }
 
     int HD() const { return H * dh; }
 
@@ -177,15 +183,16 @@ class Model {
         int norm1 = -1, Wa = -1, nu = -1, theta = -1, Ws = -1, bk = -1, brg = -1, bwg = -1, R = -1, ltau = -1;
         int ltau2 = -1, Wo = -1, Wo2 = -1, ffn_norm = -1, W1 = -1, b1 = -1, W2 = -1, b2 = -1;
         int q2_norm = -1, Wq2 = -1, brg2 = -1;
+        int ffn2_norm = -1, W1b = -1, b1b = -1, W2b = -1, b2b = -1;  // the second FFN (Config::ffn2)
     };
 
     struct LayerW {  // bf16 GEMM weights (and the FFN's first bias: the GELU epilogue takes it in bf16)
-        bf16 *Wa, *Ws, *Wo, *Wo2, *W1, *W2, *Wq2, *b1;
+        bf16 *Wa, *Ws, *Wo, *Wo2, *W1, *W2, *Wq2, *b1, *W1b, *W2b, *b1b;
     };
 
     struct LayerA {  // what the backward needs
-        bf16 *xh1, *PV, *sb, *k, *q, *o1, *xh2, *Z, *U, *xh3, *q2, *o2;
-        float *rstd1, *s, *kn, *qn, *rp1, *aw, *ar, *rstd2, *rstd3, *q2n, *ar2;
+        bf16 *xh1, *PV, *sb, *k, *q, *o1, *xh2, *Z, *U, *xh3, *q2, *o2, *xh4, *Z2, *U2;
+        float *rstd1, *s, *kn, *qn, *rp1, *aw, *ar, *rstd2, *rstd3, *q2n, *ar2, *rstd4;
         uint8_t *ridx, *gw, *gr, *gr2;
         uint2* info;
         float* zpre;  // [M][H][2] the routed slots' mass before each write (the closed write gates' gradient)
