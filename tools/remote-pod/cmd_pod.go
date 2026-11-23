@@ -397,7 +397,10 @@ downloading and cleaning data, training tokenizers, compressing datasets; then r
 				}
 			}
 			if err := c.Terminate(context.Background(), st.PodID); err != nil {
-				return err
+				if !strings.Contains(err.Error(), "not found") {
+					return err
+				}
+				ui.Note("pod %s no longer exists (already deleted)", st.PodID) // only the local state is left
 			}
 			_ = config.SaveState(&config.State{})
 			ui.Success("pod %s deleted", st.PodID)
