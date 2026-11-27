@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -27,13 +27,16 @@ def inspect_text(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
     the embedding and after each layer, at every position."""
     import torch
 
+    model, tok = models.load(body["run"], str(body.get("checkpoint", "latest")))
+    if type(model).__name__ == "LbcModel":
+        return inspect_lbc(models, body, model, tok)
+
     from model.archs.min_gru import MinGRULM
 
     from model.archs.gated_deltanet import GatedDeltaNetLM
 
     from model.archs.lru_banks import LRUBanksLM
 
-    model, tok = models.load(body["run"], str(body.get("checkpoint", "latest")))
     if isinstance(model, GatedDeltaNetLM):
         return inspect_gdn(models, body, model, tok)
     if isinstance(model, LRUBanksLM):
@@ -275,6 +278,72 @@ def inspect_banks(models: "Models", body: Dict[str, Any], model: Any, tok: Any) 
             "static_memory": False, "raw_tokens": T, "lens": lens, "vocab": vocab}
 
 
+def _topk_rows(p: Any, k: int):
+    """torch.topk over the last dim by k argmax passes: on the Iris Xe, torch-xpu's topk over a 32k vocabulary asks
+    for a work-group larger than the device's 512."""
+    import torch
+
+    p = p.clone()
+    vals, idx = [], []
+    for _ in range(k):
+        i = p.argmax(-1, keepdim=True)
+        vals.append(p.gather(-1, i))
+        idx.append(i)
+        p.scatter_(-1, i, -1.0)
+    return torch.cat(vals, -1), torch.cat(idx, -1)
+
+
+def inspect_lbc(models: "Models", body: Dict[str, Any], model: Any, tok: Any) -> Dict[str, Any]:
+    """The Inspect tab for an lbc checkpoint (`model/lbc_torch.py`): the `inspect_banks` payload, from one recording
+    pass of the decoder (the generation path, token by token). Its gates are binary per head: `gate` per layer is the
+    fraction of the heads whose write gate is open at each token, `gates` per layer [write, read 1, read 2] the same
+    for each gate (read 2: 0 on 1-hop layers)."""
+    import uuid
+
+    import torch
+
+    from model.lbc_torch import trace
+
+    ids = tok.encode(body["text"]).ids
+    if not ids or ids[0] != model.reset_token:
+        ids = [model.reset_token] + ids
+    truncated = len(ids) > MAX_INSPECT_TOKENS
+    ids = ids[:MAX_INSPECT_TOKENS]
+    with models.lock, torch.no_grad():
+        r = trace(model, ids, MAX_INSPECT_TOKENS)
+        lens = []
+        hs = torch.from_numpy(r["h"]).to(model.device)  # (T, L+1, D)
+        for n in range(hs.shape[1]):  # the logit lens on the device: top-5 only
+            p = torch.softmax(torch.cat([model.logits(hs[i:i + 256, n]) for i in range(0, len(ids), 256)]), -1)
+            v, i = _topk_rows(p, 5)
+            lens.append([[[int(a), round(float(b), 4)] for a, b in zip(ri, rv)]
+                         for ri, rv in zip(i.cpu().tolist(), v.cpu().tolist())])
+        lens_w = model.lens_weights()
+    L, lh = model.num_layers, model.layer_hops
+    w_o = []
+    for n, p in enumerate(model.layers):
+        wo = p["Wo"].float().cpu().numpy()
+        w_o.append(np.stack([wo, p["Wo2"].float().cpu().numpy() if "Wo2" in p else np.zeros_like(wo)]))
+    reset = np.asarray(ids) == model.reset_token
+    models.banks = {"id": uuid.uuid4().hex, "reset": reset, "loga": model.loga,  # (L, H, M)
+                    "r": r["w"].transpose(1, 0, 2, 3), "v": r["v"].transpose(1, 0, 2, 3),  # (L, T, H, .)
+                    "p": r["p"].transpose(1, 2, 0, 3, 4), "o": r["o"].transpose(1, 2, 0, 3, 4),  # (L, 2, T, H, .)
+                    "ids": ids, "w_o": np.stack(w_o), "lens_w": lens_w, "tok": tok, "layer_hops": lh}
+    g = r["g"].mean(-1)  # (T, L, 3): open fraction of the heads
+    stats = _prediction_stats(r["logits"], ids, body["run"], model.reset_token, spans=[])
+    used = set(ids) | {i for rows in lens for row in rows for i, _ in row}
+    vocab = {i: tok.decode([i], skip_special_tokens=False) for i in sorted(used)}
+    T = len(ids)
+    return {**stats, "kind": "banks", "gate_kind": "write", "banks_id": models.banks["id"], "num_layers": L, "hops": 2,
+            "layer_hops": lh, "num_heads": model.num_heads, "slots": model.slots,
+            "slot_half_life": model.slot_half_life,  # [layer][slot]
+            "gate": [np.round(g[:, n, 0], 3).tolist() for n in range(L)],
+            "gates": [[np.round(g[:, n, k], 3).tolist() for k in range(3)] for n in range(L)],
+            "tokens": [vocab[i] for i in ids], "raw": [vocab[i] for i in ids], "kept": list(range(T)), "ids": ids,
+            "reset": reset.astype(int).tolist(), "T": T, "truncated": truncated, "layers": [], "memory": None,
+            "static_memory": False, "raw_tokens": T, "lens": lens, "vocab": vocab}
+
+
 def banks_at(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
     """Position t of the last `inspect_banks` text, unrolled exactly over its document's tokens start..t. Slot m of a
     head holds the average of the values written to it, token j weighted by r_jm a_m^(t - j) / z_tm (z the written
@@ -333,15 +402,36 @@ def banks_at(models: "Models", body: Dict[str, Any]) -> Dict[str, Any]:
     adds = np.abs(full).max(-1) > 1e-12  # a silent layer (W_o = 0, `silent_from`) adds nothing: no tokens
     says = [[[[dec(i) for i in top[li, hop, h]] if hop < lh[li] and adds[li, hop, h] else [] for h in range(H + 1)]
              for hop in range(hops)] for li in range(L)]
+    # every readable slot of every (layer, head): [slot, mass z, tokens since its last write, [[position, share]...]]
+    wrote = b["r"][:, start:t + 1] > 0  # (L, n, H, M)
+    age_last = np.argmax(wrote[:, ::-1], axis=1)  # (L, H, M)
+    k = min(4, n)
+    top_j = np.argpartition(-share, k - 1, axis=1)[:, :k] if n > k else np.broadcast_to(
+        np.arange(n)[None, :, None, None], share.shape)  # (L, k, H, M)
+    top_s = np.take_along_axis(share, top_j, 1)
+    contents = []
+    for li in range(share.shape[0]):
+        per_head = []
+        for h in range(share.shape[2]):
+            rows = []
+            for m in np.flatnonzero(valid[li, h]):
+                o = np.argsort(-top_s[li, :, h, m])
+                rows.append([int(m), float(f"{z[li, h, m]:.3g}"), int(age_last[li, h, m]),
+                             [[start + int(top_j[li, i, h, m]), round(float(top_s[li, i, h, m]), 3)]
+                              for i in o if top_s[li, i, h, m] > 0.005]])
+            per_head.append(rows)
+        contents.append(per_head)
     return {"t": t, "start": start, "n": n, "read": _b64(c), "stored": _b64(stored), "err": err, "slots": slots,
             "filled": valid.sum(-1).tolist(), "says": [[s[:H] for s in sl] for sl in says],
-            "says_all": [[s[H] for s in sl] for sl in says]}
+            "says_all": [[s[H] for s in sl] for sl in says], "contents": contents}
 
 
-def _prediction_stats(logits: np.ndarray, ids: List[int], run: str, reset_token: int) -> Dict[str, Any]:
+def _prediction_stats(logits: np.ndarray, ids: List[int], run: str, reset_token: int,
+                      spans: Optional[List[Any]] = None) -> Dict[str, Any]:
     """The prediction at every position (target: the next token): its entropy, the loss and rank of the actual next
     token (rank 0: the top-1 choice), and which targets the training scores (inside the dataset's loss_spans, the
-    closing tag included; every one without loss_spans)."""
+    closing tag included; every one without loss_spans). `spans`: the loss spans when the run's dataset is not
+    here (lbc runs)."""
     from model import config as cfg_mod
 
     T = len(ids)
@@ -352,7 +442,8 @@ def _prediction_stats(logits: np.ndarray, ids: List[int], run: str, reset_token:
     loss[:-1] = -logp[np.arange(T - 1), ids[1:]]
     rank = np.zeros(T, int)
     rank[:-1] = (logp[:-1] > logp[np.arange(T - 1), ids[1:]][:, None]).sum(-1)
-    spans = cfg_mod.load_dataset_metadata(cfg_mod.load(run)["data"]["dataset"]).get("loss_spans") or []
+    if spans is None:
+        spans = cfg_mod.load_dataset_metadata(cfg_mod.load(run)["data"]["dataset"]).get("loss_spans") or []
     target = np.zeros(T, bool)  # token j is a scored target (predicted at j - 1)
     for o, c in spans:
         inside = False

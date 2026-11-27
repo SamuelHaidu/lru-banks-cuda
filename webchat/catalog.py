@@ -157,6 +157,12 @@ def data_examples(dataset: str, per_category: int = 8) -> Dict[str, List[str]]:
 _DOCS: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
 
 
+def _need_dataset(dataset: str) -> None:
+    if not dataset:  # an lbc run whose webchat.json names no local dataset
+        raise ValueError("the run names no local dataset: add \"dataset\" to runs/RUN/webchat.json "
+                         "(e.g. \"agentic-samples\", ad_hoc_scripts/build_webchat_samples.py)")
+
+
 _STARTERS: Dict[str, Dict[str, List[str]]] = {}
 
 
@@ -165,6 +171,7 @@ def completion_starters(dataset: str, per_category: int = 6, tokens: int = 24) -
     for completion mode."""
     if dataset in _STARTERS:
         return _STARTERS[dataset]
+    _need_dataset(dataset)
     from tokenizers import Tokenizer
 
     from model import config as cfg_mod
@@ -192,6 +199,7 @@ def dataset_documents(dataset: str, split: str, per_category: int = 12, max_toke
     (or of the whole split when the dataset has no category index)."""
     if (dataset, split) in _DOCS:
         return _DOCS[(dataset, split)]
+    _need_dataset(dataset)
     from model import config as cfg_mod
     from tokenizers import Tokenizer
 

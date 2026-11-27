@@ -172,6 +172,19 @@ const gatedLayers = (ins: Ins, ls: number[]) => ls.filter((l) => ins.gate[l]);
 function banksView(ins: Ins, sel: Sel, v: View): [string, string] {
   const el = v.el, T = ins.T, insT = sel.t;
   const { ls, hs, os } = banksSel(ins, sel);
+  if (sel.mode === "gate" && ins.gate_kind === "write") {  // lbc: binary write gates per head
+    const g = new Float32Array(T);
+    for (let j = 0; j < T; j++) for (const l of ls) g[j] += ins.gate[l][j] / ls.length;
+    for (let j = 0; j < T; j++) {
+      el[j].bg = colour.gate(g[j]);
+      el[j].title = ls.map((l) => `layer ${l + 1}: ${Math.round(ins.gate[l][j] * ins.num_heads)}/${ins.num_heads} heads write`).join(", ");
+    }
+    const means = ls.map((l) => ins.gate[l].reduce((a: number, b: number) => a + b, 0) / T);
+    return [`Write gate: the share of the heads that write this token into their banks (a closed gate skips the
+      token; the first token of a document never writes). Mean over the text: ${ls.map((l, i) => `layer ${l + 1}
+      <b>${(100 * means[i]).toFixed(0)}%</b>`).join(", ")}.`,
+      `no head writes <i style="background:linear-gradient(90deg, ${colour.gate(0)}, ${colour.gate(1)})"></i> every head writes`];
+  }
   if (sel.mode === "gate") {
     const gl = gatedLayers(ins, ls);
     if (!gl.length) return ["Layer 1 has no input gate: its LRU takes every token in full (g = 1).", ""];
@@ -328,12 +341,50 @@ const posPill = (ins: Ins, j: number, val: number) =>
   `<button class="pill" data-j="${j}" title="position ${j}">${esc(showTok(ins.tokens[j]))} ${(100 * val).toFixed(0)}%</button>`;
 const topPos = (B: any, val: Float32Array, k: number) => range(B.n).sort((a, b) => val[b] - val[a]).slice(0, k).filter((i) => val[i] > 0.005);
 
+const slotHl = (ins: Ins, l: number, m: number) =>
+  Array.isArray(ins.slot_half_life[0]) ? ins.slot_half_life[l][m] : ins.slot_half_life[m];
+
+// stored mode, one layer and one head: every readable slot at t (half-life, mass, last write, what it averages)
+function slotTable(ins: Ins, B: any, l: number, k: number) {
+  const rows = B.contents?.[l]?.[k];
+  if (!rows) return "";
+  let h = `<h3>Layer ${l + 1}, head ${k + 1}: the slots at this token</h3><p class="note" style="margin:-4px 0 6px">
+    Each readable slot is the average of the values written to it, older writes weighted down by the slot's decay.
+    Mass: the decayed sum of the write weights (the slot is dropped below 1e-6); last write: tokens ago.</p>`;
+  if (!rows.length) return h + `<p class="note">The banks are empty here.</p>`;
+  h += `<table class="lens">` + rows.map(([m, z, age, items]: [number, number, number, [number, number][]]) =>
+    `<tr><td style="white-space:nowrap">Slot ${m + 1}<br><span class="note">hl ${slotHl(ins, l, m)}, mass ${z}, ${age === 0 ? "written now" : age + " ago"}</span></td>
+     <td>${items.map(([j, s]) => posPill(ins, j, s)).join("")}</td></tr>`).join("") + `</table>`;
+  return h;
+}
+
 function banksSide(ins: Ins, sel: Sel, t: number) {
+  if (ins.gate_kind === "write") return lbcSide(ins, sel, t);
   let h = `<h3>LRU input gate at this token</h3><table class="lens">` + range(ins.num_layers).map((l) => {
     const g = ins.gate[l];
     return `<tr><td>Layer ${l + 1}</td><td>${g ? `<div class="cand"><span class="bar"><i style="width:${(100 * g[t]).toFixed(0)}%"></i></span>
       <span class="p" style="width:46px">${g[t].toFixed(3)}</span></div>` : `<span class="note">no gate: takes every token</span>`}</td></tr>`;
   }).join("") + `</table>`;
+  return h + banksReads(ins, sel, t);
+}
+
+// lbc: the binary gates at this token, then (stored, one layer and head) the slots, (recall) the reads
+function lbcSide(ins: Ins, sel: Sel, t: number) {
+  const H = ins.num_heads, bar = (f: number) => `<div class="cand"><span class="bar"><i style="width:${(100 * f).toFixed(0)}%"></i></span>
+    <span class="p" style="width:46px">${Math.round(f * H)}/${H}</span></div>`;
+  let h = `<h3>Open gates at this token (heads)</h3><table class="lens"><tr><td></td><td>write</td><td>read 1</td><td>read 2</td></tr>`
+    + range(ins.num_layers).map((l) => `<tr><td>Layer ${l + 1}</td><td>${bar(ins.gates[l][0][t])}</td><td>${bar(ins.gates[l][1][t])}</td>
+      <td>${ins.layer_hops[l] > 1 ? bar(ins.gates[l][2][t]) : `<span class="note">1 hop</span>`}</td></tr>`).join("") + `</table>`;
+  const B = ins.bk[t], { ls, hs } = banksSel(ins, sel);
+  if (sel.mode === "stored" && B) {
+    h += ls.length === 1 && hs.length === 1 ? slotTable(ins, B, ls[0], hs[0])
+      : `<p class="note">Select one layer and one head to list its slots and what each holds.</p>`;
+  }
+  return h + banksReads(ins, sel, t);
+}
+
+function banksReads(ins: Ins, sel: Sel, t: number) {
+  let h = "";
   if (sel.mode !== "recall") return h;
   const B = ins.bk[t]; if (!B) return h;
   const { ls, hs, os } = banksSel(ins, sel), one = ls.length === 1, H = ins.num_heads;
@@ -365,7 +416,7 @@ function banksSide(ins: Ins, sel: Sel, t: number) {
     h += `<h3>Layer ${l + 1}, head ${k + 1}${ins.layer_hops[l] > 1 ? ", read " + (o + 1) : ""}: slots read</h3>`;
     const sl = B.slots[l][o][k];
     h += sl.length ? sl.map(([m, p, items]: [number, number, [number, number][]]) => `<div class="facts" style="margin:6px 0 2px"><b>Slot ${m + 1}</b> ${(100 * p).toFixed(0)}% of the read,
-        half-life ${ins.slot_half_life[m]} tokens; holds:</div>` + items.map(([j, s]) => posPill(ins, j, s)).join("")).join("")
+        half-life ${slotHl(ins, l, m)} tokens; holds:</div>` + items.map(([j, s]) => posPill(ins, j, s)).join("")).join("")
       : `<p class="note">The banks are empty here.</p>`;
   }
   return h;

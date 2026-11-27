@@ -16,6 +16,34 @@ if str(ROOT / "datasets") not in sys.path:
     sys.path.insert(0, str(ROOT / "datasets"))
 
 
+def lbc_checkpoints(run: Path) -> List[str]:
+    """An lbc (C++ engine) run's checkpoints: latest (model.lbc), best, then the numbered ones, newest first."""
+    ckpts = ["latest"] if (run / "model.lbc").exists() else []
+    if (run / "checkpoints" / "best.lbc").exists():
+        ckpts.append("best")
+    epochs = sorted((int(m.group(1)) for p in (run / "checkpoints").glob("checkpoint_*.lbc")
+                     if (m := re.search(r"checkpoint_(\d+)", p.name))), reverse=True)
+    return ckpts + [str(e) for e in epochs]
+
+
+def lbc_path(run: Path, checkpoint: str) -> Path:
+    if checkpoint == "latest":
+        return run / "model.lbc"
+    if checkpoint == "best":
+        return run / "checkpoints" / "best.lbc"
+    return run / "checkpoints" / f"checkpoint_{int(checkpoint):05d}.lbc"
+
+
+def lbc_sidecar(run: Path) -> Dict[str, Any]:
+    """runs/RUN/webchat.json: what the lbc config does not say (it names the pod's dataset paths): {"tokenizer":
+    directory under tokenizers/, optional "dataset" (a local dataset for the page's catalogs), "mode": chat |
+    completion}."""
+    import json
+
+    p = run / "webchat.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
 class Models:
     """The loaded (run, checkpoint): one at a time, one generation at a time."""
 
@@ -32,6 +60,11 @@ class Models:
         if not (ROOT / "runs").is_dir():  # a fresh clone: no runs yet
             return out
         for run in sorted(p for p in (ROOT / "runs").iterdir() if (p / "config.json").exists()):
+            if lbc_checkpoints(run):
+                side = lbc_sidecar(run)
+                out.append({"run": run.name, "arch": "lru-banks (lbc)", "dataset": side.get("dataset", ""),
+                            "checkpoints": lbc_checkpoints(run), "mode": side.get("mode", "chat"), "inspect": True})
+                continue
             ckpts = ["latest"] if (run / "model.keras").exists() else []
             if (run / "checkpoints" / "best.keras").exists():
                 ckpts.append("best")
@@ -59,6 +92,18 @@ class Models:
         from model import config as cfg_mod
 
         with self.lock:
+            if self.key != (run, checkpoint) and lbc_checkpoints(ROOT / "runs" / run):
+                from tokenizers import Tokenizer
+
+                from model.lbc_torch import LbcModel
+
+                tok = lbc_sidecar(ROOT / "runs" / run).get("tokenizer")
+                if not tok:
+                    raise ValueError(f"runs/{run}/webchat.json needs a \"tokenizer\" (a directory under tokenizers/)")
+                self.model = None  # free the previous weights first
+                self.model = LbcModel(lbc_path(ROOT / "runs" / run, checkpoint), self.device or "xpu")
+                self.tokenizer = Tokenizer.from_file(str(ROOT / "tokenizers" / tok / "tokenizer.json"))
+                self.key = (run, checkpoint)
             if self.key != (run, checkpoint):
                 if self.device is None:
                     import torch

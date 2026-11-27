@@ -43,6 +43,8 @@ class Worker:
 
         key = (args["run"], str(args.get("checkpoint", "latest")))
         model, tok = self.models.load(*key)
+        if type(model).__name__ == "LbcModel":  # an lbc checkpoint: its own decoder (model/lbc_torch.py)
+            from model.lbc_torch import stream
         doc = args["document"]
         stop = ["<eos>"] if args.get("mode") == "completion" else ["</assistant>", "<eos>"]
         stop_ids = [ids[-1] for ids in (tok.encode(s).ids for s in stop) if ids]
