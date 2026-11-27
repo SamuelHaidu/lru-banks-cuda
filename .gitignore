@@ -24,6 +24,8 @@ runs/
 datasets/*
 !datasets/*.py
 !datasets/agentic/
+!datasets/finewiki/
+!datasets/climbmix/
 *.keras
 *.npy
 *.npz
