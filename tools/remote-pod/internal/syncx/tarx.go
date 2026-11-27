@@ -107,6 +107,13 @@ func addFile(tw *tar.Writer, p, name string, fi os.FileInfo) error {
 	return err
 }
 
+// SafeRelPath reports whether a name from elsewhere (a store key's tail, a stream entry) is a plain relative path:
+// not empty, not absolute, no ".." that climbs out, no backslash (a separator on Windows). Only such names may become
+// local files: a pod with write access could otherwise name an object "runs/x/../../../.bashrc".
+func SafeRelPath(rel string) bool {
+	return rel != "" && !strings.Contains(rel, "\\") && filepath.IsLocal(filepath.FromSlash(rel))
+}
+
 // safeJoin joins a stream entry onto target, refusing entries that escape it.
 func safeJoin(target, name string) (string, error) {
 	name = strings.TrimSuffix(name, "/")

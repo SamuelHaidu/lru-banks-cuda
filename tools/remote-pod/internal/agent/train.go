@@ -18,9 +18,11 @@ import (
 
 // TrainSpec is a run the agent executes on start (REMOTE_POD_JOB, JSON, set by `remote-pod train`).
 type TrainSpec struct {
-	Run          string            `json:"run"`
-	Command      string            `json:"command"`  // e.g. "lbc train /work/runs/<run>"
-	Datasets     []string          `json:"datasets"` // store dataset names, fetched to /data/<name>
+	Run      string   `json:"run"`
+	Command  string   `json:"command"`  // e.g. "lbc train /work/runs/<run>"
+	Datasets []string `json:"datasets"` // store dataset names, fetched to /data/<name>
+	// DatasetKeys: each dataset's archive key (the CLI reads the manifests; the pod cannot, it has no key)
+	DatasetKeys  map[string]string `json:"dataset_keys"`
 	Fetch        map[string]string `json:"fetch"`    // store key -> local path (e.g. the init checkpoint)
 	Files        map[string]string `json:"files"`    // local path -> contents (the run's config.json)
 	RunDir       string            `json:"run_dir"`  // uploaded to Prefix as files appear
@@ -34,14 +36,14 @@ var numbered = regexp.MustCompile(`checkpoint_\d+\.lbc$`)
 // Uploader copies new or changed files of a run directory to the store once they are stable (unchanged for a few
 // seconds), and keeps only the newest numbered checkpoint locally (the others are in the store).
 type Uploader struct {
-	st     *store.Store
+	st     Objects
 	dir    string
 	prefix string
 	mu     sync.Mutex
 	sent   map[string]time.Time // path -> the mtime that was uploaded
 }
 
-func NewUploader(st *store.Store, dir, prefix string) *Uploader {
+func NewUploader(st Objects, dir, prefix string) *Uploader {
 	return &Uploader{st: st, dir: dir, prefix: prefix, sent: map[string]time.Time{}}
 }
 
@@ -86,7 +88,7 @@ func (u *Uploader) Pass(ctx context.Context, final bool) {
 }
 
 // RunTrain fetches the inputs, runs the command as a job, uploads the run as it goes, and stops the pod at the end.
-func (s *Server) RunTrain(ctx context.Context, st *store.Store, spec TrainSpec) error {
+func (s *Server) RunTrain(ctx context.Context, st Objects, spec TrainSpec) error {
 	dataDir := spec.DataDir
 	if dataDir == "" {
 		dataDir = "/data"
@@ -96,12 +98,12 @@ func (s *Server) RunTrain(ctx context.Context, st *store.Store, spec TrainSpec) 
 		if _, err := os.Stat(filepath.Join(dst, ".remote-pod-complete")); err == nil {
 			continue
 		}
-		d, err := st.Dataset(ctx, name)
-		if err != nil {
-			return err
+		key := spec.DatasetKeys[name]
+		if key == "" {
+			key = store.DatasetKey(name)
 		}
 		t0 := time.Now()
-		files, n, err := st.GetDir(ctx, d.Key, dst, nil)
+		files, n, err := st.GetDir(ctx, key, dst, nil)
 		if err != nil {
 			return err
 		}
@@ -135,7 +137,7 @@ func (s *Server) RunTrain(ctx context.Context, st *store.Store, spec TrainSpec) 
 		return err
 	}
 	log.Printf("run %s: job %s started", spec.Run, job.ID)
-	tick := time.NewTicker(30 * time.Second)
+	tick := time.NewTicker(time.Minute) // the run's plan allows a file's rewrite about once a minute
 	defer tick.Stop()
 	for {
 		select {
@@ -154,13 +156,14 @@ func (s *Server) RunTrain(ctx context.Context, st *store.Store, spec TrainSpec) 
 	}
 }
 
-// UploadJobLogs copies every job's log to jobs/<id>.log every interval (and once more when a job ends).
-func (s *Server) UploadJobLogs(ctx context.Context, st *store.Store, every time.Duration) {
-	s.jobs.OnExit(func(j proto.Job) { _ = st.PutFile(ctx, "jobs/"+j.ID+".log", s.jobs.LogPath(j.ID)) })
+// UploadJobLogs copies every job's log to <prefix><id>.log (prefix "jobs/<tag>/": the pod's own, see JobLogKey)
+// every interval and once more when a job ends. Failures (no signer connected yet) are retried at the next tick.
+func (s *Server) UploadJobLogs(ctx context.Context, st Objects, prefix string, every time.Duration) {
+	s.jobs.OnExit(func(j proto.Job) { _ = st.PutFile(ctx, prefix+j.ID+".log", s.jobs.LogPath(j.ID)) })
 	for range time.Tick(every) {
 		for _, j := range s.jobs.List() {
 			if j.Running {
-				_ = st.PutFile(ctx, "jobs/"+j.ID+".log", s.jobs.LogPath(j.ID))
+				_ = st.PutFile(ctx, prefix+j.ID+".log", s.jobs.LogPath(j.ID))
 			}
 		}
 	}

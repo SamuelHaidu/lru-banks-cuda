@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/syncx"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/tlsroots"
 )
 
 type Config struct {
@@ -58,8 +61,9 @@ func New(c Config) (*Store, error) {
 	if region == "" {
 		region = "auto"
 	}
+	// the embedded roots only: a CA injected into this machine's store cannot read the key's requests (tlsroots)
 	mc, err := minio.New(u.Host, &minio.Options{Creds: credentials.NewStaticV4(c.AccessKey, c.SecretKey, ""),
-		Secure: u.Scheme == "https", Region: region})
+		Secure: u.Scheme == "https", Region: region, Transport: tlsroots.Transport()})
 	if err != nil {
 		return nil, err
 	}
@@ -91,11 +95,39 @@ func (s *Store) Exists(ctx context.Context, key string) bool {
 
 // Presign is a URL that downloads key without credentials until ttl passes (the URL carries a signature, not the key).
 func (s *Store) Presign(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return s.PresignGet(ctx, key, ttl)
+}
+
+// PresignGet: a URL that downloads key, and only key, until ttl passes.
+func (s *Store) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	u, err := s.mc.PresignedGetObject(ctx, s.bucket, key, ttl, nil)
 	if err != nil {
 		return "", err
 	}
 	return u.String(), nil
+}
+
+// PresignPut: a URL that uploads (HTTP PUT) to key, and only key, until ttl passes. It cannot read, list or delete.
+// size > 0 signs the Content-Length as well: the URL then takes exactly size bytes and no other length.
+func (s *Store) PresignPut(ctx context.Context, key string, ttl time.Duration, size int64) (string, error) {
+	if size > 0 {
+		u, err := s.mc.PresignHeader(ctx, http.MethodPut, s.bucket, key, ttl, nil,
+			http.Header{"Content-Length": {strconv.FormatInt(size, 10)}})
+		if err != nil {
+			return "", err
+		}
+		return u.String(), nil
+	}
+	u, err := s.mc.PresignedPutObject(ctx, s.bucket, key, ttl)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+// Remove deletes one object (this machine only: a pod is never granted a delete).
+func (s *Store) Remove(ctx context.Context, key string) error {
+	return s.mc.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
 }
 
 func (s *Store) PutFile(ctx context.Context, key, path string) error {

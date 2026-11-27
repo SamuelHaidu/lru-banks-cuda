@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,8 +19,10 @@ import (
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/agent"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/client"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/config"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/grant"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/store"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/syncx"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/ui"
 )
 
@@ -50,7 +53,12 @@ func readStoreLog(name string) ([]byte, error) {
 	if b, err := st.GetBytes(ctx, "runs/"+name+"/train.log"); err == nil {
 		return b, nil
 	}
-	return st.GetBytes(ctx, "jobs/"+name+".log")
+	if ps, _ := config.LoadState(); ps.Tag != "" { // the pod's own job logs: jobs/<tag>/<id>.log
+		if b, err := st.GetBytes(ctx, grant.JobLogPrefix(ps.Tag)+name+".log"); err == nil {
+			return b, nil
+		}
+	}
+	return st.GetBytes(ctx, "jobs/"+name+".log") // pods made before grants
 }
 
 func dataCommands() []*cobra.Command {
@@ -164,6 +172,12 @@ runs/RUN here. Files already here with the same size are skipped.`,
 			for _, o := range objs {
 				rel := strings.TrimPrefix(o.Key, "runs/"+run+"/")
 				if !all && strings.Contains(rel, "checkpoint_") {
+					continue
+				}
+				// a pod with the store's keys can name an object anything: only plain paths inside the run land here
+				// ("runs/x/../../../.bashrc" would otherwise overwrite a file of this machine)
+				if !syncx.SafeRelPath(rel) {
+					ui.Note("skipped %q: not a plain path inside the run", o.Key)
 					continue
 				}
 				dst := filepath.Join(config.ProjectRoot(), "runs", run, filepath.FromSlash(rel))
@@ -310,8 +324,9 @@ func planTrain(run string, raw []byte) (agent.TrainSpec, error) {
 }
 
 func trainCommand() *cobra.Command {
-	var gpu, cloud, image string
+	var gpu, cloud, image, provider string
 	var disk int
+	var maxPrice float64
 	var detach, dry bool
 	cmd := &cobra.Command{
 		Use:   "train CONFIG.json --gpu GPU",
@@ -320,10 +335,15 @@ func trainCommand() *cobra.Command {
 datasets in R2 (remote-pod dataset add), and paths under runs/ (init_from) name files in R2's runs/. On the pod the
 agent fetches them, runs the training, uploads checkpoints, metrics and the log to runs/<run>/ as they appear (keeping
 only the newest numbered checkpoint on the pod), and stops the pod when the run ends. This command follows the
-progress; Ctrl-C only stops following (the run goes on): resume with remote-pod logs <run> -f --epochs.`,
+progress; Ctrl-C only stops following (the run goes on): resume with remote-pod logs <run> -f --epochs.
+
+On vast.ai (--provider vast) the pod is the cheapest good offer of the GPU (as remote-pod up --provider vast) on a
+public CUDA image; lbc comes from R2, so build it first (remote-pod build). Stopping at the end releases the GPU; the
+disk is kept and billed for storage until remote-pod down.`,
 		Example: `  remote-pod train runs/anneal-t40/config.json --gpu "RTX 5090"
   remote-pod train runs/x/config.json --gpu 4090 --detach     start it and return
-  remote-pod train runs/x/config.json --gpu 4090 --dry-run    show what would be fetched and run`,
+  remote-pod train runs/x/config.json --gpu 4090 --dry-run    show what would be fetched and run
+  remote-pod train runs/x/config.json --provider vast --gpu 4090 --max-price 0.5`,
 		GroupID: "data",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -351,39 +371,101 @@ progress; Ctrl-C only stops following (the run goes on): resume with remote-pod 
 				return err
 			}
 			ctx := context.Background()
+			spec.DatasetKeys = map[string]string{}
 			for _, d := range spec.Datasets { // fail before paying for a GPU
-				if _, err := st.Dataset(ctx, d); err != nil {
+				ds, err := st.Dataset(ctx, d)
+				if err != nil {
 					return err
 				}
+				if strings.Contains(ds.Key, "://") {
+					return fmt.Errorf("dataset %s lives outside the store (%s): a pod can only be granted store keys", d, ds.Key)
+				}
+				spec.DatasetKeys[d] = ds.Key
 			}
 			for key := range spec.Fetch {
 				if !st.Exists(ctx, key) {
 					return hint(fmt.Errorf("%s is not in R2", key), "remote-pod pull / upload the run first")
 				}
 			}
-			c, _, err := api()
-			if err != nil {
-				return err
-			}
 			if s, _ := config.LoadState(); s.PodID != "" {
 				return hint(fmt.Errorf("this project already has pod %s", s.PodID), "remote-pod down (or stop) first")
 			}
-			gpuID, err := resolveGPU(ctx, c, gpu)
+			prov, err := providerFlag(cfg, provider)
+			if err != nil {
+				return err
+			}
+			// the pod gets no key: a policy (its inputs, its run's prefix, its job logs) and grants pre-issued for 7 days
+			// for its inputs and its fixed-name outputs; the rest is signed while this command (or a signer) runs
+			token, tag := newToken(), newTag()
+			var gets []string
+			for _, d := range spec.Datasets {
+				gets = append(gets, spec.DatasetKeys[d])
+			}
+			for key := range spec.Fetch {
+				gets = append(gets, key)
+			}
+			sort.Strings(gets)
+			policy, err := grant.PodPolicy(tag, []string{spec.Prefix}, gets)
+			if err != nil {
+				return err
+			}
+			// what this run will upload, from its config: the pod may upload that much, at that pace, and no more
+			epochs, every, epochTokens := runShape(raw)
+			plan := grant.RunUploadPlan(spec.Prefix, epochs, every, epochTokens)
+			policy.Plans = []grant.UploadPlan{plan}
+			ui.Note("upload plan: at most %d files under %s, %d new checkpoints an hour, a checkpoint rewritten at most every %s",
+				plan.MaxObjects, spec.Prefix, plan.MaxNewHeavyPerHour, plan.MinRewrite.Round(time.Second))
+			var fixed []string
+			for _, f := range grant.RunFixedFiles {
+				fixed = append(fixed, spec.Prefix+f)
+			}
+			pre, err := grant.Preissue(ctx, st, policy, fixed)
+			if err != nil {
+				return err
+			}
+			env, err := grant.PodEnv(tag, pre)
 			if err != nil {
 				return err
 			}
 			specJSON, _ := json.Marshal(spec)
-			token, ref := newToken(), imageRef(cfg, image)
-			env := map[string]string{"REMOTE_POD_TOKEN": token, "REMOTE_POD_IDLE_MIN": "20",
-				"REMOTE_POD_JOB": base64.StdEncoding.EncodeToString(specJSON)}
-			id, err := createPod(ctx, c, cfg, gpuID, cloud, ref, disk, 0, env, "train-"+run, "")
-			if err != nil {
-				return err
+			env["REMOTE_POD_TOKEN"], env["REMOTE_POD_IDLE_MIN"] = token, "20"
+			env["REMOTE_POD_JOB"] = base64.StdEncoding.EncodeToString(specJSON)
+			var id string
+			if prov == "vast" {
+				if cmd.Flags().Changed("cloud") {
+					return hint(errors.New("--cloud is RunPod's"), "remote-pod train CONFIG --provider vast --gpu 4090")
+				}
+				if !cmd.Flags().Changed("image") {
+					image = "cuda"
+				}
+				vs, err := createVast(ctx, cfg, vastPlan{GPU: gpu, MaxPrice: maxPrice, DiskGB: disk,
+					Image: imageRef(cfg, image), Label: "train-" + run, Env: env})
+				if err != nil {
+					return err
+				}
+				vs.Token, vs.Tag, vs.Policy = token, tag, policy
+				_ = config.SaveState(vs)
+				id = vs.PodID
+			} else {
+				c, _, err := api()
+				if err != nil {
+					return err
+				}
+				gpuID, err := resolveGPU(ctx, c, gpu)
+				if err != nil {
+					return err
+				}
+				ref := imageRef(cfg, image)
+				if id, err = createPod(ctx, c, cfg, gpuID, cloud, ref, disk, 0, env, "train-"+run, ""); err != nil {
+					return err
+				}
+				_ = config.SaveState(&config.State{Provider: "runpod", PodID: id, Token: token, Image: ref, GPU: gpuID,
+					Tag: tag, Policy: policy})
 			}
-			_ = config.SaveState(&config.State{PodID: id, Token: token, Image: ref, GPU: gpuID})
-			ui.Success("pod %s for run %s (%s); it stops itself when the run ends", id, run, gpuID)
+			ui.Success("pod %s for run %s (%s); it stops itself when the run ends", id, run, gpu)
 			if detach {
-				fmt.Fprintln(os.Stderr, ui.Dim("  follow: ")+"remote-pod logs "+run+" -f --epochs")
+				fmt.Fprintln(os.Stderr, ui.Dim("  follow: ")+"remote-pod logs "+run+" -f --epochs   (signs the pod's uploads while it follows)")
+				fmt.Fprintln(os.Stderr, ui.Dim("  or:     ")+"remote-pod signer   (numbered checkpoints wait on the pod until one runs)")
 				return nil
 			}
 			cl, _, _ := agentClient()
@@ -394,8 +476,10 @@ progress; Ctrl-C only stops following (the run goes on): resume with remote-pod 
 		},
 	}
 	cmd.Flags().StringVar(&gpu, "gpu", "", `GPU type ("RTX 5090", "4090"; see remote-pod gpus)`)
-	cmd.Flags().StringVar(&cloud, "cloud", "any", "community, secure, or any (community first)")
-	cmd.Flags().StringVar(&image, "image", "train", "train, dev, or an image reference")
+	cmd.Flags().StringVar(&provider, "provider", "", "runpod or vast (default: the settings' provider, else runpod)")
+	cmd.Flags().StringVar(&cloud, "cloud", "any", "RunPod: community, secure, or any (community first)")
+	cmd.Flags().Float64Var(&maxPrice, "max-price", 0, "vast.ai: the most $/hr to pay (0: any)")
+	cmd.Flags().StringVar(&image, "image", "train", "train, dev, cuda (vast.ai's default), or an image reference")
 	cmd.Flags().IntVar(&disk, "disk", 60, "container disk in GB (datasets + the run)")
 	cmd.Flags().BoolVar(&detach, "detach", false, "start the run and return")
 	cmd.Flags().BoolVar(&dry, "dry-run", false, "print the plan (datasets, fetches, command) and stop")
@@ -405,6 +489,15 @@ progress; Ctrl-C only stops following (the run goes on): resume with remote-pod 
 
 // followRun waits for the run's job (the agent fetches the inputs first), then follows its epoch lines.
 func followRun(cl *client.Client, run string) error {
+	if cfg, err := config.Load(); err == nil { // sign the pod's uploads while following
+		if st, err := config.LoadState(); err == nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := serveSigner(ctx, cfg, st, cl, false); err != nil {
+				ui.Note("not signing the pod's uploads: %v", err)
+			}
+		}
+	}
 	ui.Note("the agent is fetching the datasets; the run starts after")
 	for {
 		if _, err := cl.Job(run); err == nil {
@@ -422,4 +515,37 @@ func followRun(cl *client.Client, run string) error {
 	}
 	ui.Success("run %s done; checkpoints in R2: remote-pod pull %s", run, run)
 	return nil
+}
+
+// runShape reads what the upload plan needs from an lbc run config: the epochs in all (the stages' sum when there
+// are stages), how often a numbered checkpoint is written, and the tokens of an epoch (0: unknown).
+func runShape(raw []byte) (epochs, checkpointEvery int, epochTokens float64) {
+	var c struct {
+		Data struct {
+			EpochTokens float64 `json:"epoch_tokens"`
+		} `json:"data"`
+		Training struct {
+			Epochs          int  `json:"epochs"`
+			CheckpointEvery *int `json:"checkpoint_every"`
+			Stages          []struct {
+				Epochs int `json:"epochs"`
+			} `json:"stages"`
+		} `json:"training"`
+	}
+	_ = json.Unmarshal(raw, &c)
+	epochs = c.Training.Epochs
+	if len(c.Training.Stages) > 0 {
+		epochs = 0
+		for _, st := range c.Training.Stages {
+			epochs += st.Epochs
+		}
+	}
+	if epochs <= 0 {
+		epochs = 100 // lbc's default
+	}
+	checkpointEvery = 1 // lbc's default
+	if c.Training.CheckpointEvery != nil {
+		checkpointEvery = *c.Training.CheckpointEvery
+	}
+	return epochs, checkpointEvery, c.Data.EpochTokens
 }

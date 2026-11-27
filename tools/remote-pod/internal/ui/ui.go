@@ -100,6 +100,11 @@ func Note(format string, a ...any) {
 	fmt.Fprintln(os.Stderr, Dim("· ")+fmt.Sprintf(format, a...))
 }
 
+// Warning is a status line that must not be missed (stderr, highlighted).
+func Warning(format string, a ...any) {
+	fmt.Fprintln(os.Stderr, Warn("! ")+Warn(fmt.Sprintf(format, a...)))
+}
+
 func Success(format string, a ...any) {
 	fmt.Fprintln(os.Stderr, OK("✓ ")+fmt.Sprintf(format, a...))
 }

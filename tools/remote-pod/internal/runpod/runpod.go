@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/tlsroots"
 	"net/http"
 	"sort"
 	"strings"
@@ -22,7 +23,7 @@ type Client struct {
 }
 
 func New(key string) *Client {
-	return &Client{Key: key, URL: Endpoint, HTTP: &http.Client{Timeout: 60 * time.Second}}
+	return &Client{Key: key, URL: Endpoint, HTTP: tlsroots.Client(60 * time.Second)}
 }
 
 // Do sends one GraphQL query and decodes `data` into out.
@@ -36,7 +37,7 @@ func (c *Client) Do(ctx context.Context, query string, vars map[string]any, out 
 	req.Header.Set("Authorization", "Bearer "+c.Key)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("runpod api: %w", err)
+		return fmt.Errorf("runpod api: %w", tlsroots.Explain("api.runpod.io", err))
 	}
 	defer resp.Body.Close()
 	var r struct {

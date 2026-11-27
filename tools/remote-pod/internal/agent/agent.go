@@ -4,11 +4,13 @@ package agent
 
 import (
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/grant"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/syncx"
 )
@@ -29,7 +32,12 @@ type Options struct {
 	Token    string        // required: every request carries "Authorization: Bearer <token>"
 	Workdir  string        // relative paths and the default cwd
 	IdleStop time.Duration // > 0: stop the pod after this long with no request and nothing running
-	OnIdle   func()        // what "stop the pod" does (set by main: the RunPod API from inside the pod)
+	OnIdle   func()        // what "stop the pod" does (set by main: the provider's API from inside the pod)
+	TLS      *tls.Config   // non-nil: serve HTTPS with it (a pod reached on its public IP: vast.ai, see pin)
+	// GrantAddr: where processes on the pod ask for store grants (POST /v1/grant); loopback only, e.g.
+	// "127.0.0.1:8090" ("" = none). Grants are the pre-issued ones (REMOTE_POD_GRANTS), the rest come from the CLI.
+	GrantAddr string
+	Grants    []grant.Grant
 }
 
 type Server struct {
@@ -38,6 +46,7 @@ type Server struct {
 	active   atomic.Int64 // execs in progress
 	lastSeen atomic.Int64 // unix nanos of the last request
 	upgrader websocket.Upgrader
+	relay    *Relay
 }
 
 func New(opt Options) (*Server, error) {
@@ -51,7 +60,7 @@ func New(opt Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{opt: opt, jobs: NewJobs(filepath.Join(opt.Workdir, ".remote-pod", "jobs")),
-		upgrader: websocket.Upgrader{ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10}}
+		upgrader: websocket.Upgrader{ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10}, relay: NewRelay(opt.Grants)}
 	s.lastSeen.Store(time.Now().UnixNano())
 	return s, nil
 }
@@ -72,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/signal", s.signalJob)
 	mux.HandleFunc("GET /v1/jobs/{id}/log", s.jobLog)
+	mux.HandleFunc("GET /v1/signer", s.signerWS)
 	return s.auth(mux)
 }
 
@@ -92,7 +102,22 @@ func (s *Server) Serve() error {
 	if s.opt.IdleStop > 0 {
 		go s.idleGuard()
 	}
-	log.Printf("remote-pod agent %s on %s, workdir %s", proto.Version, s.opt.Addr, s.opt.Workdir)
+	log.Printf("remote-pod agent %s on %s, workdir %s, tls %v", proto.Version, s.opt.Addr, s.opt.Workdir, s.opt.TLS != nil)
+	if s.opt.GrantAddr != "" {
+		host, _, err := net.SplitHostPort(s.opt.GrantAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("agent: the grant endpoint must listen on a loopback address, not %q", s.opt.GrantAddr)
+		}
+		ln, err := net.Listen("tcp", s.opt.GrantAddr)
+		if err != nil {
+			return err
+		}
+		go func() { log.Printf("grant endpoint: %v", http.Serve(ln, s.GrantHandler())) }()
+	}
+	if s.opt.TLS != nil {
+		srv := &http.Server{Addr: s.opt.Addr, Handler: s.Handler(), TLSConfig: s.opt.TLS}
+		return srv.ListenAndServeTLS("", "")
+	}
 	return http.ListenAndServe(s.opt.Addr, s.Handler())
 }
 

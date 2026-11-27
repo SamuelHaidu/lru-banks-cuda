@@ -3,10 +3,12 @@ package client
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,18 +19,49 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/pin"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/syncx"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/tlsroots"
 )
 
 type Client struct {
 	Base  string // http(s)://host:port
 	Token string
 	HTTP  *http.Client
+	tls   *tls.Config // nil: the system's CAs (RunPod's proxy); set by Pin
 }
 
 func New(base, token string) *Client {
-	return &Client{Base: strings.TrimRight(base, "/"), Token: token, HTTP: &http.Client{}}
+	// RunPod's proxy and any other agent behind a public certificate: the embedded roots only (tlsroots)
+	return &Client{Base: strings.TrimRight(base, "/"), Token: token, HTTP: tlsroots.Client(0), tls: tlsroots.Config()}
+}
+
+// CheckBase refuses an agent address that would carry the token in clear: https, or http to this machine only.
+func CheckBase(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("agent address %q: %w", raw, err)
+	}
+	if u.Scheme == "https" && u.Host != "" {
+		return nil
+	}
+	h := u.Hostname()
+	if ip := net.ParseIP(h); u.Scheme == "http" && (h == "localhost" || (ip != nil && ip.IsLoopback())) {
+		return nil
+	}
+	return fmt.Errorf("agent address %q: only https (or http to this machine) may carry the token", raw)
+}
+
+// Pin trusts only this certificate (PEM) for the agent's TLS: a pod reached on its public IP (vast.ai), see pin.
+func (c *Client) Pin(certPEM []byte) error {
+	cfg, err := pin.ClientConfig(certPEM)
+	if err != nil {
+		return err
+	}
+	c.tls = cfg
+	c.HTTP = &http.Client{Transport: &http.Transport{TLSClientConfig: cfg, Proxy: http.ProxyFromEnvironment}}
+	return nil
 }
 
 func (c *Client) header() http.Header {
@@ -47,7 +80,7 @@ func (c *Client) do(method, path string, q url.Values, body io.Reader, out any) 
 	req.Header = c.header()
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("agent unreachable at %s: %w", c.Base, err)
+		return fmt.Errorf("agent unreachable at %s: %w", c.Base, tlsroots.Explain(c.Base, err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -75,13 +108,14 @@ func (c *Client) dial(path string, q url.Values) (*websocket.Conn, error) {
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	d := websocket.Dialer{HandshakeTimeout: 30 * time.Second, ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10}
+	d := websocket.Dialer{HandshakeTimeout: 30 * time.Second, ReadBufferSize: 64 << 10, WriteBufferSize: 64 << 10,
+		TLSClientConfig: c.tls}
 	conn, resp, err := d.Dial(u, c.header())
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			return nil, errors.New("the agent refused the token (another pod's state? run remote-pod status)")
 		}
-		return nil, fmt.Errorf("agent unreachable at %s: %w", c.Base, err)
+		return nil, fmt.Errorf("agent unreachable at %s: %w", c.Base, tlsroots.Explain(c.Base, err))
 	}
 	return conn, nil
 }

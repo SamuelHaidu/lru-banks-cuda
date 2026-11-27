@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/client"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/config"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/syncx"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/ui"
@@ -343,7 +345,8 @@ func logsCommand() *cobra.Command {
 		Short: "A job's or run's output: live from the pod, or from R2 when the pod is gone",
 		Long: `Print a job's output (stdout and stderr together, from its start). With -f, follow it until it ends: if the
 connection drops, it reconnects and resumes at the last byte received. When the pod is unreachable or gone, the copy
-in R2 is read (runs/<run>/train.log, or jobs/<id>.log). --epochs keeps the end-of-epoch lines of a training log.`,
+in R2 is read (runs/<run>/train.log, or jobs/<tag>/<id>.log). While following, it also signs the pod's store
+requests (see remote-pod signer). --epochs keeps the end-of-epoch lines of a training log.`,
 		Example: `  remote-pod logs tok -f
   remote-pod logs my-run -f --epochs          one line per epoch: loss, val_loss, lr, tokens/s
   remote-pod logs my-run                      the whole log (from R2 after the pod stopped)`,
@@ -358,9 +361,18 @@ in R2 is read (runs/<run>/train.log, or jobs/<id>.log). --epochs keeps the end-o
 			}
 			bw := bufio.NewWriterSize(w, 1)
 			defer bw.Flush()
-			cl, _, err := agentClient()
+			cl, pst, err := agentClient()
 			if err == nil {
 				if _, err = cl.Job(args[0]); err == nil {
+					if follow { // sign the pod's store requests while following (it holds no key)
+						if cfg, cerr := config.Load(); cerr == nil {
+							ctx, cancel := context.WithCancel(context.Background())
+							defer cancel()
+							if serr := serveSigner(ctx, cfg, pst, cl, false); serr != nil {
+								ui.Note("not signing the pod's uploads: %v", serr)
+							}
+						}
+					}
 					code, err := cl.FollowLog(args[0], since, follow, w, func(e error) {
 						ui.Note("connection lost (%v); reconnecting", e)
 					})

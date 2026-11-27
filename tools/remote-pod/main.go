@@ -1,4 +1,5 @@
-// remote-pod: work on a RunPod GPU as if it were this machine. See `remote-pod --help` (the help is the manual).
+// remote-pod: work on a rented GPU (RunPod or vast.ai) as if it were this machine. See `remote-pod --help` (the help is
+// the manual).
 package main
 
 import (
@@ -30,8 +31,8 @@ func hint(err error, next string) error {
 	return hinted{err, next}
 }
 
-const overview = `Work on a RunPod GPU as if it were this machine: run commands, copy files, sync code,
-train with datasets and checkpoints in R2, follow logs that survive disconnects.
+const overview = `Work on a rented GPU (RunPod or vast.ai) as if it were this machine: run commands, copy files,
+sync code, train with datasets and checkpoints in R2, follow logs that survive disconnects.
 
 Quick start
   remote-pod gpus                          what is in stock, cheapest first
@@ -43,19 +44,25 @@ Quick start
   remote-pod sh -d python3 long_job.py     a detached job: survives disconnects
   remote-pod logs <job> -f                 follow it (reconnects and resumes on its own)
   remote-pod stop                          stop paying for the GPU
+  remote-pod balance                       credit left on every provider, and how long it lasts
+
+The same on vast.ai (cheaper machines from many hosts; every other command works unchanged):
+  remote-pod gpus --provider vast          one line per GPU type, the cheapest good offer of each
+  remote-pod up --provider vast --gpu 4090
+  (or provider = "vast" in the settings: then --provider is not needed)
 
 One command for a training run (datasets and checkpoints in R2; the pod stops itself at the end):
   remote-pod dataset add --name pretrain-mix --from datasets/pretrain-mix-bpe32768
   remote-pod train runs/my-run/config.json --gpu "RTX 5090"
   remote-pod pull my-run
 
-Settings: ~/.config/remote-pod/config.toml (RunPod key, R2 endpoint / bucket / keys, images);
+Settings: ~/.config/remote-pod/config.toml (default provider, RunPod / vast.ai keys, R2, images);
 the current pod: .remote-pod/state.json in the repository. Every command takes --json for scripts and agents.`
 
 func main() {
 	root := &cobra.Command{
 		Use:           "remote-pod",
-		Short:         "Work on a RunPod GPU as if it were this machine",
+		Short:         "Work on a rented GPU (RunPod or vast.ai) as if it were this machine",
 		Long:          overview,
 		Version:       proto.Version,
 		SilenceUsage:  true,
@@ -71,6 +78,8 @@ func main() {
 	)
 	root.AddCommand(podCommands()...)
 	root.AddCommand(workCommands()...)
+	root.AddCommand(signerCommand())
+	root.AddCommand(sshCommand())
 	root.AddCommand(dataCommands()...)
 	root.AddCommand(buildCommands()...)
 	root.AddCommand(agentCommand())

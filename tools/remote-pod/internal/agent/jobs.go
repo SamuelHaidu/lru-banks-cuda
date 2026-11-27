@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/entropy"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/proto"
 )
 
@@ -46,8 +46,7 @@ func NewJobs(dir string) *Jobs { return &Jobs{dir: dir, jobs: map[string]*job{}}
 func (j *Jobs) LogPath(id string) string { return filepath.Join(j.dir, id+".log") }
 
 func newID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
+	b := entropy.Bytes(4)
 	return hex.EncodeToString(b)
 }
 

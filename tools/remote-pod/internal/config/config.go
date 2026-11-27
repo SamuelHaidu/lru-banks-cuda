@@ -8,20 +8,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/grant"
 )
 
 // Config is the user's settings. Secrets live only here (mode 0600), never in the repository or an image.
 type Config struct {
-	RunPod RunPod `toml:"runpod"`
-	R2     R2     `toml:"r2"`
-	Images Images `toml:"images"`
+	Provider string `toml:"provider"` // where up / train rent a GPU: "runpod" (default) or "vast"
+	RunPod   RunPod `toml:"runpod"`
+	Vast     Vast   `toml:"vast"`
+	R2       R2     `toml:"r2"`
+	Images   Images `toml:"images"`
 }
 
 type RunPod struct {
 	APIKey string `toml:"api_key"` // empty: read from ~/.runpod/config.toml (runpodctl's)
 }
+
+type Vast struct {
+	APIKey string `toml:"api_key"` // empty: $VAST_API_KEY, else ~/.config/vastai/vast_api_key (the vastai CLI's)
+}
+
+// Providers are the GPU clouds remote-pod rents from.
+var Providers = []string{"runpod", "vast"}
 
 // R2 is any S3-compatible store (Cloudflare R2: https://<account>.r2.cloudflarestorage.com).
 type R2 struct {
@@ -36,6 +48,9 @@ type Images struct {
 	Train string `toml:"train"`
 	Dev   string `toml:"dev"`
 	CPU   string `toml:"cpu"`
+	// CUDA is a public CUDA runtime image ("--image cuda"): the agent and lbc are fetched from R2 at boot. The default
+	// on vast.ai, whose hosts cannot pull our private images.
+	CUDA string `toml:"cuda"`
 }
 
 // Dir is ~/.config/remote-pod (or $REMOTE_POD_CONFIG_DIR).
@@ -69,7 +84,43 @@ func Load() (*Config, error) {
 	if c.Images.Dev == "" {
 		c.Images.Dev = "ghcr.io/samuelhaidu/remote-pod:dev"
 	}
+	if c.Images.CUDA == "" {
+		c.Images.CUDA = "nvidia/cuda:12.8.1-runtime-ubuntu24.04"
+	}
+	if c.Provider == "" {
+		c.Provider = "runpod"
+	}
+	if err := CheckProvider(c.Provider); err != nil {
+		return nil, fmt.Errorf("%s: provider: %w", Path(), err)
+	}
 	return c, nil
+}
+
+// CheckProvider accepts the known provider names.
+func CheckProvider(p string) error {
+	for _, x := range Providers {
+		if p == x {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown provider %q (runpod or vast)", p)
+}
+
+// VastKey is the configured key, $VAST_API_KEY, or the vastai CLI's.
+func (c *Config) VastKey() (string, error) {
+	if c.Vast.APIKey != "" {
+		return c.Vast.APIKey, nil
+	}
+	if k := os.Getenv("VAST_API_KEY"); k != "" {
+		return k, nil
+	}
+	home, _ := os.UserHomeDir()
+	if b, err := os.ReadFile(filepath.Join(home, ".config", "vastai", "vast_api_key")); err == nil {
+		if k := strings.TrimSpace(string(b)); k != "" {
+			return k, nil
+		}
+	}
+	return "", errors.New("no vast.ai API key: set vast.api_key in " + Path() + " (or $VAST_API_KEY, or vastai set api-key)")
 }
 
 // RunPodKey is the configured key, $RUNPOD_API_KEY, or runpodctl's.
@@ -97,11 +148,25 @@ func (c *Config) HasR2() bool {
 
 // State is the project's current pod: where its agent listens and the token to talk to it.
 type State struct {
-	PodID string `json:"pod_id,omitempty"`
-	URL   string `json:"url,omitempty"` // override (a local agent: http://127.0.0.1:8080)
-	Token string `json:"token,omitempty"`
-	Image string `json:"image,omitempty"`
-	GPU   string `json:"gpu,omitempty"`
+	Provider string `json:"provider,omitempty"` // "" = runpod (states written before vast.ai support)
+	PodID    string `json:"pod_id,omitempty"`
+	URL      string `json:"url,omitempty"` // the agent: set for vast.ai (https://<ip>:<port>) or a local agent
+	Token    string `json:"token,omitempty"`
+	Cert     string `json:"cert,omitempty"` // the agent's pinned TLS certificate (PEM; vast.ai)
+	Image    string `json:"image,omitempty"`
+	GPU      string `json:"gpu,omitempty"`
+	// Tag is the pod's random name in the store (its job logs: jobs/<tag>/); Policy is what the signer may grant it.
+	// Both live only here: the pod cannot widen its own policy.
+	Tag    string       `json:"tag,omitempty"`
+	Policy grant.Policy `json:"policy,omitzero"`
+}
+
+// ProviderName is the pod's provider (runpod for states without one).
+func (s *State) ProviderName() string {
+	if s.Provider == "" {
+		return "runpod"
+	}
+	return s.Provider
 }
 
 // ProjectRoot is the nearest directory upward with .git (or the working directory).
@@ -142,7 +207,7 @@ func SaveState(s *State) error {
 // Endpoint is where the agent listens and its token: $REMOTE_POD_URL / $REMOTE_POD_TOKEN override the state.
 func (s *State) Endpoint() (url, token string, err error) {
 	url, token = s.URL, s.Token
-	if url == "" && s.PodID != "" {
+	if url == "" && s.PodID != "" && s.ProviderName() == "runpod" {
 		url = fmt.Sprintf("https://%s-%d.proxy.runpod.net", s.PodID, AgentPort)
 	}
 	if v := os.Getenv("REMOTE_POD_URL"); v != "" {
@@ -152,6 +217,9 @@ func (s *State) Endpoint() (url, token string, err error) {
 		token = v
 	}
 	if url == "" {
+		if s.PodID != "" {
+			return "", "", fmt.Errorf("pod %s has no agent address yet (still starting? remote-pod status)", s.PodID)
+		}
 		return "", "", errors.New(`no pod: run remote-pod up --gpu "RTX 4090" (or set REMOTE_POD_URL for a local agent)`)
 	}
 	return url, token, nil

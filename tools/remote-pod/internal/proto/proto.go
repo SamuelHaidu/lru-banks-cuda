@@ -9,6 +9,12 @@
 //	GET  /v1/jobs                        [Job]
 //	GET  /v1/jobs/{id}                   Job
 //	WS   /v1/jobs/{id}/log?offset=N      the job's output from byte N, followed until it ends
+//	WS   /v1/signer                      the CLI signs store grants for the pod (below; see package grant)
+//
+// Signer websocket: the CLI connects and waits; the agent sends SignRequest (text, JSON) whenever something on the
+// pod needs a presigned URL, the CLI answers SignReply with the same ID (a grant, or the policy's refusal). The pod
+// itself never holds a store key. Inside the pod the agent serves POST /v1/grant {"op", "key"} on 127.0.0.1 only
+// (REMOTE_POD_GRANT_URL), answering with the grant or an error.
 //
 // Exec websocket: the client sends an ExecStart (text, JSON), then binary frames [ChanStdin]+bytes and text Control
 // messages (stdin EOF, a signal, a terminal resize). The agent sends binary frames [ChanStdout|ChanStderr]+bytes and,
@@ -61,4 +67,20 @@ type Health struct {
 	Version string `json:"version"`
 	Workdir string `json:"workdir"`
 	Jobs    int    `json:"jobs_running"`
+}
+
+// SignRequest asks the CLI for a grant (Op "get" or "put", one object Key).
+type SignRequest struct {
+	ID   uint64 `json:"id"`
+	Op   string `json:"op"`
+	Key  string `json:"key"`
+	Size int64  `json:"size,omitempty"` // an upload's exact size (the URL is signed for it)
+}
+
+// SignReply answers a SignRequest: URL valid until Expires, or Error.
+type SignReply struct {
+	ID      uint64    `json:"id"`
+	URL     string    `json:"url,omitempty"`
+	Expires time.Time `json:"expires,omitzero"`
+	Error   string    `json:"error,omitempty"`
 }

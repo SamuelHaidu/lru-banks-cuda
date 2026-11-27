@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,9 +19,12 @@ import (
 
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/agent"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/config"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/grant"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/pin"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/runpod"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/store"
 	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/ui"
+	"github.com/SamuelHaidu/rnn-research/tools/remote-pod/internal/vast"
 )
 
 // run streams a local command's output (docker, git).
@@ -163,53 +168,95 @@ engine/build/dist/lbc (remote-pod build). "agent" is the train image without lbc
 }
 
 func agentCommand() *cobra.Command {
-	var addr, workdir string
+	var addr, workdir, grantAddr string
 	cmd := &cobra.Command{
 		Use:   "agent",
 		Short: "Run the agent (the pod image's entrypoint; settings from the environment)",
 		Long: `The server inside the pod that sh, cp, sync, jobs and logs talk to. Settings from the environment, set by
 remote-pod up / train: REMOTE_POD_TOKEN (required), REMOTE_POD_IDLE_MIN, REMOTE_POD_JOB (a run to execute),
-REMOTE_POD_S3_* (R2), RUNPOD_POD_ID and RUNPOD_API_KEY (to stop the pod itself).`,
+REMOTE_POD_TAG (job logs go to jobs/<tag>/), REMOTE_POD_GRANTS (pre-issued store URLs; the rest are signed by the CLI
+over /v1/signer: the pod holds no store key), REMOTE_POD_TLS_CERT / REMOTE_POD_TLS_KEY (base64 PEM: serve HTTPS with them, vast.ai). To stop
+the pod itself: RUNPOD_POD_ID and RUNPOD_API_KEY (RunPod sets them), or CONTAINER_ID and CONTAINER_API_KEY (vast.ai).`,
 		Example: "  REMOTE_POD_TOKEN=secret remote-pod agent --addr 127.0.0.1:8080 --workdir /tmp/work   a local agent",
 		GroupID: "internal",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			idle, _ := strconv.Atoi(os.Getenv("REMOTE_POD_IDLE_MIN"))
 			stopPod := func() {
+				if id, key := os.Getenv("CONTAINER_ID"), os.Getenv("CONTAINER_API_KEY"); id != "" && key != "" { // vast.ai
+					n, err := strconv.ParseInt(id, 10, 64)
+					if err == nil {
+						err = vast.New(key).Stop(context.Background(), n)
+					}
+					if err != nil {
+						log.Printf("stopping the instance: %v", err)
+					}
+					return
+				}
 				id, key := os.Getenv("RUNPOD_POD_ID"), os.Getenv("RUNPOD_API_KEY")
 				if id == "" || key == "" {
-					log.Printf("cannot stop the pod: RUNPOD_POD_ID / RUNPOD_API_KEY not set")
+					log.Printf("cannot stop the pod: neither RUNPOD_POD_ID / RUNPOD_API_KEY nor CONTAINER_ID / CONTAINER_API_KEY set")
 					return
 				}
 				if err := runpod.New(key).Stop(context.Background(), id); err != nil {
 					log.Printf("stopping the pod: %v", err)
 				}
 			}
+			var tlsCfg *tls.Config
+			if c64, k64 := os.Getenv("REMOTE_POD_TLS_CERT"), os.Getenv("REMOTE_POD_TLS_KEY"); c64 != "" && k64 != "" {
+				cert, err1 := base64.StdEncoding.DecodeString(c64)
+				key, err2 := base64.StdEncoding.DecodeString(k64)
+				if err := errors.Join(err1, err2); err != nil {
+					return fmt.Errorf("REMOTE_POD_TLS_CERT / KEY: %w", err)
+				}
+				var err error
+				if tlsCfg, err = pin.ServerConfig(cert, key); err != nil {
+					return fmt.Errorf("REMOTE_POD_TLS_CERT / KEY: %w", err)
+				}
+			}
+			var grants []grant.Grant
+			if b64 := os.Getenv("REMOTE_POD_GRANTS"); b64 != "" {
+				raw, err := base64.StdEncoding.DecodeString(b64)
+				if err == nil {
+					err = json.Unmarshal(raw, &grants)
+				}
+				if err != nil {
+					return fmt.Errorf("REMOTE_POD_GRANTS: %w", err)
+				}
+			}
 			srv, err := agent.New(agent.Options{Addr: addr, Token: os.Getenv("REMOTE_POD_TOKEN"), Workdir: workdir,
-				IdleStop: time.Duration(idle) * time.Minute, OnIdle: stopPod})
+				IdleStop: time.Duration(idle) * time.Minute, OnIdle: stopPod, TLS: tlsCfg, GrantAddr: grantAddr,
+				Grants: grants})
 			if err != nil {
 				return err
 			}
-			if sc, ok := store.FromEnv(); ok {
+			// commands on the pod ask the agent for store grants here (engine/scripts/r2.py, any script)
+			_ = os.Setenv("REMOTE_POD_GRANT_URL", "http://"+grantAddr)
+			// the store through grants (no key on the pod), unless this agent was started with a key (a local agent)
+			var objs agent.Objects = agent.GrantObjects{Relay: srv.Relay()}
+			if sc, ok := store.FromEnv(); ok && sc.AccessKey != "" {
 				st, err := store.New(sc)
 				if err != nil {
 					return err
 				}
-				go srv.UploadJobLogs(context.Background(), st, 10*time.Second)
-				if b64 := os.Getenv("REMOTE_POD_JOB"); b64 != "" {
-					var spec agent.TrainSpec
-					raw, err := base64.StdEncoding.DecodeString(b64)
-					if err == nil {
-						err = json.Unmarshal(raw, &spec)
-					}
-					if err != nil {
-						return fmt.Errorf("REMOTE_POD_JOB: %w", err)
-					}
-					go func() {
-						if err := srv.RunTrain(context.Background(), st, spec); err != nil {
-							log.Printf("run %s failed before training: %v", spec.Run, err)
-						}
-					}()
+				objs = agent.StoreObjects{St: st}
+			}
+			if tag := os.Getenv("REMOTE_POD_TAG"); tag != "" {
+				go srv.UploadJobLogs(context.Background(), objs, grant.JobLogPrefix(tag), time.Minute)
+			}
+			if b64 := os.Getenv("REMOTE_POD_JOB"); b64 != "" {
+				var spec agent.TrainSpec
+				raw, err := base64.StdEncoding.DecodeString(b64)
+				if err == nil {
+					err = json.Unmarshal(raw, &spec)
 				}
+				if err != nil {
+					return fmt.Errorf("REMOTE_POD_JOB: %w", err)
+				}
+				go func() {
+					if err := srv.RunTrain(context.Background(), objs, spec); err != nil {
+						log.Printf("run %s failed before training: %v", spec.Run, err)
+					}
+				}()
 			}
 			return srv.Serve()
 		},
@@ -220,6 +267,7 @@ REMOTE_POD_S3_* (R2), RUNPOD_POD_ID and RUNPOD_API_KEY (to stop the pod itself).
 		},
 	}
 	cmd.Flags().StringVar(&addr, "addr", fmt.Sprintf(":%d", config.AgentPort), "listen address")
+	cmd.Flags().StringVar(&grantAddr, "grant-addr", "127.0.0.1:8090", "the pod-local grant endpoint (loopback only)")
 	cmd.Flags().StringVar(&workdir, "workdir", "", "the working directory (default $REMOTE_POD_WORKDIR, else /work)")
 	return cmd
 }
