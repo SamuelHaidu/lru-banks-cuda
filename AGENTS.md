@@ -46,6 +46,9 @@ model create --run-name Y --init-from X [--init-checkpoint best]              # 
 - **Config keys that matter here:**
   - `data.batch_size` / `data.micro_batch_size`: gradient accumulation, the exact mean gradient over the whole batch.
   - `data.random_windows`, `data.epoch_passes`.
+  - C++ engine: `data.stream_chunks` K > 1 = truncated BPTT (rows continue across K batches, states carried
+    detached; needs `micro_batch_size = batch_size`; validation stateless). Checks: `train_bench --carry-check`,
+    and `check_and_bench.sh` (log P60).
   - `training.dense_supervision` / `dense_validation`.
   - `training.lr_decay_start` / `lr_decay_steps` / `lr_min_ratio`: warmup-stable-decay.
   - `training.checkpoint_every`.
@@ -165,6 +168,11 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
 - The last pod (`51d0e5uzmw5mf3`) no longer exists (found 2026-11-20); everything needed is local.
 - **GPU choice for the pipeline work:** RTX 4090 (Ada sm_89: FP8, 72 MB L2, 165 bf16 TFLOPS, $0.34/hr community when
   in stock) or a 48 GB Ada card. The earlier runs used an RTX A5000 (Ampere, 111 bf16 TFLOPS, 6 MB L2, no FP8).
+- **A100 40 GB (vast.ai, ~$0.47/hr, log P61):** the 47M model runs 349 ms per step at 128 x 512 with
+  `runtime.ce_chunk` 4096 (404 ms at the default 256; the 4090 trains it at ~305 ms). Its case is memory: a 2x model
+  (~100M, est. ~30 GiB at 128 x 512) fits there and not on the 4090, since truncated BPTT allows no micro-batches.
+  Build with `-DCMAKE_CUDA_ARCHITECTURES=80`. vast.ai: `vastai` CLI, key in `~/.config/vastai`, ssh with
+  `~/.ssh/id_ed25519`; `remote-pod` does not drive it.
 
 ## Findings to keep in mind (details and numbers: `docs/agents-reference.md`)
 
@@ -175,6 +183,14 @@ pass per epoch, or `epoch_passes` of one), targets -1 at document ends and outsi
     1 x 64 and 4 x 16).
   - LRU keys encode the last ~3-4 tokens in order.
   - Banks learn MQAR / induction in ~200 steps where one GDN layer needs 600-800.
+- **Repetition loops (log A30-A32):** the banks are an associative copy memory; under maximum likelihood each
+  repetition makes the next more likely (self-reinforcement; the LRU alone cannot copy). The models are calibrated
+  on real text; loops come from free-running generation plus truncated sampling (top-k 50 triples repeated 4-grams).
+  Use top-p 0.95 at T 1.0 (`lbc generate --top-k 0 --temperature 1 --top-p 0.95`, or `--rep-penalty 1.1`), and
+  train with `training.unlikelihood` 0.5 (-30% loops for +0.8% loss on the 47M model at 600M tokens, log A33).
+- **Optimizer: Muon** (`training.optimizer` "muon", `muon_lr_scale` 1, log T44): on the 47M finewiki model it beats
+  AdamW by 0.10-0.16 nats at equal tokens (200M, same lr thanks to the 0.2 sqrt(max) scaling) for ~2.5% more time
+  per step. Use it for new runs; seeds and longer horizons are still to measure.
 - **Gates:** sigmoid gates left alone stay open (the LRU input gate in the needle test: 0.894 on filler vs 0.905 on
   keys; the `rope-state-memory` write gate saturated open). Any skip / sparse gate needs a sparsity pressure (budget,
   L0 / L1, or capacity).
