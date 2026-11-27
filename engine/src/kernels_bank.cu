@@ -245,11 +245,27 @@ __device__ __forceinline__ void step_state(float (&Kb)[DH],
     }
 }
 
-// the state at the start of chunk c (zero for the first chunk)
+// a row's carried slot states (truncated BPTT), [B][H][ckpt_fields(dh)][SLOTS]
+template <int DH>
+__device__ __forceinline__ size_t init_offset(int b, int h, int H) {
+    return (size_t(b) * H + h) * ckpt_fields_t<DH>() * SLOTS;
+}
+
+template <int DH>
+__device__ __forceinline__ void
+load_init(const BankWrites& w, int b, int h, int m, float (&Kb)[DH], float (&Vb)[DH], float& Zs, int& tm) {
+    float tmf = NAN;
+    ckpt_load(w.init + init_offset<DH>(b, h, w.H), m, Kb, Vb, Zs, tmf);
+    tm = __float_as_int(tmf);
+}
+
+// the state at the start of chunk c (the first chunk's: the carried one, else zero)
 template <int DH>
 __device__ __forceinline__ void
 chunk_start(const BankWrites& w, int b, int h, int c, int m, float (&Kb)[DH], float (&Vb)[DH], float& Zs, int& tm) {
-    if (c == 0) {
+    if (c == 0 && w.init != nullptr) {
+        load_init(w, b, h, m, Kb, Vb, Zs, tm);
+    } else if (c == 0) {
 #pragma unroll
         for (int d = 0; d < DH; ++d) { Kb[d] = Vb[d] = 0.f; }
         Zs = 0.f;
@@ -298,8 +314,12 @@ __global__ void __launch_bounds__(SLOTS)
     const float la = w.loga[h * SLOTS + m];
     float Kb[DH], Vb[DH], Zs = 0.f;
     int tm = 0;
+    if (w.init != nullptr) {  // state(0): the carried one
+        load_init(w, b, h, m, Kb, Vb, Zs, tm);
+    } else {
 #pragma unroll
-    for (int d = 0; d < DH; ++d) { Kb[d] = Vb[d] = 0.f; }
+        for (int d = 0; d < DH; ++d) { Kb[d] = Vb[d] = 0.f; }
+    }
     for (int c = 0; c + 1 < nc; ++c) {
         float LK[DH], LV[DH], LZ = NAN, ltmf = NAN;
         ckpt_load(local + ckpt_offset<DH>(b, h, c, H, nc), m, LK, LV, LZ, ltmf);
@@ -571,6 +591,13 @@ __global__ void __launch_bounds__(SLOTS) k_bank_rewalk(BankWrites w, BankRead rd
 #pragma unroll
         for (int i = 0; i < NWARP; ++i) { tot += s_tau[i]; }
         atomicAdd(rd.dlog_tau + h, tot * tau);
+    }
+    // truncated BPTT: the row's state after its last token, on the next row's clock (its t = 0 is this row's T); a
+    // slot unwritten for ~2^30 tokens keeps that age (its decayed mass underflows to 0 long before)
+    if (rd.final_state != nullptr && t1 == T) {
+        const int tn = tm - T;
+        ckpt_store(rd.final_state + init_offset<DH>(b, h, H), m, Kb, Vb, Zs,
+                   __int_as_float(tn < -(1 << 30) ? -(1 << 30) : tn));
     }
 }
 

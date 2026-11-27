@@ -210,7 +210,11 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
                                                  const float* __restrict__ lp_old,
                                                  float tis_cap,
                                                  float clip_low,
-                                                 float clip_high) {
+                                                 float clip_high,
+                                                 const int* __restrict__ cand,
+                                                 int nc,
+                                                 float ul,
+                                                 float* __restrict__ ul_sum) {
     float inv_n = *inv_n_ptr;
     __shared__ float sh[32];
     const size_t row = blockIdx.x;
@@ -253,11 +257,41 @@ __global__ void __launch_bounds__(256) k_ce_rows(const float* __restrict__ logit
         }
         inv_n *= wt;
     }
+    // token-level unlikelihood (Welleck et al. 2019): ul * -sum_c log(1 - p_c) over the row's candidates C (tokens
+    // already in the document, the target excluded); d/dz_j = [j in C] p_j / (1 - p_j) - p_j S, S = sum_c p_c / (1 -
+    // p_c)
+    const int* cr = (cand != nullptr && ul > 0.f) ? cand + row * size_t(nc) : nullptr;
+    float S = 0.f;
+    if (cr != nullptr) {
+        float s1 = 0.f, s2 = 0.f;
+        for (int i = threadIdx.x; i < nc; i += blockDim.x) {
+            const int c = cr[i];
+            if (c >= 0) {
+                const float pc = fminf(__expf(l[c] - m) * inv, 1.f - 1e-6f);
+                s1 += pc / (1.f - pc);
+                s2 -= log1pf(-pc);
+            }
+        }
+        S = block_sum(s1, sh);
+        const float u = block_sum(s2, sh);
+        if (threadIdx.x == 0 && ul_sum != nullptr) { atomicAdd(ul_sum, u * inv_n); }
+    }
     if (d != nullptr) {
         for (int j = threadIdx.x; j < V; j += blockDim.x) {
-            float p = __expf(l[j] - m) * inv;
-            if (j == target) { p -= 1.f; }
-            d[j] = __float2bfloat16(p * inv_n);
+            const float pj = __expf(l[j] - m) * inv;
+            float g = pj - ul * pj * S;  // ul * S = 0 without candidates
+            if (j == target) { g -= 1.f; }
+            d[j] = __float2bfloat16(g * inv_n);
+        }
+        if (cr != nullptr) {
+            __syncthreads();  // the candidates' entries get their own term (distinct tokens, none the target)
+            for (int i = threadIdx.x; i < nc; i += blockDim.x) {
+                const int c = cr[i];
+                if (c >= 0) {
+                    const float pc = fminf(__expf(l[c] - m) * inv, 1.f - 1e-6f);
+                    d[c] = __float2bfloat16((pc - ul * pc * S + ul * pc / (1.f - pc)) * inv_n);
+                }
+            }
         }
     }
     if (threadIdx.x == 0) {
@@ -302,6 +336,7 @@ __global__ void k_adamw(float* __restrict__ p,
     }
     const float scale = (clip > 0.f && norm > clip) ? clip / (norm + 1e-6f) : 1.f;
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        if (decay[i] == 2u) { continue; }  // a Muon parameter (muon_apply)
         const float gi = g[i] * scale;
         const float mi = b1 * m[i] + (1.f - b1) * gi;
         const float vi = b2 * v[i] + (1.f - b2) * gi * gi;
@@ -314,6 +349,65 @@ __global__ void k_adamw(float* __restrict__ p,
 }
 
 __global__ void k_increment(int* x) { ++*x; }
+
+// Muon, one block (rows x cols at row stride ld): m = mu m + g', x = bf16(g' + mu m) (Nesterov), with g' the clipped
+// gradient; ||x||^2 into *norm. A non-finite gradient norm: nothing (muon_apply skips the update as well).
+__global__ void k_muon_prep(const float* __restrict__ g,
+                            float* __restrict__ m,
+                            bf16* __restrict__ x,
+                            int rows,
+                            int cols,
+                            int ld,
+                            float mu,
+                            const float* __restrict__ gsq,
+                            float clip,
+                            float* __restrict__ norm) {
+    const float gn = sqrtf(*gsq);
+    if (!isfinite(gn)) { return; }
+    const float scale = (clip > 0.f && gn > clip) ? clip / (gn + 1e-6f) : 1.f;
+    const size_t n = size_t(rows) * cols;
+    float ss = 0.f;
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t j = (i / cols) * size_t(ld) + (i % cols);
+        const float gi = g[j] * scale;
+        const float mi = mu * m[j] + gi;
+        m[j] = mi;
+        const bf16 u = __float2bfloat16(gi + mu * mi);
+        x[i] = u;
+        const float uf = __bfloat162float(u);
+        ss += uf * uf;
+    }
+    ss = warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) { atomicAdd(norm, ss); }
+}
+
+__global__ void k_muon_normalize(bf16* __restrict__ x, size_t n, const float* __restrict__ norm) {
+    const float inv = 1.f / (sqrtf(*norm) + 1e-7f);
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        x[i] = __float2bfloat16(__bfloat162float(x[i]) * inv);
+    }
+}
+
+__global__ void k_muon_apply(float* __restrict__ p,
+                             const bf16* __restrict__ o,
+                             int rows,
+                             int cols,
+                             int ld,
+                             Schedule sched,
+                             float wd,
+                             float rms,
+                             float lr_scale,
+                             const int* __restrict__ step,
+                             const float* __restrict__ gsq) {
+    if (!isfinite(sqrtf(*gsq))) { return; }
+    const float lr = lr_scale * schedule_lr(sched, *step - 1);
+    const size_t n = size_t(rows) * cols;
+    for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        const size_t j = (i / cols) * size_t(ld) + (i % cols);
+        const float pj = p[j];
+        p[j] = pj - lr * (wd * pj + rms * __bfloat162float(o[i]));
+    }
+}
 
 __global__ void k_prep_weight(const float* __restrict__ W,
                               const float* __restrict__ gain,
@@ -549,9 +643,13 @@ void ce_rows(const float* logits,
              const float* lp_old,
              float tis_cap,
              float clip_low,
-             float clip_high) {
+             float clip_high,
+             const int* cand,
+             int nc,
+             float ul,
+             float* ul_sum) {
     k_ce_rows<<<rows, 256, 0, s>>>(logits, y, dlogits, loss_sum, correct_sum, V, inv_n, row_loss, w, lp_old, tis_cap,
-                                   clip_low, clip_high);
+                                   clip_low, clip_high, cand, nc, ul, ul_sum);
     LBC_CUDA(cudaGetLastError());
 }
 
@@ -582,6 +680,43 @@ void adamw(float* p,
 
 void increment(int* x, cudaStream_t s) {
     k_increment<<<1, 1, 0, s>>>(x);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void muon_prep(const float* g,
+               float* m,
+               bf16* x,
+               int rows,
+               int cols,
+               int ld,
+               float mu,
+               const float* gsq,
+               float clip,
+               float* norm,
+               cudaStream_t s) {
+    k_muon_prep<<<blocks_for(size_t(rows) * cols), 256, 0, s>>>(g, m, x, rows, cols, ld, mu, gsq, clip, norm);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void muon_normalize(bf16* x, size_t n, const float* norm, cudaStream_t s) {
+    k_muon_normalize<<<blocks_for(n), 256, 0, s>>>(x, n, norm);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void muon_apply(float* p,
+                const bf16* o,
+                int rows,
+                int cols,
+                int ld,
+                const Schedule& sched,
+                float wd,
+                float rms,
+                float lr_scale,
+                const int* step,
+                const float* gsq,
+                cudaStream_t s) {
+    k_muon_apply<<<blocks_for(size_t(rows) * cols), 256, 0, s>>>(p, o, rows, cols, ld, sched, wd, rms, lr_scale, step,
+                                                                 gsq);
     LBC_CUDA(cudaGetLastError());
 }
 

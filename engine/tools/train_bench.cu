@@ -10,6 +10,11 @@
 //               [--grad-report]  (the profiled step's gradient norm per tensor, largest first)
 //               [--set section.key=value ...]   (any config.json key, e.g. arch_params.tied_embeddings=false,
 //                               arch_params.hops=[2,1]; applied after the flags above)
+//               [--carry-check]  (truncated BPTT, with --set data.stream_chunks=2 or more: two consecutive rows of T
+//                               with the state carried from the first against one row of 2T, the loss of the second
+//                               half; equal when the carried state is the true continuation)
+// With data.stream_chunks > 1 the loader streams rows (truncated BPTT) and --dump also writes each layer's carried
+// state (the dumped step's start, so use --dump-after 1 or more): tests/check_grads.py starts from it.
 
 #include <algorithm>
 #include <cmath>
@@ -37,7 +42,7 @@ struct Args {
     int dump_after = 0;
     int steps = 30, warmup = 5, batch = 64, seq = 512, layers = 4, ce_chunk = 256, bank_chunk = 512;
     float gate_w = 2.f, gate_r = 2.f, lr = 2e-3f, budget = 0.f;
-    bool tiny = false, gate_report = false, graph = true, grad_report = false;
+    bool tiny = false, gate_report = false, graph = true, grad_report = false, carry_check = false;
     float budget_target = 0.5f;
     uint64_t seed = 1;
     std::vector<std::pair<std::string, std::string>> sets;
@@ -90,6 +95,8 @@ Args parse(int argc, char** argv) {
             a.gate_report = true;
         } else if (k == "--grad-report") {
             a.grad_report = true;
+        } else if (k == "--carry-check") {
+            a.carry_check = true;
         } else if (k == "--no-graph") {
             a.graph = false;
         } else if (k == "--budget-target") {
@@ -127,7 +134,14 @@ std::vector<T> download(const T* d, size_t n) {
     return h;
 }
 
-void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_t s) {
+// carried: per layer the LRU and slot states the dumped step started from (truncated BPTT; empty without)
+void dump(const std::string& dir,
+          Model& model,
+          const HostBatch& hb,
+          cudaStream_t s,
+          const std::vector<std::vector<float>>& carried,
+          int nc = 0,
+          float ul = 0.f) {
     const Config& c = model.config();
     std::filesystem::create_directories(dir);
     float loss = 0.f;
@@ -144,7 +158,13 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
         for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slots_of(l); }
         f << "\nslot_hl_max_layers ";
         for (int l = 0; l < c.L; ++l) { f << ((l != 0) ? "," : "") << c.slot_hl_max_of(l); }
-        f << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\n";
+        f << "\nloss " << loss << "\nn_targets " << hb.n_targets << "\ncarry " << int(c.carry) << "\nfields "
+          << ckpt_fields(c.dh) << "\nul_nc " << nc << "\nul_weight " << ul << "\n";
+    }
+    if (nc > 0) { write_bin(dir + "/cand.bin", hb.cand, size_t(c.B) * c.T * size_t(nc)); }
+    for (size_t i = 0; i < carried.size(); ++i) {  // layer i / 2: 0 the LRU's h0, 1 the slot states
+        write_bin(dir + "/l" + std::to_string(i / 2) + (i % 2 == 0 ? "_h0.bin" : "_binit.bin"), carried[i].data(),
+                  carried[i].size());
     }
     {
         std::ofstream f(dir + "/manifest.txt");
@@ -166,6 +186,138 @@ void dump(const std::string& dir, Model& model, const HostBatch& hb, cudaStream_
         write_bin(p + "gr2.bin", gr2.data(), gr2.size());
     }
     std::printf("dumped to %s (loss %.6f)\n", dir.c_str(), loss);
+}
+
+// --carry-check: batches 0 and 1 of a stream through a carrying model (forward_backward: the carry is updated in the
+// backward), then the same rows joined into one row of 2T through a model without carry and with the same weights,
+// scoring only the second half. The losses match when the carried LRU and slot states and the first key are the true
+// continuation; they differ only by rounding (GEMMs of another height, which can flip a gate near its threshold).
+int carry_check(const Config& c1, const TokenFile& file, uint64_t seed, int stream) {
+    if (!c1.carry) {
+        std::fprintf(stderr, "--carry-check needs --set data.stream_chunks=2 (or more)\n");
+        return 2;
+    }
+    cudaStream_t s = nullptr;
+    LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    const int B = c1.B, T = c1.T;
+    const size_t n1 = size_t(B) * T;
+    int *d_ids = nullptr, *d_y = nullptr;
+    uint8_t* d_reset = nullptr;
+    float* d_inv = nullptr;
+    LBC_CUDA(cudaMalloc(&d_ids, 2 * n1 * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_y, 2 * n1 * sizeof(int)));
+    LBC_CUDA(cudaMalloc(&d_reset, 2 * n1));
+    LBC_CUDA(cudaMalloc(&d_inv, sizeof(float)));
+    const Batch batch{d_ids, d_y, d_reset, d_inv};
+    std::vector<int> ids[2], ys[2];
+    std::vector<uint8_t> rs[2];
+    float inv1 = 0.f;
+    int targets1 = 0;
+    Loader ld(file, B, T, seed, 0, 0, -1, -1, false, 3, {}, stream);
+    Model m1(c1, seed);
+    for (int k = 0; k < 2; ++k) {
+        HostBatch* hb = ld.next();
+        ids[k].assign(hb->ids, hb->ids + n1);
+        ys[k].assign(hb->y, hb->y + n1);
+        rs[k].assign(hb->reset, hb->reset + n1);
+        inv1 = *hb->inv_n;
+        targets1 = hb->n_targets;
+        LBC_CUDA(cudaMemcpy(d_ids, ids[k].data(), n1 * sizeof(int), cudaMemcpyHostToDevice));
+        LBC_CUDA(cudaMemcpy(d_y, ys[k].data(), n1 * sizeof(int), cudaMemcpyHostToDevice));
+        LBC_CUDA(cudaMemcpy(d_reset, rs[k].data(), n1, cudaMemcpyHostToDevice));
+        LBC_CUDA(cudaMemcpy(d_inv, &inv1, sizeof(float), cudaMemcpyHostToDevice));
+        ld.release(hb, s);
+        m1.forward_backward(batch, s);
+    }
+    LBC_CUDA(cudaStreamSynchronize(s));
+    float r1[2] = {0.f, 0.f};  // loss, accuracy
+    LBC_CUDA(cudaMemcpy(r1, m1.metrics_device(), sizeof(r1), cudaMemcpyDeviceToHost));
+
+    Config c2 = c1;
+    c2.carry = false;
+    c2.T = 2 * T;
+    Model m2(c2, seed);
+    LBC_CUDA(cudaMemcpy(m2.params(), m1.params(), m1.num_params() * sizeof(float), cudaMemcpyDeviceToDevice));
+    m2.prepare_weights(s);
+    std::vector<int> ids2(2 * n1), y2(2 * n1);
+    std::vector<uint8_t> rs2(2 * n1);
+    for (int b = 0; b < B; ++b) {
+        for (int k = 0; k < 2; ++k) {
+            const size_t src = size_t(b) * T, dst = size_t(b) * 2 * T + size_t(k) * T;
+            std::copy_n(ids[k].begin() + long(src), T, ids2.begin() + long(dst));
+            std::copy_n(rs[k].begin() + long(src), T, rs2.begin() + long(dst));
+            if (k == 0) {
+                std::fill_n(y2.begin() + long(dst), T, -1);  // the first half is context only
+            } else {
+                std::copy_n(ys[1].begin() + long(src), T, y2.begin() + long(dst));
+            }
+        }
+    }
+    LBC_CUDA(cudaMemcpy(d_ids, ids2.data(), 2 * n1 * sizeof(int), cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_y, y2.data(), 2 * n1 * sizeof(int), cudaMemcpyHostToDevice));
+    LBC_CUDA(cudaMemcpy(d_reset, rs2.data(), 2 * n1, cudaMemcpyHostToDevice));
+    m2.forward_loss(batch, s);
+    LBC_CUDA(cudaStreamSynchronize(s));
+    float r2[2] = {0.f, 0.f};
+    LBC_CUDA(cudaMemcpy(r2, m2.metrics_device(), sizeof(r2), cudaMemcpyDeviceToHost));
+    const double rel = std::abs(double(r1[0]) - double(r2[0])) / std::max(1e-12, std::abs(double(r2[0])));
+    std::printf("carry check: %d rows, T %d, bank chunk %d, %d targets in the second half\n", B, T, c1.bank_chunk,
+                targets1);
+    std::printf("  carried (2 x %d): loss %.6f  accuracy %.5f\n  one row (%d):    loss %.6f  accuracy %.5f\n", T, r1[0],
+                r1[1], 2 * T, r2[0], r2[1]);
+    // An untrained model's loss barely depends on the context; the keys and reads of every layer do. Relative L2
+    // distance to the one-row model over the second half of the first B / 2 rows, for the carrying model and for a
+    // control without any carry: the same 2T rows through a model of B / 2 rows (other GEMM heights). Rounding alone
+    // (a few bf16 ulps flipping top-2 routes and gates near their thresholds) moves the control as much; a wrong
+    // carry would move the carrying model by O(1) from layer 0 on.
+    Config c3 = c2;
+    c3.B = B / 2;
+    Model m3(c3, seed);
+    LBC_CUDA(cudaMemcpy(m3.params(), m1.params(), m1.num_params() * sizeof(float), cudaMemcpyDeviceToDevice));
+    m3.prepare_weights(s);
+    m3.forward_loss(batch, s);  // the first B / 2 rows of the joined batch
+    LBC_CUDA(cudaStreamSynchronize(s));
+    const auto HD = size_t(c1.HD());
+    double worst = 0.0, worst_ctl = 0.0;
+    const char* names[5] = {"q1", "q2", "read 1", "read 2", "keys"};
+    std::printf("  relative distance to the one-row model, carried / control without carry:\n");
+    for (int n = 0; n < c1.L; ++n) {
+        std::printf("  layer %d:", n);
+        for (const int which : {4, 2, 3}) {
+            const std::vector<bf16> x1 = m1.download_read(n, which, s), x2 = m2.download_read(n, which, s),
+                                    x3 = m3.download_read(n, which, s);
+            if (x1.empty()) { continue; }
+            double d1 = 0.0, d3 = 0.0, nn = 0.0;
+            for (int b = 0; b < B / 2; ++b) {
+                for (int t = 0; t < T; ++t) {
+                    for (size_t j = 0; j < HD; ++j) {
+                        const size_t at = (size_t(b) * 2 * T + T + t) * HD + j;
+                        const double u = __bfloat162float(x1[(size_t(b) * T + t) * HD + j]);
+                        const double v = __bfloat162float(x2[at]), w = __bfloat162float(x3[at]);
+                        d1 += (u - v) * (u - v);
+                        d3 += (w - v) * (w - v);
+                        nn += v * v;
+                    }
+                }
+            }
+            const double r1d = std::sqrt(d1 / std::max(nn, 1e-30)), r3d = std::sqrt(d3 / std::max(nn, 1e-30));
+            worst = std::max(worst, r1d);
+            worst_ctl = std::max(worst_ctl, r3d);
+            std::printf("  %s %.2e / %.2e", names[which], r1d, r3d);
+        }
+        std::printf("\n");
+    }
+    // the carried model may not be farther from the one-row model than rounding moves the control (2x margin, and an
+    // absolute floor for layers where the control happens to round identically)
+    const bool ok = rel < 2e-3 && worst < std::max(2.0 * worst_ctl, 2e-2);
+    std::printf("%s (relative loss difference %.2e, tolerance 2e-3; largest activation distance %.2e, control %.2e)\n",
+                ok ? "PASS" : "FAIL", rel, worst, worst_ctl);
+    LBC_CUDA(cudaFree(d_ids));
+    LBC_CUDA(cudaFree(d_y));
+    LBC_CUDA(cudaFree(d_reset));
+    LBC_CUDA(cudaFree(d_inv));
+    LBC_CUDA(cudaStreamDestroy(s));
+    return ok ? 0 : 1;
 }
 
 }  // namespace
@@ -211,18 +363,23 @@ static int run(int argc, char** argv) {
     const Config c = rc.model_config();
 
     TokenFile const file(a.data);
-    Loader loader(file, c.B, c.T, a.seed);
+    const int stream = std::max(1, rc.data.stream_chunks);
+    if (a.carry_check) { return carry_check(c, file, a.seed, stream); }
+    const int nc = rc.training.unlikelihood > 0 ? rc.training.unlikelihood_candidates : 0;
+    const auto ul = float(rc.training.unlikelihood);
+    Loader loader(file, c.B, c.T, a.seed, 0, 0, -1, -1, false, 3, {}, stream, nc);
     Model model(c, a.seed);
     cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const size_t ntok = size_t(c.B) * c.T;
-    int *d_ids = nullptr, *d_y = nullptr;
+    int *d_ids = nullptr, *d_y = nullptr, *d_cand = nullptr;
     uint8_t* d_reset = nullptr;
     float* d_inv_n = nullptr;
     LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
     LBC_CUDA(cudaMalloc(&d_ids, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_y, ntok * sizeof(int)));
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
+    if (nc > 0) { LBC_CUDA(cudaMalloc(&d_cand, ntok * size_t(nc) * sizeof(int))); }
 
     size_t free_b = 0, total_b = 0;
     LBC_CUDA(cudaMemGetInfo(&free_b, &total_b));
@@ -241,7 +398,13 @@ static int run(int argc, char** argv) {
         LBC_CUDA(cudaMemcpyAsync(d_y, hb->y, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_reset, hb->reset, ntok, cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_inv_n, hb->inv_n, sizeof(float), cudaMemcpyHostToDevice, s));
-        const Batch b{d_ids, d_y, d_reset, d_inv_n};
+        Batch b{d_ids, d_y, d_reset, d_inv_n};
+        if (nc > 0) {
+            LBC_CUDA(cudaMemcpyAsync(d_cand, hb->cand, ntok * size_t(nc) * sizeof(int), cudaMemcpyHostToDevice, s));
+            b.cand = d_cand;
+            b.nc = nc;
+            b.ul = ul;
+        }
         return b;
     };
 
@@ -256,9 +419,16 @@ static int run(int argc, char** argv) {
         HostBatch* hb = loader.next();
         HostBatch const keep = *hb;  // the pinned buffers stay valid until the slot is refilled (after this run)
         const Batch b = copy_batch(hb);
+        std::vector<std::vector<float>> carried;  // the step's starting states: it overwrites them
+        if (c.carry) {
+            for (int l = 0; l < c.L; ++l) {
+                carried.push_back(model.carried(l, 0, s));
+                carried.push_back(model.carried(l, 1, s));
+            }
+        }
         model.forward_backward(b, s);
         LBC_CUDA(cudaStreamSynchronize(s));
-        dump(a.dump, model, keep, s);
+        dump(a.dump, model, keep, s, carried, nc, ul);
         loader.release(hb, s);
         return 0;
     }

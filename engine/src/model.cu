@@ -4,6 +4,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <utility>
 
 #include "kernels.hpp"
@@ -75,6 +76,37 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
             x.b2b = add(l + "b2b", 1, D, false);
         }
         li_.push_back(x);
+    }
+    if (c.muon) {
+        // the hidden matrices, each projection of a fused matrix on its own (Wa = [LRU input | value], Ws = [key |
+        // query | gates], Wq2 = [query 2 | gate]): the gate columns, the embedding and every vector keep AdamW
+        const int HDm = H * c.dh;
+        auto whole = [&](int t) {
+            if (t >= 0) { muon_blocks_.push_back({tensors_[size_t(t)].off, tensors_[size_t(t)].rows,
+                                                  tensors_[size_t(t)].cols, tensors_[size_t(t)].cols}); }
+        };
+        auto part = [&](int t, int col0, int ncols) {
+            const Tensor& tt = tensors_[size_t(t)];
+            muon_blocks_.push_back({tt.off + size_t(col0), tt.rows, ncols, tt.cols});
+        };
+        for (const LayerIdx& x : li_) {
+            part(x.Wa, 0, c.S2());
+            part(x.Wa, c.S2(), HDm);
+            part(x.Ws, 0, HDm);
+            part(x.Ws, HDm, HDm);
+            if (x.Wq2 >= 0) { part(x.Wq2, 0, HDm); }
+            for (const int t : {x.Wo, x.Wo2, x.W1, x.W2, x.W1b, x.W2b}) { whole(t); }
+        }
+        size_t most = 0, side = 0;
+        for (const MuonBlock& b : muon_blocks_) {
+            most = std::max(most, size_t(b.rows) * b.cols);
+            side = std::max(side, size_t(std::min(b.rows, b.cols)));
+        }
+        mx_ = alloc<bf16>(most);
+        mx2_ = alloc<bf16>(most);
+        ma_ = alloc<bf16>(side * side);
+        mb_ = alloc<bf16>(side * side);
+        mnorm_ = alloc<float>(muon_blocks_.size());
     }
     P_ = alloc<float>(n_);
     G_ = alloc<float>(n_);
@@ -153,6 +185,16 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
         a.info = alloc<uint2>(size_t(M) * H);
         a.zpre = alloc<float>(size_t(M) * H * 2);
         a.ckpt = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
+        if (c.carry) {  // empty until the first step writes them (that step's rows start with a reset)
+            const size_t init_floats = size_t(c.B) * H * ckpt_fields(c.dh) * SLOTS;
+            a.h0 = alloc<float>(size_t(c.B) * S2);
+            a.sb0 = alloc<bf16>(size_t(c.B) * S2);
+            a.G0 = alloc<bf16>(size_t(c.B) * HD);
+            a.binit = alloc<float>(init_floats);
+            LBC_CUDA(cudaMemset(a.h0, 0, size_t(c.B) * S2 * sizeof(float)));
+            LBC_CUDA(cudaMemset(a.sb0, 0, size_t(c.B) * S2 * sizeof(bf16)));
+            LBC_CUDA(cudaMemset(a.binit, 0, init_floats * sizeof(float)));
+        }
         la_.push_back(a);
     }
     const int Mc = std::min(c.ce_chunk, M);
@@ -201,6 +243,12 @@ Model::Model(const Config& c, uint64_t seed) : c_(c) {
     LBC_CUDA(cudaMemset(step_, 0, sizeof(int)));
     carry_ = nchunks > 1 ? alloc<float>(ckpt_floats) : nullptr;
     cflags_ = nchunks > 1 ? alloc<int>(size_t(c.B) * H * nchunks) : nullptr;
+    if (c.carry) {
+        dG0_ = alloc<bf16>(size_t(c.B) * HD);
+        // one chunk per row: the re-walk writes the final states over binit in place (each block reads its own
+        // record first); more chunks: the first chunk's blocks still read binit while the last chunk's write
+        if (nchunks > 1) { bfinal_ = alloc<float>(size_t(c.B) * H * ckpt_fields(c.dh) * SLOTS); }
+    }
     init(seed);
 }
 
@@ -277,6 +325,12 @@ void Model::init(uint64_t seed) {
     }
     for (const auto& t : tensors_) {
         if (t.decay) { std::fill(hd.begin() + t.off, hd.begin() + t.off + size_t(t.rows) * t.cols, 1); }
+    }
+    for (const MuonBlock& b : muon_blocks_) {
+        for (int r = 0; r < b.rows; ++r) {
+            const auto row = hd.begin() + std::ptrdiff_t(b.off + size_t(r) * b.ld);
+            std::fill(row, row + b.cols, 2);
+        }
     }
     LBC_CUDA(cudaMemcpy(P_, hp.data(), n_ * 4, cudaMemcpyHostToDevice));
     LBC_CUDA(cudaMemcpy(decay_, hd.data(), n_, cudaMemcpyHostToDevice));
@@ -381,7 +435,7 @@ BankWrites Model::writes(int n, const Batch& b) {
     const LayerA& a = la_[n];
     (void)b;
     return BankWrites{a.k,  a.PV + c_.S2(), c_.ldPV(), a.info, loga_ + size_t(n) * c_.H * SLOTS, c_.B, c_.T,
-                      c_.H, c_.bank_chunk,  a.ckpt,    c_.dh};
+                      c_.H, c_.bank_chunk,  a.ckpt,    c_.dh,  carry_now_ ? a.binit : nullptr};
 }
 
 void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
@@ -396,14 +450,19 @@ void Model::layer_fwd(int n, const Batch& b, cudaStream_t s) {
     toc(s);
     mm(s, false, false, M, c_.ldPV(), D, a.xh1, D, w.Wa, c_.ldPV(), a.PV, c_.ldPV(), Out::BF16);
     tic(s, "lru");
-    lru_fwd(a.PV, c_.ldPV(), p(x.nu), p(x.theta), b.reset, a.s, a.sb, c_.B, c_.T, c_.N, s);
+    lru_fwd(a.PV, c_.ldPV(), p(x.nu), p(x.theta), b.reset, a.s, a.sb, c_.B, c_.T, c_.N, s, carry_now_ ? a.h0 : nullptr);
     toc(s);
     mm(s, false, false, M, c_.ldG(), S2, a.sb, S2, w.Ws, c_.ldG(), Gt_, c_.ldG(), Out::BF16);
+    // truncated BPTT: the first token's k_pre from the carried state, with this step's W_k (B rows)
+    if (carry_now_) { mm(s, false, false, c_.B, HD, S2, a.sb0, S2, w.Ws, c_.ldG(), a.G0, HD, Out::BF16); }
     tic(s, "addr_fwd");
-    addr_fwd(
-        AddrFwd{Gt_,   c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q,  a.kn, a.qn,  a.ridx,
-                a.rp1, a.gw,     a.gr,    a.aw,     a.ar,     st,     a.info,  M,   c_.T, H,    c_.dh, c_.slots_of(n)},
-        s);
+    AddrFwd af{Gt_,   c_.ldG(), p(x.bk), p(x.brg), p(x.bwg), p(x.R), b.reset, a.k, a.q,  a.kn, a.qn,  a.ridx,
+               a.rp1, a.gw,     a.gr,    a.aw,     a.ar,     st,     a.info,  M,   c_.T, H,    c_.dh, c_.slots_of(n)};
+    if (carry_now_) {
+        af.G0 = a.G0;
+        af.ldG0 = HD;
+    }
+    addr_fwd(af, s);
     toc(s);
     const BankWrites bw = writes(n, b);
     if (a.ckpt != nullptr) {
@@ -514,7 +573,14 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     mm(s, false, true, M, HD, D, dhb_, D, w.Wo, D, dO1_, HD, Out::F32);
     mm(s, true, false, HD, D, M, a.o1, HD, dhb_, D, g(x.Wo), D, Out::F32, 1.f);
     tic(s, "bank_rewalk");
-    bank_rewalk(bw, BankRead{a.q, a.gr, p(x.ltau), 2, nullptr, dO1_, dq1_, dgr1_, coef1_, g(x.ltau)}, s);
+    // the last reader of this step's initial slot states: it also writes the final ones (the next step's start)
+    BankRead rw1{a.q, a.gr, p(x.ltau), 2, nullptr, dO1_, dq1_, dgr1_, coef1_, g(x.ltau)};
+    if (carry_now_) { rw1.final_state = bfinal_ != nullptr ? bfinal_ : a.binit; }
+    bank_rewalk(bw, rw1, s);
+    if (carry_now_ && bfinal_ != nullptr) {
+        LBC_CUDA(cudaMemcpyAsync(a.binit, bfinal_, size_t(c_.B) * H * ckpt_fields(c_.dh) * SLOTS * sizeof(float),
+                                 cudaMemcpyDeviceToDevice, s));
+    }
     toc(s);
     // the writes, for both reads
     tic(s, "bank_adjoint");
@@ -534,17 +600,22 @@ void Model::layer_bwd(int n, const Batch& b, cudaStream_t s) {
     if (c_.ldG() != 2 * HD + 2 * H) {  // padding columns (small widths only) must stay zero for the GEMMs
         LBC_CUDA(cudaMemsetAsync(dG_, 0, size_t(M) * c_.ldG() * sizeof(bf16), s));
     }
-    addr_bwd(AddrBwd{dk2_,     dv2_,    dr2_,     dq1_,     dgr1_,  a.gw,      dPV_ + S2,        c_.ldPV(), a.k,
-                     a.q,      a.kn,    a.qn,     a.rp1,    a.aw,   a.ar,      a.ridx,           b.reset,   p(x.R),
-                     g(x.R),   g(x.bk), g(x.brg), g(x.bwg), st,     c_.budget, c_.budget_target, count,     dG_,
-                     c_.ldG(), M,       c_.T,     H,        a.zpre, c_.dh},
-             s);
+    AddrBwd ab{dk2_,     dv2_,    dr2_,     dq1_,     dgr1_,  a.gw,      dPV_ + S2,        c_.ldPV(), a.k,
+               a.q,      a.kn,    a.qn,     a.rp1,    a.aw,   a.ar,      a.ridx,           b.reset,   p(x.R),
+               g(x.R),   g(x.bk), g(x.brg), g(x.bwg), st,     c_.budget, c_.budget_target, count,     dG_,
+               c_.ldG(), M,       c_.T,     H,        a.zpre, c_.dh};
+    if (carry_now_) { ab.dG0 = dG0_; }
+    addr_bwd(ab, s);
     toc(s);
     mm(s, false, true, M, S2, c_.ldG(), dG_, c_.ldG(), w.Ws, c_.ldG(), dS_, S2, Out::F32);
     mm(s, true, false, S2, c_.ldG(), M, a.sb, S2, dG_, c_.ldG(), g(x.Ws), c_.ldG(), Out::F32, 1.f);
+    // truncated BPTT: W_k's gradient from the first keys (the carried state itself gets none)
+    if (carry_now_) { mm(s, true, false, S2, HD, c_.B, a.sb0, S2, dG0_, HD, g(x.Ws), c_.ldG(), Out::F32, 1.f); }
     tic(s, "lru");
     lru_bwd(dS_, a.s, a.PV, c_.ldPV(), p(x.nu), p(x.theta), b.reset, dPV_, c_.ldPV(), g(x.nu), g(x.theta), c_.B, c_.T,
-            c_.N, s);
+            c_.N, s, carry_now_ ? a.h0 : nullptr);
+    // the last reader of h0 and sb0 in this step: they become the rows' last states
+    if (carry_now_) { lru_carry(a.s, a.h0, a.sb0, c_.B, c_.T, c_.N, s); }
     toc(s);
     mm(s, false, true, M, D, c_.ldPV(), dPV_, c_.ldPV(), w.Wa, c_.ldPV(), dxh_, D, Out::F32);
     mm(s, true, false, D, c_.ldPV(), M, a.xh1, D, dPV_, c_.ldPV(), dWp_, c_.ldPV(), Out::F32);
@@ -590,7 +661,8 @@ void Model::readout_loss(const Batch& b, bool backward, cudaStream_t s) {
         tic(s, "ce_softmax");
         ce_rows(logits_, b.y + r0, backward ? dlog_ : nullptr, loss_, acc_, rows, V, b.inv_n, s,
                 (row_loss_ != nullptr) ? row_loss_ + r0 : nullptr, (b.w != nullptr) ? b.w + r0 : nullptr,
-                (b.lp_old != nullptr) ? b.lp_old + r0 : nullptr, b.tis_cap, b.clip_low, b.clip_high);
+                (b.lp_old != nullptr) ? b.lp_old + r0 : nullptr, b.tis_cap, b.clip_low, b.clip_high,
+                (backward && b.cand != nullptr) ? b.cand + size_t(r0) * b.nc : nullptr, b.nc, b.ul);
         toc(s);
         if (!backward) { continue; }
         mm(s, false, false, rows, E0, V, dlog_, V, Eo, E0, dhrb_ + size_t(r0) * E0, E0, Out::BF16);
@@ -617,6 +689,11 @@ void Model::forward_backward(const Batch& b, cudaStream_t s, bool accumulate) {
         LBC_CUDA(cudaMemsetAsync(G_, 0, n_ * sizeof(float), s));
         LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));
     }
+    // micro-batches hold other rows: one carry per row set would be needed (refused by the run config)
+    if (c_.carry && accumulate) {
+        throw std::runtime_error("Model: truncated BPTT (carry) with gradient accumulation");
+    }
+    carry_now_ = c_.carry;
 
     embed_fwd(b, s);
     for (int n = 0; n < c_.L; ++n) { layer_fwd(n, b, s); }
@@ -664,7 +741,19 @@ std::vector<float> Model::readout_input(int r, cudaStream_t s) {
     return out;
 }
 
+std::vector<float> Model::carried(int n, int which, cudaStream_t s) {
+    const LayerA& a = la_[size_t(n)];
+    std::vector<float> out;
+    if (!c_.carry) { return out; }
+    out.resize(which == 0 ? size_t(c_.B) * c_.S2() : size_t(c_.B) * c_.H * ckpt_fields(c_.dh) * SLOTS);
+    LBC_CUDA(cudaMemcpyAsync(out.data(), which == 0 ? a.h0 : a.binit, out.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost, s));
+    LBC_CUDA(cudaStreamSynchronize(s));
+    return out;
+}
+
 void Model::forward_loss(const Batch& b, cudaStream_t s) {
+    carry_now_ = false;  // validation rows start fresh and leave the training carry as it is
     LBC_CUDA(cudaMemsetAsync(metrics_, 0, size_t(2 + 6 * c_.L) * sizeof(float), s));
     embed_fwd(b, s);
     for (int n = 0; n < c_.L; ++n) { layer_fwd(n, b, s); }
@@ -677,8 +766,25 @@ void Model::optimizer_step(cudaStream_t s) {
     sumsq(G_, n_, gsq_, s);
     increment(step_, s);
     adamw(P_, G_, M1_, M2_, decay_, n_, schedule(), c_.beta1, c_.beta2, c_.eps, c_.wd, step_, gsq_, c_.clip, lr_, s);
+    if (!muon_blocks_.empty()) { muon_step(s); }
     prepare_weights(s);
     toc(s);
+}
+
+// Muon on each block: m = mu m + g, u = g + mu m (Nesterov), X = u / ||u||, then muon_ns Newton-Schulz iterations
+// X <- a X + (b A + c A^2) X with A = X X^T (on the short side: X^T X and X (b A + c A^2) when rows > cols), in bf16
+// with fp32 accumulation (Jordan 2024); p -= lr (wd p + 0.2 sqrt(max(rows, cols)) X). The momentum lives in M1_.
+void Model::muon_step(cudaStream_t s) {
+    LBC_CUDA(cudaMemsetAsync(mnorm_, 0, muon_blocks_.size() * sizeof(float), s));
+    for (size_t i = 0; i < muon_blocks_.size(); ++i) {
+        const MuonBlock& b = muon_blocks_[i];
+        const int r = b.rows, cc = b.cols;
+        muon_prep(G_ + b.off, M1_ + b.off, mx_, r, cc, b.ld, c_.muon_mu, gsq_, c_.clip, mnorm_ + i, s);
+        muon_normalize(mx_, size_t(r) * cc, mnorm_ + i, s);
+        const bf16* o = newton_schulz(gemm_, mx_, mx2_, ma_, mb_, r, cc, c_.muon_ns, s);
+        muon_apply(P_ + b.off, o, r, cc, b.ld, schedule(), c_.wd, 0.2f * std::sqrt(float(std::max(r, cc))),
+                   c_.muon_lr_scale, step_, gsq_, s);
+    }
 }
 
 StepMetrics Model::decode_metrics(const float* r) const {

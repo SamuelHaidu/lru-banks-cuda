@@ -68,6 +68,9 @@ Decoder::Decoder(Model& model, int slots, int max_rows) : m_(model), slots_(slot
     LBC_CUDA(cudaMallocHost(&h_in_, R * 4 * sizeof(int) + R * sizeof(uint64_t)));
     LBC_CUDA(cudaMallocHost(&h_out_, R * sizeof(int)));
     LBC_CUDA(cudaMallocHost(&h_outf_, R * 2 * sizeof(float)));
+    // the zeroing memsets above run on the legacy default stream, which a cudaStreamNonBlocking stream (step's) does
+    // not wait for: without this, the first step's kernels race them (its embedding and slot states got wiped)
+    LBC_CUDA(cudaDeviceSynchronize());
 }
 
 Decoder::~Decoder() {

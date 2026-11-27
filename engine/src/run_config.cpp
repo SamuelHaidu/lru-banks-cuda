@@ -160,6 +160,7 @@ void visit(V& v, RC& c) {
     v("epoch_passes", c.data.epoch_passes);
     v("epoch_tokens", c.data.epoch_tokens);
     v("seed", c.data.seed);
+    v("stream_chunks", c.data.stream_chunks);
     v("validation_dataset", c.data.validation_dataset);
     v("mix_datasets", c.data.mix_datasets);
     v("mix_fractions", c.data.mix_fractions);
@@ -177,6 +178,12 @@ void visit(V& v, RC& c) {
     v("beta_2", c.training.beta_2);
     v("epsilon", c.training.epsilon);
     v("global_clipnorm", c.training.global_clipnorm);
+    v("unlikelihood", c.training.unlikelihood);
+    v("unlikelihood_candidates", c.training.unlikelihood_candidates);
+    v("optimizer", c.training.optimizer);
+    v("muon_momentum", c.training.muon_momentum);
+    v("muon_ns_steps", c.training.muon_ns_steps);
+    v("muon_lr_scale", c.training.muon_lr_scale);
     v("epochs", c.training.epochs);
     v("validation_steps", c.training.validation_steps);
     v("checkpoint_every", c.training.checkpoint_every);
@@ -258,6 +265,9 @@ void RunConfig::validate() const {
     check(data.batch_size >= 1, "data.batch_size", "must be at least 1");
     check(data.micro_batch_size == 0 || (data.micro_batch_size >= 1 && data.batch_size % data.micro_batch_size == 0),
           "data.micro_batch_size", "must be 0 or divide data.batch_size");
+    check(data.stream_chunks >= 0, "data.stream_chunks", "must be >= 0 (0 or 1: independent windows)");
+    check(data.stream_chunks <= 1 || data.micro_batch_size == 0 || data.micro_batch_size == data.batch_size,
+          "data.stream_chunks", "needs data.micro_batch_size = data.batch_size (a carry per row, no accumulation)");
     check(data.mix_datasets.size() == data.mix_fractions.size(), "data.mix_fractions",
           "needs one entry per mix dataset");
     {
@@ -295,10 +305,10 @@ void RunConfig::validate() const {
             }
         }
     }
-    for (size_t i = 0; i < training.stages.arr.size(); ++i) {
-        (void)stage_config(i);
-    }  // every key exists, every value
-       // is valid
+    check(training.stages.arr.empty() || data.epoch_tokens > 0, "data.epoch_tokens",
+          "must be set with training.stages (each stage's first update follows from the token budgets)");
+    // every stage key exists and every value is valid
+    for (size_t i = 0; i < training.stages.arr.size(); ++i) { (void)stage_config(i); }
     const TrainCfg& t = training;
     check(t.learning_rate > 0, "training.learning_rate", "must be positive");
     check(t.warmup_steps >= 0 && t.lr_decay_start >= 0 && t.lr_decay_steps >= 0, "training.warmup_steps / lr_decay_*",
@@ -312,6 +322,13 @@ void RunConfig::validate() const {
           "must be in [0, 1)");
     check(t.epsilon > 0, "training.epsilon", "must be positive");
     check(t.global_clipnorm >= 0, "training.global_clipnorm", "must be >= 0 (0 or null: off)");
+    check(t.unlikelihood >= 0, "training.unlikelihood", "must be >= 0 (0: off)");
+    check(t.unlikelihood_candidates >= 1 && t.unlikelihood_candidates <= 1024, "training.unlikelihood_candidates",
+          "must be in [1, 1024]");
+    check(t.optimizer == "adamw" || t.optimizer == "muon", "training.optimizer", R"(must be "adamw" or "muon")");
+    check(t.muon_momentum >= 0 && t.muon_momentum < 1, "training.muon_momentum", "must be in [0, 1)");
+    check(t.muon_ns_steps >= 1 && t.muon_ns_steps <= 20, "training.muon_ns_steps", "must be in [1, 20]");
+    check(t.muon_lr_scale > 0, "training.muon_lr_scale", "must be positive");
     check(t.epochs >= 1, "training.epochs", "must be at least 1");
     check(t.validation_steps >= 0, "training.validation_steps", "must be >= 0");
     check(t.checkpoint_every >= 0, "training.checkpoint_every", "must be >= 0");
@@ -336,6 +353,7 @@ Config RunConfig::model_config() const {
     c.F = ffn_dim();
     c.B = data.micro_batch_size > 0 ? data.micro_batch_size : data.batch_size;  // rows per forward/backward
     c.T = arch.window_size;
+    c.carry = data.stream_chunks > 1;
     c.bank_chunk = runtime.bank_chunk;
     c.ce_chunk = runtime.ce_chunk;
     c.lr = float(training.learning_rate);
@@ -350,6 +368,10 @@ Config RunConfig::model_config() const {
     c.beta2 = float(training.beta_2);
     c.eps = float(training.epsilon);
     c.clip = float(training.global_clipnorm);
+    c.muon = training.optimizer == "muon";
+    c.muon_mu = float(training.muon_momentum);
+    c.muon_ns = training.muon_ns_steps;
+    c.muon_lr_scale = float(training.muon_lr_scale);
     c.tau = float(arch.tau);
     c.lru_hl_min = float(arch.lru_half_life[0]);
     c.lru_hl_max = float(arch.lru_half_life[1]);

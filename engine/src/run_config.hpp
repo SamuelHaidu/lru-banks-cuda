@@ -55,6 +55,8 @@ struct DataCfg {
     double epoch_tokens = 0;         // > 0: one epoch = this many training tokens instead (whatever the dataset:
                                      // stages that change the data or the context keep their epochs comparable)
     int seed = 42;                   // data order, validation rows and the initialization
+    int stream_chunks = 0;           // > 1: truncated BPTT over streams of this many consecutive rows (Loader): the
+                                     // model carries its states from one batch to the next, detached (no micro-batches)
     std::string validation_dataset;  // val_loss on this dataset's validation split (the training dataset's own split
                                      // is then logged as val_data_loss): e.g. pretraining text during a fine-tune
     std::vector<std::string> mix_datasets;  // more training sources, each a fixed share of every batch's rows
@@ -71,6 +73,19 @@ struct TrainCfg {
     int lr_cycles = 1;  // > 1: the decay repeats lr_cycles times (each restart warms up over warmup_steps)
     double weight_decay = 0.1, beta_1 = 0.9, beta_2 = 0.999, epsilon = 1e-7;
     double global_clipnorm = 1.0;  // 0 or null: off
+    // token-level unlikelihood (Welleck et al. 2019): weight of -sum_c log(1 - p_c) over each position's candidates,
+    // the most recent `unlikelihood_candidates` distinct tokens of its document in the row, the target excluded (0:
+    // off)
+    double unlikelihood = 0.0;
+    int unlikelihood_candidates = 64;
+    // "adamw", or "muon": the hidden weight matrices (the LRU input, value, key, query and output projections and the
+    // FFNs, each projection of a fused matrix on its own) get Muon (Nesterov momentum, Newton-Schulz
+    // orthogonalization, the update scaled by 0.2 sqrt(max(rows, cols)) so learning_rate and weight_decay carry over
+    // from AdamW: Liu et al. 2025, arXiv 2502.16982); the embedding, norms, biases, decays, gates and router keep AdamW
+    std::string optimizer = "adamw";
+    double muon_momentum = 0.95;
+    int muon_ns_steps = 5;
+    double muon_lr_scale = 1.0;  // the Muon matrices' learning rate = this x learning_rate (the AdamW group's)
     int epochs = 100;
     int validation_steps = 50;  // batches of validation rows at every epoch end (0: no validation)
     int checkpoint_every = 1;   // numbered checkpoints every N epochs (0: none); latest and best always
@@ -80,8 +95,10 @@ struct TrainCfg {
     // is this config with its `set` keys changed (dotted, as `lbc config`); the run lasts the sum of the stages'
     // epochs (training.epochs is then ignored). Between stages the trainer checkpoints and resumes: weights, Adam
     // moments and the step carry over; the context, batch, data mix, learning rate and runtime may change. Of the
-    // architecture only window_size may. With constant tokens per update, the warmup-stable-decay schedule over
-    // the step count spans the whole run.
+    // architecture only window_size may. Each stage's schedule (warmup_steps, lr_decay_start, lr_decay_steps,
+    // lr_min_ratio, learning_rate) counts from the stage's first update; a later stage's warmup starts at the rate
+    // the previous stage ended at, so the curve is continuous. Stages need data.epoch_tokens (their first updates
+    // follow from the token budgets).
     json::Value stages = json::Value::array();
 };
 

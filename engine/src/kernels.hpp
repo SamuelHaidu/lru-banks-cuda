@@ -54,7 +54,11 @@ void ce_rows(const float* logits,
              const float* lp_old = nullptr,  // with w: the weight is w * min(p / exp(lp_old), tis_cap) (TIS)
              float tis_cap = 2.f,
              float clip_low = 0.f,
-             float clip_high = 0.f);  // PPO clip of the ratio (clip_high 0: off)
+             float clip_high = 0.f,      // PPO clip of the ratio (clip_high 0: off)
+             const int* cand = nullptr,  // unlikelihood: [rows][nc] candidate tokens (-1 padded), or null
+             int nc = 0,
+             float ul = 0.f,            // its weight: ul * -sum_c log(1 - p_c) is added to each row's loss
+             float* ul_sum = nullptr);  // += that term * inv_n (its mean, for the log)
 
 // -- optimizer (kernels_basic.cu) ---------------------------------------------------------------------------------
 
@@ -67,11 +71,14 @@ struct Schedule {
     float min_ratio{};
     int cosine = 0;
     int cycles = 1;  // > 1: the decay repeats (warm restarts), each restart warming up from min_ratio over `warmup`
+    int start = 0;   // the step the schedule counts from (a stage's first update)
+    float warm_from = 0.f;  // the warmup's starting fraction (a later stage: the previous stage's final min_ratio)
 };
 
 __host__ __device__ inline float schedule_lr(const Schedule& s, int step) {
+    step -= s.start;
     float frac = float(step + 1) / float(s.warmup > 1 ? s.warmup : 1);
-    frac = frac < 1.f ? frac : 1.f;
+    frac = s.warm_from + (1.f - s.warm_from) * (frac < 1.f ? frac : 1.f);
     if (s.decay_steps > 0) {
         int pos = step - s.decay_start;
         const int k = pos > 0 ? pos / s.decay_steps : 0;  // the cycle
@@ -112,6 +119,34 @@ void adamw(float* p,
            float* lr_out,
            cudaStream_t s);
 void increment(int* x, cudaStream_t s);
+// Muon (Model::muon_step), one block of rows x cols at row stride ld in the flat buffers: muon_prep updates the
+// momentum (m = mu m + g, g clipped as adamw does) and writes the Nesterov update g + mu m into x (rows x cols, bf16)
+// with ||x||^2 added to *norm; muon_normalize divides x by ||x||; muon_apply does p -= lr_scale lr (wd p + rms o), lr from the
+// schedule at the device step. A non-finite gradient norm skips the update, as in adamw.
+void muon_prep(const float* g,
+               float* m,
+               bf16* x,
+               int rows,
+               int cols,
+               int ld,
+               float mu,
+               const float* gsq,
+               float clip,
+               float* norm,
+               cudaStream_t s);
+void muon_normalize(bf16* x, size_t n, const float* norm, cudaStream_t s);
+void muon_apply(float* p,
+                const bf16* o,
+                int rows,
+                int cols,
+                int ld,
+                const Schedule& sched,
+                float wd,
+                float rms,
+                float lr_scale,
+                const int* step,
+                const float* gsq,
+                cudaStream_t s);
 // Wb = bf16(diag(gain) W) (gain may be null)
 void prep_weight(const float* W, const float* gain, bf16* Wb, int rows, int cols, cudaStream_t s);
 // From dWp = dL/d(diag(gain) W): dW += diag(gain) dWp, dgain += rowsum(W * dWp) (gain may be null: dW += dWp)
@@ -128,6 +163,8 @@ void unfold_grad(const float* dWp,
 
 // h_t = lambda h_{t-1} + gamma (P_re + i P_im), restarting at resets; lambda = exp(-exp(nu) + i theta),
 // gamma = sqrt(1 - |lambda|^2). P: columns [0, N) real, [N, 2N) imaginary, row stride ldp. s = [Re h, Im h].
+// h0: [B][2N] each row's state before its first token (truncated BPTT: the previous batch's last state), or null
+// (zero). The backward treats it as a constant: the decay gradients include its term, nothing flows into it.
 void lru_fwd(const bf16* P,
              int ldp,
              const float* nu,
@@ -138,7 +175,8 @@ void lru_fwd(const bf16* P,
              int B,
              int T,
              int N,
-             cudaStream_t st);
+             cudaStream_t st,
+             const float* h0 = nullptr);
 // dP (bf16, row stride lddp) from ds; dnu, dtheta accumulated
 void lru_bwd(const float* ds,
              const float* s,
@@ -154,7 +192,10 @@ void lru_bwd(const float* ds,
              int B,
              int T,
              int N,
-             cudaStream_t st);
+             cudaStream_t st,
+             const float* h0 = nullptr);
+// truncated BPTT: h0[b] = s[b][T - 1] (fp32) and sb0[b] = bf16 of it (the first key's GEMM operand next step)
+void lru_carry(const float* s, float* h0, bf16* sb0, int B, int T, int N, cudaStream_t st);
 
 // -- addressing: keys, queries, routing, gates (kernels_lru_addr.cu) ----------------------------------------------
 
@@ -184,6 +225,10 @@ struct AddrFwd {
     int ldGprev = 0;
     const int* map = nullptr;
     const int* tpos = nullptr;
+    // truncated BPTT: G0 [B][ldG0] holds k_pre of each row's carried state (W_k s_{-1}, this step's weights), so a
+    // row's first token has a previous state (its key, its write gate) unless it is a reset; null: it has none
+    const bf16* G0 = nullptr;
+    int ldG0 = 0;
 };
 
 void addr_fwd(const AddrFwd& a, cudaStream_t s);
@@ -213,6 +258,9 @@ struct AddrBwd {
     // the secant to the open state (see addr_bwd); null: the tangent at weight 0
     const float* zpre = nullptr;
     int dh = 32;
+    // truncated BPTT (AddrFwd::G0 set): dG0 [B][H*DH], the gradient of each row's first k_pre (every entry written:
+    // 0 at a reset); null: the first token has no previous state
+    bf16* dG0 = nullptr;
 };
 
 void addr_bwd(const AddrBwd& a, cudaStream_t s);
@@ -265,6 +313,9 @@ struct BankWrites {
     int chunk{};
     const float* ckpt{};  // [B][H][chunks][ckpt_fields(dh)][SLOTS], or null with one chunk per row
     int dh = 32;          // head size (32 or 64)
+    // truncated BPTT: [B][H][ckpt_fields(dh)][SLOTS] each row's slot states before its first token (the previous
+    // batch's final states, times relative to this row's start), or null (empty slots)
+    const float* init = nullptr;
 };
 
 inline int ckpt_fields(int dh) { return 2 * dh + 2; }  // Kb, Vb, Zs, tm (forward); LK, LV, LZ (adjoint)
@@ -287,6 +338,10 @@ struct BankRead {
     bf16* coef{};            // scratch [3][M*H*SLOTS]: the read's local gradients on each slot's K, V, Z
     float* dlog_tau{};       // [H] accumulated
     float* zpre = nullptr;   // forward (hop 1): [M][H][2] each routed slot's mass just before the write (for AddrBwd)
+    // re-walk (truncated BPTT): [B][H][ckpt_fields(dh)][SLOTS] each row's slot states after its last token, times
+    // shifted by -T (the next row's clock), written by the last chunk's blocks. May be BankWrites::init itself when a
+    // row is one chunk (each block reads its record before writing it); with more chunks it must be another buffer.
+    float* final_state = nullptr;
 };
 
 void bank_fwd(const BankWrites& w, const BankRead& r, cudaStream_t s);

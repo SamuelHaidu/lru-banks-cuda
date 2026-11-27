@@ -81,6 +81,8 @@ for line in (DUMP / "manifest.txt").read_text().split("\n"):
         P[name] = params[off:off + rows * cols].reshape(rows, cols).clone().requires_grad_(True)
         Gc[name] = grads_c[off:off + rows * cols].reshape(rows, cols)
 
+UL_NC, UL_W = int(cfg.get("ul_nc", 0)), float(cfg.get("ul_weight", 0.0))  # unlikelihood (training.unlikelihood)
+cand = read("cand.bin", torch.int32).long().reshape(B, T, UL_NC) if UL_NC > 0 else None
 ids = read("ids.bin", torch.int32).long().reshape(B, T)
 y = read("y.bin", torch.int32).long().reshape(B, T)
 reset = read("reset.bin", torch.uint8).bool().reshape(B, T)
@@ -90,6 +92,22 @@ for n in range(L):
     dec[n]["ridx"] = dec[n]["ridx"].reshape(B, T, H, 2)
     for k in ("gw", "gr", "gr2"):
         dec[n][k] = dec[n][k].reshape(B, T, H)
+
+# truncated BPTT (train_bench --dump with data.stream_chunks > 1): every layer starts from the dumped carried state, a
+# constant: the LRU's h0 [B][2N], and the slot states [B][H][2 DH + 2][SLOTS] (average key, average value, mass at the
+# last write, that write's time on this row's clock, an int)
+CARRY = bool(cfg.get("carry", 0))
+carry = []
+if CARRY:
+    FIELDS = cfg["fields"]
+    for n in range(L):
+        h0 = read(f"l{n}_h0.bin", torch.float32).double().reshape(B, 2 * N)
+        raw = read(f"l{n}_binit.bin", torch.float32).reshape(B, H, FIELDS, SLOTS)
+        tm = raw[:, :, 2 * DH + 1].contiguous().view(torch.int32).double()
+        raw = raw.double()
+        carry.append({"h0": h0, "Kb": raw[:, :, :DH].transpose(-1, -2), "Vb": raw[:, :, DH:2 * DH].transpose(-1, -2),
+                      "Zs": raw[:, :, 2 * DH], "tm": tm})
+
 
 def slot_decays(ns, hl_max):
     """Half-lives log-spaced over the layer's ns slots; slots past it (never written) keep the slowest one."""
@@ -116,12 +134,12 @@ def ste(open_, logit, mask):
     return open_.double() + (s - s.detach()) * mask.double()
 
 
-def lru(Pin, nu, theta):
+def lru(Pin, nu, theta, h0=None):
     rate = nu.exp()
     lr_, li = torch.exp(-rate) * torch.cos(theta), torch.exp(-rate) * torch.sin(theta)
     gam = torch.sqrt(-torch.expm1(-2 * rate))
-    hr = torch.zeros(B, N)
-    hi = torch.zeros(B, N)
+    hr = torch.zeros(B, N) if h0 is None else h0[:, :N]
+    hi = torch.zeros(B, N) if h0 is None else h0[:, N:]
     out = []
     for t in range(T):
         keep = (~reset[:, t]).double()[:, None]
@@ -131,18 +149,24 @@ def lru(Pin, nu, theta):
     return torch.stack(out, 1)
 
 
-def bank_reads(k, v, r1, r2, ridx, queries, gates, taus, closed, p1, slot_decay):
+def bank_reads(k, v, r1, r2, ridx, queries, gates, taus, closed, p1, slot_decay, init=None):
     """The banks of one layer (token loop) and its reads: queries / gates / taus, one per hop. A closed write gate's
     gradient is the secant to the open state: its slot weights' gradients scaled by Z / (Z + r), Z the slot's mass just
-    before the write and r the weight the write would have had (as the C++ addr_bwd)."""
+    before the write and r the weight the write would have had (as the C++ addr_bwd). init: the carried slot states,
+    as the sums they stand for at t = -1 (the mass Zs a^(-1 - tm), the averages times it)."""
     outs = [torch.zeros(B, T, H, DH) for _ in queries]
     outs = [list(torch.unbind(o.reshape(B * T * H, DH))) for o in outs]
     for b in range(B):
         for h in range(H):
-            K = torch.zeros(SLOTS, DH)
-            Vb = torch.zeros(SLOTS, DH)
-            Z = torch.zeros(SLOTS)
             a = slot_decay
+            if init is None:
+                K = torch.zeros(SLOTS, DH)
+                Vb = torch.zeros(SLOTS, DH)
+                Z = torch.zeros(SLOTS)
+            else:
+                Z = init["Zs"][b, h] * a ** (-1 - init["tm"][b, h])
+                K = init["Kb"][b, h] * Z[:, None]
+                Vb = init["Vb"][b, h] * Z[:, None]
             for t in range(T):
                 if reset[b, t]:
                     K, Vb, Z = K * 0, Vb * 0, Z * 0
@@ -181,10 +205,13 @@ def reference():
         p_ = lambda k: P[f"l{n}_{k}"]
         d = dec[n]
         PV = bf(bf(rms(h)) @ bf(p_("Wa") * p_("norm1").T))
-        s = lru(PV[..., :2 * N], p_("nu")[0], p_("theta")[0])
+        init = carry[n] if CARRY else None
+        s = lru(PV[..., :2 * N], p_("nu")[0], p_("theta")[0], init["h0"] if CARRY else None)
         G = bf(bf(s) @ bf(p_("Ws")))  # the C++ GEMM writes bf16
         kraw = G[..., :HD]
-        kprev = torch.cat([torch.zeros(B, 1, HD), kraw[:, :-1]], 1) * (~reset).double()[..., None]
+        # the first token's previous state: the carried one (its k_pre with this step's W_k), else none
+        k0 = bf(bf(init["h0"]) @ bf(p_("Ws")))[:, None, :HD] if CARRY else torch.zeros(B, 1, HD)
+        kprev = torch.cat([k0, kraw[:, :-1]], 1) * (~reset).double()[..., None]
         k = bf(normalize((kprev + p_("bk")[0]).reshape(B, T, H, DH)))
         q = bf(normalize(G[..., HD:2 * HD].reshape(B, T, H, DH)))
         ar = G[..., 2 * HD:2 * HD + H] + p_("brg")[0]
@@ -195,7 +222,7 @@ def reference():
         l2 = logits_r.gather(-1, d["ridx"][..., 1:])[..., 0]
         p1 = torch.sigmoid(l1 - l2)
         first = torch.zeros(B, T, dtype=torch.bool)
-        first[:, 0] = True
+        first[:, 0] = not CARRY  # with a carried state the first token has a previous one
         notreset = (~(reset | first))[..., None].expand(B, T, H)
         gw = ste(d["gw"], aw, notreset)
         gr = ste(d["gr"], ar, d["gr"].bool())
@@ -203,7 +230,7 @@ def reference():
         # hop 1, the FFN, then hop 2 (its query from the stream after the FFN)
         closed = d["gw"] == 0
         (o1,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q], [gr], [p_("log_tau")[0].exp()], closed, p1,
-                           slot_decays(BANK_SLOTS[n], HL_MAX[n]))
+                           slot_decays(BANK_SLOTS[n], HL_MAX[n]), init)
         h = h + bf(o1) @ bf(p_("Wo"))
         z = bf(bf(bf(rms(h)) @ bf(p_("W1") * p_("ffn_norm").T)) + p_("b1")[0])
         h = h + bf(gelu(z)) @ bf(p_("W2")) + p_("b2")[0]
@@ -214,7 +241,7 @@ def reference():
         ar2 = G2[..., HD:HD + H] + p_("brg2")[0]
         gr2 = ste(d["gr2"], ar2, d["gr2"].bool())
         (o2,) = bank_reads(k, v, gw * p1, gw * (1 - p1), d["ridx"], [q2], [gr2], [p_("log_tau2")[0].exp()], closed,
-                           p1, slot_decays(BANK_SLOTS[n], HL_MAX[n]))
+                           p1, slot_decays(BANK_SLOTS[n], HL_MAX[n]), init)
         h = h + bf(o2) @ bf(p_("Wo2"))
         if f"l{n}_W1b" in P:  # the second FFN (arch_params.hop2_ffn)
             z = bf(bf(bf(rms(h)) @ bf(p_("W1b") * p_("ffn2_norm").T)) + p_("b1b")[0])
@@ -227,7 +254,13 @@ def reference():
     logits = hr @ bf(P["E"] if TIED else P["E_out"]).T
     mask = y >= 0
     loss = torch.nn.functional.cross_entropy(logits[mask], y[mask])
-    loss.backward()
+    total = loss
+    if UL_NC > 0:  # token-level unlikelihood: ul * mean over scored positions of -sum_c log(1 - p_c)
+        p = torch.softmax(logits[mask], -1)
+        c = cand[mask]  # (n, nc), -1 padded
+        pc = p.gather(1, c.clamp_min(0)).clamp_max(1 - 1e-6) * (c >= 0).double()
+        total = loss + UL_W * (-torch.log1p(-pc)).sum(1).mean()
+    total.backward()
     return loss.item(), {k: (t.grad.clone() if t.grad is not None else torch.zeros_like(t)) for k, t in P.items()}
 
 

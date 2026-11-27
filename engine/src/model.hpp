@@ -43,15 +43,26 @@ struct Config {
     int bank_chunk = 512;  // tokens per bank-walk block (rows longer than this walk in parallel chunks)
     int ce_chunk = 256;    // loss rows per chunk: 256 x V fp32 logits + bf16 gradients (50 MB) stay in the L2
     float lr = 2e-3f, wd = 0.1f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-7f, clip = 1.f;
+    bool muon = false;  // Muon on the hidden weight matrices (Model::muon_blocks_), AdamW on the rest
+    float muon_mu = 0.95f;
+    int muon_ns = 5;            // Newton-Schulz iterations
+    float muon_lr_scale = 1.f;  // the Muon learning rate / lr
     int warmup = 0, decay_start = 0, decay_steps = 0;  // the schedule (kernels.hpp: schedule_lr)
     float min_ratio = 0.1f;
-    bool cosine = false;  // the decay's shape: half a cosine (else linear)
-    int cycles = 1;       // decay cycles (warm restarts)
+    bool cosine = false;    // the decay's shape: half a cosine (else linear)
+    int cycles = 1;         // decay cycles (warm restarts)
+    int sched_start = 0;    // the step the schedule counts from (a training stage's first update)
+    float warm_from = 0.f;  // the warmup's starting fraction of lr
     float tau = 8.f, lru_hl_min = 1.f, lru_hl_max = 16.f, slot_hl_min = 1.f, slot_hl_max = 1024.f;
     std::vector<float> slot_hl_max_layer;  // per layer, the longest slot half-life (empty: slot_hl_max everywhere)
     bool ffn2 = false;                     // 2-hop layers: a second FFN after the second read
     float gate_bias_w = 2.f, gate_bias_r = 2.f;  // initial gate logit biases (how many gates start open)
     float budget = 0.f, budget_target = 0.5f;
+    // truncated BPTT: row b of a training batch continues row b of the previous one (data.stream_chunks), so every
+    // layer carries its LRU state and slot states across forward_backward calls, detached (the forward sees the whole
+    // stream, the gradient stops at the row start). A row whose first token is a reset starts empty, exactly as
+    // without a carry. Validation (forward_loss) never uses or changes the carry. No gradient accumulation with it.
+    bool carry = false;
 
     int M() const { return B * T; }
 
@@ -99,6 +110,10 @@ struct Batch {
     const float* lp_old = nullptr;  // RL: the rollout's log-probability of each target (truncated importance weights)
     float tis_cap = 2.f;
     float clip_low = 0.f, clip_high = 0.f;  // RL: PPO clip of the ratio p / exp(lp_old) (clip_high 0: off)
+    // unlikelihood training (training.unlikelihood): [M][nc] candidate tokens per position (HostBatch::cand), weight
+    const int* cand = nullptr;
+    int nc = 0;
+    float ul = 0.f;
 };
 
 class Model {
@@ -168,6 +183,10 @@ class Model {
 
     const float* readout_table_params() { return p(c_.tied ? E_ : E_out_); }  // device, V x E0 (fp32)
 
+    // truncated BPTT (tests): layer n's carried state, the next step's start: which 0 the LRU's [B][2N], 1 the slot
+    // states [B][H][ckpt_fields(dh)][SLOTS] (the time field holds int bits)
+    std::vector<float> carried(int n, int which, cudaStream_t s);
+
     std::vector<std::pair<std::string, float>> profile_ms();
 
     // discrete decisions of layer n (tests replay them): ridx [M][H][2], gw, gr, gr2 [M][H]
@@ -197,6 +216,13 @@ class Model {
         uint2* info;
         float* zpre;  // [M][H][2] the routed slots' mass before each write (the closed write gates' gradient)
         float* ckpt;  // slot states at chunk starts (rows longer than bank_chunk), shared by forward and backward
+        // truncated BPTT (Config::carry): per row the LRU state before the first token (h0 [B][2N] fp32, sb0 its
+        // bf16), the first key's k_pre from it (G0 [B][H*DH]) and the slot states (binit, BankWrites::init); null
+        // without a carry (LayerA a{} value-initializes every member)
+        float* h0;
+        bf16* sb0;
+        bf16* G0;
+        float* binit;
     };
 
     int add(const std::string& name, int rows, int cols, bool decay);
@@ -233,7 +259,16 @@ class Model {
     std::vector<Tensor> tensors_;
     size_t n_ = 0;
     float *P_ = nullptr, *G_ = nullptr, *M1_ = nullptr, *M2_ = nullptr;
-    uint8_t* decay_ = nullptr;
+    uint8_t* decay_ = nullptr;  // per parameter: 0 AdamW, 1 AdamW with weight decay, 2 Muon (skipped by adamw)
+    // Muon: each block a rows x cols column range of a row-major tensor (row stride ld) orthogonalized on its own
+    struct MuonBlock {
+        size_t off;
+        int rows, cols, ld;
+    };
+    std::vector<MuonBlock> muon_blocks_;
+    bf16 *mx_ = nullptr, *mx2_ = nullptr, *ma_ = nullptr, *mb_ = nullptr;  // Newton-Schulz work
+    float* mnorm_ = nullptr;                                                 // per block: ||update||^2
+    void muon_step(cudaStream_t s);
     int E_, E_out_ = -1, W_in_ = -1, final_norm_, W_out_ = -1;
     std::vector<LayerIdx> li_;
     std::vector<LayerW> lw_;
@@ -248,7 +283,8 @@ class Model {
     int accum_ = 1;
 
     Schedule schedule() const {
-        return Schedule{c_.lr, c_.warmup, c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0, c_.cycles};
+        return Schedule{c_.lr,     c_.warmup,      c_.decay_start, c_.decay_steps, c_.min_ratio, c_.cosine ? 1 : 0,
+                        c_.cycles, c_.sched_start, c_.warm_from};
     }
 
     float* loga_;
@@ -266,6 +302,11 @@ class Model {
     float *metrics_, *loss_, *acc_, *stats_, *gsq_, *lr_, *carry_;
     int* step_;
     int* cflags_;
+    // truncated BPTT: the first keys' k_pre gradient [B][H*DH], and (rows of several bank chunks) the final slot
+    // states before they replace a layer's binit; carry_now_: this pass carries (forward_backward with Config::carry)
+    bf16* dG0_ = nullptr;
+    float* bfinal_ = nullptr;
+    bool carry_now_ = false;
 
     std::vector<void*> allocations_;
     bool profile_ = false;

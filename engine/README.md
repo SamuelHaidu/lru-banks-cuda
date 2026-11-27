@@ -75,7 +75,8 @@ bash scripts/train.sh /workspace/runs/NAME [--epochs N]                # backgro
 - `arch_params`: dim, embed_dim, factorized, tied_embeddings, num_layers, hops (per layer, 1 or 2), lru_dim, num_heads,
   head_dim (32 or 64), bank_slots (per layer, 2..128), ffn_mult, half-lives, tau, gate biases and budget, window_size;
 - `data`: dataset directory, batch_size, epoch_passes (an epoch = that fraction of a pass in shuffled random windows),
-  seed;
+  seed, stream_chunks (> 1: truncated BPTT, each row continues the previous batch's row for that many batches and the
+  model carries its LRU and slot states across steps, detached; no micro-batches; validation stays stateless);
 - `training`: learning_rate, warmup_steps, lr_decay_start / lr_decay_steps / lr_min_ratio, weight_decay, betas,
   epsilon, global_clipnorm, epochs, validation_steps, checkpoint_every;
 - `runtime`: bank_chunk, ce_chunk, cuda_graph.

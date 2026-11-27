@@ -49,7 +49,13 @@ struct HostBatch {
     uint8_t* reset = nullptr;  // [B * T]
     float* inv_n = nullptr;    // [1] 1 / targets (pinned, copied with the batch)
     int n_targets = 0;
+    // unlikelihood training (Loader nc > 0): [B * T][nc] per position the most recent distinct tokens of its
+    // document so far in the row (the input token included, the marker and the target excluded), -1 padded
+    int* cand = nullptr;
 };
+
+// A row's unlikelihood candidates (HostBatch::cand) from its ids / targets / resets (resets clear the list)
+void fill_candidates(const int* ids, const int* y, const uint8_t* reset, int T, int nc, int marker, int* cand);
 
 class Loader {
   public:
@@ -58,6 +64,10 @@ class Loader {
     // score_prev >= 0: only targets whose input token follows that token (a query marker) are scored
     // aligned: the file is made of whole rows of T tokens (documents never cross a row boundary): every pass cuts the
     // windows at offset 0 instead of a random one
+    // stream_chunks K > 1 (truncated BPTT): each pass cuts windows of K T tokens instead; B of them make a stream of
+    // K batches, batch k holding their k-th T tokens, so row b of a batch continues row b of the previous one. A
+    // stream's first batch, and the first batch this loader produces (a start or a resume: the model holds no
+    // carried state), mark every row's first token as a reset, so the row starts from an empty state.
     Loader(const TokenFile& file,
            int B,
            int T,
@@ -68,11 +78,17 @@ class Loader {
            int score_prev = -1,
            bool aligned = false,
            int slots = 3,
-           Span span = {});
+           Span span = {},
+           int stream_chunks = 1,
+           int nc = 0);  // unlikelihood candidates per position (0: none)
 
-    // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler
-    static size_t steps_per_pass(size_t tokens, int B, int T) {
-        return std::cmp_greater(tokens, T) ? (tokens - T) / T / B : 0;
+    int nc() const { return nc_; }
+
+    // batches of B windows in one pass (the windows that fit at any offset: (n - T) / T), as the Python sampler;
+    // with streams of K batches, whole streams only
+    static size_t steps_per_pass(size_t tokens, int B, int T, int K = 1) {
+        const size_t W = size_t(T) * size_t(K);
+        return tokens > W ? (tokens - W) / W / size_t(B) * size_t(K) : 0;
     }
 
     ~Loader();
@@ -97,7 +113,9 @@ class Loader {
     Span span_;
     bool aligned_;
     uint64_t seed_;
-    uint64_t next_batch_, pass_ = ~uint64_t(0), steps_per_pass_;
+    int stream_;  // batches per stream (1: independent windows)
+    int nc_;      // unlikelihood candidates per position
+    uint64_t next_batch_, first_batch_, pass_ = ~uint64_t(0), steps_per_pass_;
     size_t offset_ = 0;
     std::vector<uint32_t> order_;
 
@@ -135,7 +153,7 @@ class MixLoader {
   private:
     std::vector<std::unique_ptr<Loader>> src_;
     std::vector<int> rows_;
-    int T_, B_ = 0;
+    int T_, B_ = 0, nc_ = 0;
     HostBatch buf_[2];
     cudaEvent_t done_[2] = {nullptr, nullptr};
     bool recorded_[2] = {false, false};

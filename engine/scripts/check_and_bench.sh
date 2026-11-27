@@ -27,6 +27,14 @@ check slots-64,16 --set 'arch_params.bank_slots=[64,16]' "$@"
 check head-dim-64 --set arch_params.head_dim=64 "$@"
 check all-options --set arch_params.tied_embeddings=false --set arch_params.factorized=false \
     --set 'arch_params.hops=[1,2]' "$@"
+# truncated BPTT: the dumped step starts from carried states (one bank chunk per row: final states in place; four)
+check carry --set data.stream_chunks=4 --dump-after 2 "$@"
+check carry-chunks --set data.stream_chunks=4 --set runtime.bank_chunk=16 --dump-after 2 "$@"
+# the carried state is the true continuation: 2 x 512 with the carry against one row of 1024 (bank chunks of 512, 256)
+for bc in 512 256; do
+    out=$("$BIN" --data "$DATA" --set data.stream_chunks=2 --bank-chunk "$bc" --carry-check "$@" | grep -E "^(PASS|FAIL)" || true)
+    printf "carry check   bank chunk %-4s: %s\n" "$bc" "${out:-ERROR (no verdict)}"
+done
 for mode in "B1 all gates open:--gate-w 20 --gate-r 20" "B2 reads closed:--gate-w 20 --gate-r -20"; do
     name=${mode%%:*}
     args=${mode#*:}

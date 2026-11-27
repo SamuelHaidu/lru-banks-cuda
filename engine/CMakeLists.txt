@@ -60,6 +60,9 @@ target_link_libraries(train_bench PRIVATE lbc)
 add_executable(check_epilogue tools/check_epilogue.cu)
 target_link_libraries(check_epilogue PRIVATE lbc)
 
+add_executable(muon_check tools/muon_check.cu)
+target_link_libraries(muon_check PRIVATE lbc)
+
 add_executable(bench_fp8 tools/bench_fp8.cu)
 target_link_libraries(bench_fp8 PRIVATE lbc)
 

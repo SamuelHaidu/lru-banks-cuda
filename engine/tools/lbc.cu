@@ -31,6 +31,7 @@
 
 #include "../src/checkpoint.hpp"
 #include "../src/data.hpp"
+#include "../src/decode.hpp"
 #include "../src/json.hpp"
 #include "../src/model.hpp"
 #include "../src/run_config.hpp"
@@ -63,7 +64,9 @@ void usage() {
                  "  lbc dump   RUN_DIR [--checkpoint best|latest|PATH] [--split FILE] [--rows N] [--out DIR]\n"
                  "             [--silence L:H,...]\n"
                  "  lbc generate RUN_DIR --ids PROMPTS --out FILE [--tokens N] [--temperature T] [--top-k K] [--seed "
-                 "S] [--stop ID,ID]\n"
+                 "S] [--stop ID,ID] [--batch N]\n"
+                 "             [--top-p P] [--rep-penalty R]   (against loops: --top-k 0 --temperature 1 --top-p 0.95, "
+                 "log A31)\n"
                  "  lbc score  RUN_DIR --pairs FILE --out FILE [--checkpoint best|latest|PATH] [--rows N]\n");
     std::exit(2);  // NOLINT(concurrency-mt-unsafe): argument parsing, before any thread starts
 }
@@ -252,7 +255,13 @@ json::Value arch_without_window(const json::Value& config) {
 }
 
 // Trains `run` with config `rc` until epoch `total_epochs` (resuming from its checkpoint if there is one).
-int train_segment(const std::string& run, const RunConfig& rc, int total_epochs, const std::string& stage) {
+// A stage: its schedule counts from `stage_start` (its first update); `warm_from` is the warmup's starting fraction.
+int train_segment(const std::string& run,
+                  const RunConfig& rc,
+                  int total_epochs,
+                  const std::string& stage,
+                  int stage_start = 0,
+                  float warm_from = 0.f) {
     if (rc.data.dataset.empty()) { die("data.dataset is empty (lbc config " + run + " data.dataset DIR)"); }
     const DatasetMeta meta = DatasetMeta::load(rc.data.dataset);
     if (meta.vocabulary_size != rc.arch.vocabulary_size) {
@@ -289,12 +298,15 @@ int train_segment(const std::string& run, const RunConfig& rc, int total_epochs,
         return 0;
     }
 
-    Config const c = rc.model_config();
+    Config c = rc.model_config();
+    c.sched_start = stage_start;
+    c.warm_from = warm_from;
     cudaStream_t s = nullptr;
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     TokenFile const train_file(meta.train_file);
     const int batch_rows = rc.data.batch_size, accum = batch_rows / c.B;  // c.B: rows per forward/backward
-    const size_t spp = Loader::steps_per_pass(train_file.size(), batch_rows, c.T);
+    const int stream = std::max(1, rc.data.stream_chunks);                // > 1: truncated BPTT (Config::carry)
+    const size_t spp = Loader::steps_per_pass(train_file.size(), batch_rows, c.T, stream);
     if (spp == 0) { die("the train split holds less than one batch"); }
     const int spe = rc.data.epoch_tokens > 0
                         ? std::max(1, int(std::lround(rc.data.epoch_tokens / (double(batch_rows) * c.T))))
@@ -354,17 +366,18 @@ int train_segment(const std::string& run, const RunConfig& rc, int total_epochs,
         }
     }
     const uint64_t start_batch = uint64_t(initial_epoch) * uint64_t(spe);
+    const int nc = rc.training.unlikelihood > 0 ? rc.training.unlikelihood_candidates : 0;  // unlikelihood candidates
     std::vector<std::unique_ptr<TokenFile>> mix_files;
     std::vector<std::unique_ptr<Loader>> sources;
     sources.push_back(std::make_unique<Loader>(train_file, src_rows[0], c.T, seed, meta.doc_token_id, start_batch,
                                                meta.score_after_token, meta.score_prev_token, meta.row_length > 0, 3,
-                                               span_of(meta)));
+                                               span_of(meta), stream, nc));
     for (size_t i = 0; i < mix_meta.size(); ++i) {
         const DatasetMeta& m = mix_meta[i];
         mix_files.push_back(std::make_unique<TokenFile>(m.train_file));
         sources.push_back(std::make_unique<Loader>(*mix_files.back(), src_rows[i + 1], c.T, seed + 1000 * (i + 1),
                                                    m.doc_token_id, start_batch, m.score_after_token, m.score_prev_token,
-                                                   m.row_length > 0, 3, span_of(m)));
+                                                   m.row_length > 0, 3, span_of(m), stream, nc));
     }
     MixLoader loader(std::move(sources), src_rows, c.T);
     if (mixed) {
@@ -386,13 +399,22 @@ int train_segment(const std::string& run, const RunConfig& rc, int total_epochs,
     LBC_CUDA(cudaMalloc(&d_reset, ntok));
     LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
     LBC_CUDA(cudaMalloc(&d_val, 2 * sizeof(float) * size_t(std::max(1, rc.training.validation_steps * accum))));
-    const Batch batch{d_ids, d_y, d_reset, d_inv_n};
+    int* d_cand = nullptr;
+    if (nc > 0) { LBC_CUDA(cudaMalloc(&d_cand, ntok * size_t(nc) * sizeof(int))); }
+    Batch batch{d_ids, d_y, d_reset, d_inv_n};
+    batch.cand = d_cand;
+    batch.nc = nc;
+    batch.ul = float(rc.training.unlikelihood);
     auto copy_batch = [&](const HostBatch& hb, int part = 0) {  // micro-batch `part` of the batch's rows
         const size_t o = size_t(part) * ntok;
         LBC_CUDA(cudaMemcpyAsync(d_ids, hb.ids + o, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_y, hb.y + o, ntok * sizeof(int), cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_reset, hb.reset + o, ntok, cudaMemcpyHostToDevice, s));
         LBC_CUDA(cudaMemcpyAsync(d_inv_n, hb.inv_n, sizeof(float), cudaMemcpyHostToDevice, s));
+        if (d_cand != nullptr && hb.cand != nullptr) {  // validation batches have none (and the loss ignores them)
+            LBC_CUDA(cudaMemcpyAsync(d_cand, hb.cand + o * size_t(nc), ntok * size_t(nc) * sizeof(int),
+                                     cudaMemcpyHostToDevice, s));
+        }
     };
 
     cudaDeviceProp prop{};
@@ -411,6 +433,18 @@ int train_segment(const std::string& run, const RunConfig& rc, int total_epochs,
         "dataset=%s  context=%d  batch=%d (micro-batches of %d: %d per update)  steps/epoch=%d (%.3g pass, "
         "random windows)  dense supervision  epochs %d -> %d\n",
         meta.name.c_str(), c.T, batch_rows, c.B, accum, spe, double(spe) / double(spp), initial_epoch, total_epochs);
+    if (c.carry) {
+        std::printf(
+            "truncated BPTT: streams of %d rows (%d tokens of carried context), states carried across "
+            "batches, gradient over %d tokens\n",
+            stream, stream * c.T, c.T);
+    }
+    if (nc > 0) {
+        std::printf(
+            "unlikelihood: weight %g on the %d most recent distinct tokens of each position's document "
+            "(val_loss stays plain cross-entropy)\n",
+            rc.training.unlikelihood, nc);
+    }
     std::fflush(stdout);
 
     // per-step numbers: one asynchronous copy of the model's metrics record into a pinned ring after every step,
@@ -636,17 +670,28 @@ int cmd_train(int argc, char** argv) {
     const RunConfig rc = load_run_config(run);
     const int total = epochs_override > 0 ? std::min(epochs_override, rc.total_epochs()) : rc.total_epochs();
     if (rc.training.stages.arr.empty()) { return train_segment(run, rc, total, ""); }
-    int end = 0;
+    int end = 0, start_step = 0;
+    double prev_end_lr = 0;  // the learning rate the previous stage ended at (its decay's floor, or its peak)
     for (size_t i = 0; i < rc.training.stages.arr.size() && end < total; ++i) {
         const json::Value& st = rc.training.stages.arr[i];
-        end = std::min(total, end + int(st.find("epochs")->num));
+        const RunConfig sc = rc.stage_config(i);
+        const int epochs = int(st.find("epochs")->num);
+        // the stage's updates per epoch, as train_segment computes them (epoch_tokens is required with stages)
+        const int spe =
+            std::max(1, int(std::lround(sc.data.epoch_tokens / (double(sc.data.batch_size) * sc.arch.window_size))));
+        const int stage_start = start_step;
+        start_step += epochs * spe;
+        // the warmup starts at the previous stage's final rate, so the curve is continuous across stages
+        const auto stage_warm_from = float(std::min(1.0, prev_end_lr / sc.training.learning_rate));
+        prev_end_lr = sc.training.learning_rate * (sc.training.lr_decay_steps > 0 ? sc.training.lr_min_ratio : 1.0);
+        end = std::min(total, end + epochs);
         const json::Value* name = st.find("name");
         const std::string label =
             name != nullptr && name->type == json::Value::String ? name->str : std::to_string(i + 1);
         const std::string latest = run + "/model.lbc";
         const int done = fs::exists(latest) ? read_checkpoint_info(latest).epoch : 0;
         if (done >= end) { continue; }  // a stage finished before a resume
-        if (const int rc_ = train_segment(run, rc.stage_config(i), end, label); rc_ != 0) { return rc_; }
+        if (const int rc_ = train_segment(run, sc, end, label, stage_start, stage_warm_from); rc_ != 0) { return rc_; }
     }
     return 0;
 }
@@ -806,14 +851,15 @@ int cmd_dump(int argc, char** argv) {
 }
 
 // Sampling from a checkpoint: prompts as token ids (one prompt per line, space-separated; tokenize outside), each
-// continued by --tokens tokens (temperature, top-k), written one line of ids per prompt. Every step reruns the forward
-// over the window so far (the model is causal: positions after the cursor do not matter).
+// continued by up to --tokens tokens (temperature, top-k), written one line of ids per prompt. Decoded as a recurrence
+// (the incremental decoder, the training forward's arithmetic): every prompt is one row with its own state, all rows
+// step together, so a prompt of any length costs one step per token and no window cuts it.
 int cmd_generate(int argc, char** argv) {
     if (argc < 1) { usage(); }
     const std::string run = argv[0];
     std::string which = "latest", in, out;
-    int tokens = 100, topk = 50;
-    double temp = 0.8;
+    int tokens = 100, topk = 50, batch = 256;
+    double temp = 0.8, top_p = 1.0, rep_penalty = 1.0;
     uint64_t seed = 1;
     std::vector<int> stop = {0, 1};  // <bos> / <eos>: the document ends
     for (int i = 1; i < argc; ++i) {
@@ -833,13 +879,30 @@ int cmd_generate(int argc, char** argv) {
             temp = parse_double(argv[++i], "--temperature");
         } else if (a == "--top-k" && i + 1 < argc) {
             topk = parse_int(argv[++i], "--top-k");
+        } else if (a == "--top-p" && i + 1 < argc) {  // nucleus: the smallest top set holding this probability
+            top_p = parse_double(argv[++i], "--top-p");
+        } else if (a == "--rep-penalty"
+                   && i + 1 < argc) {  // CTRL: seen tokens' logits / r (positive) or x r (negative)
+            rep_penalty = parse_double(argv[++i], "--rep-penalty");
         } else if (a == "--seed" && i + 1 < argc) {
             seed = std::strtoull(argv[++i], nullptr, 10);
+        } else if (a == "--batch" && i + 1 < argc) {  // rows decoded together
+            batch = parse_int(argv[++i], "--batch");
         } else {
             usage();
         }
     }
     if (in.empty() || out.empty()) { die("generate needs --ids FILE and --out FILE"); }
+    std::vector<std::vector<int>> prompts;
+    {
+        std::ifstream fin(in);
+        for (std::string line; std::getline(fin, line);) {
+            std::vector<int> ids;
+            std::stringstream ls(line);
+            for (int x = 0; ls >> x;) { ids.push_back(x); }
+            if (!ids.empty()) { prompts.push_back(std::move(ids)); }
+        }
+    }
     const std::string path = checkpoint_path(run, which);
     const CheckpointInfo info = read_checkpoint_info(path);
     const RunConfig rc = RunConfig::from_json(info.config);
@@ -850,75 +913,138 @@ int cmd_generate(int argc, char** argv) {
     LBC_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     Model model(c, uint64_t(rc.data.seed));
     load_checkpoint(path, model, s);
-    std::vector<float> table(static_cast<size_t>(c.V) * c.E0);  // the readout table on the host
-    LBC_CUDA(cudaMemcpy(table.data(), model.readout_table_params(), table.size() * 4, cudaMemcpyDeviceToHost));
-    const int T = c.T, marker = meta.doc_token_id;
-    int *d_ids = nullptr, *d_y = nullptr;
-    uint8_t* d_reset = nullptr;
-    float* d_inv_n = nullptr;
-    LBC_CUDA(cudaMalloc(&d_ids, T * sizeof(int)));
-    LBC_CUDA(cudaMalloc(&d_y, T * sizeof(int)));
-    LBC_CUDA(cudaMalloc(&d_reset, T));
-    LBC_CUDA(cudaMalloc(&d_inv_n, sizeof(float)));
-    const std::vector<int> no_target(static_cast<size_t>(T), -1);
-    const float one = 1.f;
-    LBC_CUDA(cudaMemcpy(d_y, no_target.data(), T * sizeof(int), cudaMemcpyHostToDevice));
-    LBC_CUDA(cudaMemcpy(d_inv_n, &one, sizeof(float), cudaMemcpyHostToDevice));
+    const int V = c.V, marker = meta.doc_token_id;
+    const int rows_max = std::max(1, std::min({batch, int(prompts.size()), 1024}));
+    Decoder dec(model, rows_max, rows_max);
     std::mt19937_64 rng(seed);
-    std::ifstream fin(in);
-    std::ofstream fout(out);
-    std::string line;
-    int prompts = 0;
-    while (std::getline(fin, line)) {
-        std::vector<int> ids;
-        std::stringstream ls(line);
-        for (int x = 0; ls >> x;) { ids.push_back(x); }
-        if (ids.empty()) { continue; }
-        std::vector<int> gen;
-        for (int k = 0; k < tokens; ++k) {
-            const int len = std::min<int>(int(ids.size()), T);
-            std::vector<int> row(static_cast<size_t>(T), marker);
-            std::copy(ids.end() - len, ids.end(), row.begin());
-            std::vector<uint8_t> rst(static_cast<size_t>(T));
-            for (int t = 0; t < T; ++t) { rst[size_t(t)] = static_cast<uint8_t>(row[size_t(t)] == marker); }
-            LBC_CUDA(cudaMemcpyAsync(d_ids, row.data(), T * sizeof(int), cudaMemcpyHostToDevice, s));
-            LBC_CUDA(cudaMemcpyAsync(d_reset, rst.data(), T, cudaMemcpyHostToDevice, s));
-            model.forward_loss(Batch{d_ids, d_y, d_reset, d_inv_n}, s);
-            const std::vector<float> h = model.readout_input(len - 1, s);
-            std::vector<std::pair<float, int>> logit(static_cast<size_t>(c.V));
-            for (int v = 0; v < c.V; ++v) {
-                const float* e = table.data() + size_t(v) * c.E0;
-                float acc = 0.f;
-                for (int j = 0; j < c.E0; ++j) { acc += h[size_t(j)] * e[j]; }
-                logit[size_t(v)] = {acc, v};
-            }
-            const int K = std::min<int>(topk > 0 ? topk : c.V, c.V);
-            std::partial_sort(logit.begin(), logit.begin() + K, logit.end(), std::greater<>());
-            std::vector<double> pr(static_cast<size_t>(K));
-            double sum = 0;
-            for (int i = 0; i < K; ++i) {
-                sum += pr[size_t(i)] = std::exp((logit[size_t(i)].first - logit[0].first) / temp);
-            }
-            std::uniform_real_distribution<double> u(0.0, sum);
-            double r = u(rng);
-            int pick = logit[size_t(K - 1)].second;
-            for (int i = 0; i < K; ++i) {
-                r -= pr[size_t(i)];
-                if (r <= 0) {
-                    pick = logit[size_t(i)].second;
-                    break;
+    std::vector<std::vector<int>> gens(prompts.size());
+    std::vector<float> logits;
+    std::vector<std::pair<float, int>> cand(static_cast<size_t>(V));
+    std::vector<double> pr;
+    std::vector<int> ids, slot, tpos;
+    std::vector<uint8_t> rst;
+    const auto t0 = std::chrono::steady_clock::now();
+    long steps = 0;
+    for (size_t b0 = 0; b0 < prompts.size(); b0 += size_t(rows_max)) {
+        const int N = int(std::min(prompts.size() - b0, size_t(rows_max)));
+        auto prompt = [&](int r) -> const std::vector<int>& { return prompts[b0 + size_t(r)]; };
+        // prefill: every prompt token but the last, all rows together (a row joins while it has tokens left)
+        int lmax = 0;
+        for (int r = 0; r < N; ++r) { lmax = std::max(lmax, int(prompt(r).size()) - 1); }
+        for (int t = 0; t < lmax; ++t) {
+            ids.clear();
+            slot.clear();
+            tpos.clear();
+            rst.clear();
+            for (int r = 0; r < N; ++r) {
+                if (t < int(prompt(r).size()) - 1) {
+                    const int x = prompt(r)[size_t(t)];
+                    ids.push_back(x);
+                    slot.push_back(r);
+                    tpos.push_back(t);
+                    rst.push_back(static_cast<uint8_t>(t == 0 || x == marker));
                 }
             }
-            ids.push_back(pick);
-            gen.push_back(pick);
-            if (pick == marker || std::ranges::find(stop, pick) != stop.end()) { break; }
+            dec.step(ids.data(), slot.data(), tpos.data(), rst.data(), int(ids.size()), 1.f, nullptr, nullptr, nullptr,
+                     nullptr, s);
+            ++steps;
         }
-        for (size_t i = 0; i < gen.size(); ++i) { fout << ((i != 0u) ? " " : "") << gen[i]; }
-        fout << "\n";
-        ++prompts;
+        // generation: each live row feeds its last token and samples the next on the host (temperature, top-k)
+        std::vector<int> next(static_cast<size_t>(N)), pos(static_cast<size_t>(N)), live;
+        std::vector<uint8_t> done(static_cast<size_t>(N), 0);
+        // the repetition penalty's seen tokens per row (the prompt and what it generated)
+        std::vector<std::vector<int>> seen(rep_penalty != 1.0 ? size_t(N) : 0);
+        std::vector<std::vector<uint8_t>> seen_mark(seen.size(), std::vector<uint8_t>(size_t(V), 0));
+        auto mark = [&](int r, int tok) {
+            if (seen.empty() || tok < 0 || tok >= V || seen_mark[size_t(r)][size_t(tok)] != 0u) { return; }
+            seen_mark[size_t(r)][size_t(tok)] = 1;
+            seen[size_t(r)].push_back(tok);
+        };
+        for (int r = 0; r < N; ++r) {
+            next[size_t(r)] = prompt(r).back();
+            pos[size_t(r)] = int(prompt(r).size()) - 1;
+            for (const int x : prompt(r)) { mark(r, x); }
+        }
+        for (int k = 0; k < tokens; ++k) {
+            live.clear();
+            for (int r = 0; r < N; ++r) {
+                if (done[size_t(r)] == 0u) { live.push_back(r); }
+            }
+            if (live.empty()) { break; }
+            const int R = int(live.size());
+            ids.resize(size_t(R));
+            slot.resize(size_t(R));
+            tpos.resize(size_t(R));
+            rst.resize(size_t(R));
+            for (int j = 0; j < R; ++j) {
+                const int r = live[size_t(j)];
+                ids[size_t(j)] = next[size_t(r)];
+                slot[size_t(j)] = r;
+                tpos[size_t(j)] = pos[size_t(r)];
+                rst[size_t(j)] = static_cast<uint8_t>(pos[size_t(r)] == 0 || next[size_t(r)] == marker);
+            }
+            dec.step(ids.data(), slot.data(), tpos.data(), rst.data(), R, 1.f, nullptr, nullptr, nullptr, nullptr, s);
+            ++steps;
+            logits.resize(size_t(R) * V);
+            LBC_CUDA(
+                cudaMemcpyAsync(logits.data(), dec.logits(), logits.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+            LBC_CUDA(cudaStreamSynchronize(s));
+            for (int j = 0; j < R; ++j) {
+                const int r = live[size_t(j)];
+                const float* l = logits.data() + size_t(j) * V;
+                for (int v = 0; v < V; ++v) { cand[size_t(v)] = {l[v], v}; }
+                if (!seen.empty()) {
+                    for (const int v : seen[size_t(r)]) {
+                        float& x = cand[size_t(v)].first;
+                        x = x > 0.f ? float(x / rep_penalty) : float(x * rep_penalty);
+                    }
+                }
+                int K = std::min<int>(topk > 0 ? topk : V, V);
+                std::partial_sort(cand.begin(), cand.begin() + K, cand.end(), std::greater<>());
+                pr.resize(size_t(K));
+                double sum = 0;
+                for (int i = 0; i < K; ++i) {
+                    sum += pr[size_t(i)] = std::exp((cand[size_t(i)].first - cand[0].first) / temp);
+                }
+                if (top_p > 0.0 && top_p < 1.0) {  // keep the smallest prefix (by probability) holding top_p
+                    double acc = 0;
+                    int n = 0;
+                    while (n < K && acc < top_p * sum) { acc += pr[size_t(n++)]; }
+                    K = std::max(1, n);
+                    sum = acc;
+                }
+                std::uniform_real_distribution<double> u(0.0, sum);
+                double x = u(rng);
+                int pick = cand[size_t(K - 1)].second;
+                for (int i = 0; i < K; ++i) {
+                    x -= pr[size_t(i)];
+                    if (x <= 0) {
+                        pick = cand[size_t(i)].second;
+                        break;
+                    }
+                }
+                if (!std::isfinite(cand[0].first)) {  // no finite logits: end the row
+                    done[size_t(r)] = 1;
+                    continue;
+                }
+                gens[b0 + size_t(r)].push_back(pick);
+                mark(r, pick);
+                next[size_t(r)] = pick;
+                ++pos[size_t(r)];
+                if (std::ranges::find(stop, pick) != stop.end()) { done[size_t(r)] = 1; }
+            }
+        }
     }
-    std::printf("generated for %d prompts with %s (epoch %d), temperature %.2f, top-k %d\n", prompts, path.c_str(),
-                info.epoch, temp, topk);
+    std::ofstream fout(out);
+    for (const auto& g : gens) {
+        for (size_t i = 0; i < g.size(); ++i) { fout << ((i != 0u) ? " " : "") << g[i]; }
+        fout << "\n";
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf(
+        "generated for %zu prompts with %s (epoch %d), temperature %.2f, top-k %d, top-p %.2f, repetition penalty "
+        "%.2f: %ld decoder steps in %.1f s\n",
+        prompts.size(), path.c_str(), info.epoch, temp, topk, top_p, rep_penalty, steps, secs);
     return 0;
 }
 

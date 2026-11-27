@@ -56,7 +56,8 @@ __global__ void k_lru_fwd(const bf16* __restrict__ P,
                           bf16* __restrict__ sb,
                           int B,
                           int T,
-                          int N) {
+                          int N,
+                          const float* __restrict__ h0) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * N) { return; }
     const int b = idx / N, n = idx % N;
@@ -65,7 +66,7 @@ __global__ void k_lru_fwd(const bf16* __restrict__ P,
     float* so = s + size_t(b) * T * 2 * N;
     bf16* sbo = sb + size_t(b) * T * 2 * N;
     const uint8_t* rs = reset + size_t(b) * T;
-    float hr = 0.f, hi = 0.f;
+    float hr = h0 ? h0[size_t(b) * 2 * N + n] : 0.f, hi = h0 ? h0[size_t(b) * 2 * N + N + n] : 0.f;
     for (int t0 = 0; t0 < T; t0 += LRU_UNROLL) {
         float xr[LRU_UNROLL], xi[LRU_UNROLL];
         uint8_t rr[LRU_UNROLL];
@@ -104,12 +105,15 @@ __global__ void k_lru_bwd(const float* __restrict__ ds,
                           float* __restrict__ dtheta,
                           int B,
                           int T,
-                          int N) {
+                          int N,
+                          const float* __restrict__ h0) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * N) { return; }
     const int b = idx / N, n = idx % N;
     const LruConst c = lru_const(nu[n], theta[n]);
     const size_t S2 = 2 * size_t(N);
+    // the state before the first token: the carried one (a constant: its term enters the decay gradient only)
+    const float h0r = h0 ? h0[size_t(b) * S2 + n] : 0.f, h0i = h0 ? h0[size_t(b) * S2 + N + n] : 0.f;
     const float* dsb = ds + size_t(b) * T * S2;
     const float* sbb = s + size_t(b) * T * S2;
     const bf16* p = P + size_t(b) * T * ldp;
@@ -126,8 +130,8 @@ __global__ void k_lru_bwd(const float* __restrict__ ds,
             gi_[u] = dsb[t * S2 + N + n];
             xr[u] = __bfloat162float(p[size_t(t) * ldp + n]);
             xi[u] = __bfloat162float(p[size_t(t) * ldp + N + n]);
-            pr[u] = t > 0 ? sbb[(t - 1) * S2 + n] : 0.f;
-            pi[u] = t > 0 ? sbb[(t - 1) * S2 + N + n] : 0.f;
+            pr[u] = t > 0 ? sbb[(t - 1) * S2 + n] : h0r;
+            pi[u] = t > 0 ? sbb[(t - 1) * S2 + N + n] : h0i;
             rr[u] = rs[t];
         }
 #pragma unroll
@@ -170,13 +174,18 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
     for (int r = r0 + warp; r < r1; r += nw) {
         const int t = a.tpos ? a.tpos[r] : r % a.T;
         const bool rst = a.reset[r];
-        const bf16* gprev = a.Gprev ? a.Gprev + size_t(a.map[r]) * a.ldGprev : a.G + size_t(r - 1) * a.ldG;
+        // the previous state: row r - 1's, or at a row's first token the carried one (G0), else none
+        const bool carried = t == 0 && a.G0 != nullptr;
+        const bool prev = (t > 0 || carried) && !rst;
+        const bf16* gprev = a.Gprev   ? a.Gprev + size_t(a.map[r]) * a.ldGprev
+                            : carried ? a.G0 + size_t(r / a.T) * a.ldG0
+                                      : a.G + size_t(r - 1) * a.ldG;
         float kp[E], qp[E], ks = 0.f, qs = 0.f;
 #pragma unroll
         for (int c = 0; c < E; ++c) {
             const int d = lane + 32 * c;
             kp[c] = a.bk[h * DH + d];
-            if (t > 0 && !rst) { kp[c] += __bfloat162float(gprev[h * DH + d]); }
+            if (prev) { kp[c] += __bfloat162float(gprev[h * DH + d]); }
             qp[c] = __bfloat162float(a.G[size_t(r) * a.ldG + HD + size_t(h) * DH + d]);
             ks += kp[c] * kp[c];
             qs += qp[c] * qp[c];
@@ -235,7 +244,7 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
         if (lane == 0) {
             const float aw = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * size_t(HD) + H + h]) + a.bwg[h];
             const float ar = __bfloat162float(a.G[size_t(r) * a.ldG + 2 * size_t(HD) + h]) + a.brg[h];
-            const bool gw = !rst && t > 0 && aw > 0.f, gr = ar > 0.f;  // no write without a previous state
+            const bool gw = prev && aw > 0.f, gr = ar > 0.f;  // no write without a previous state
             a.kn[rh] = kn;
             a.qn[rh] = qn;
             a.ridx[rh * 2] = uint8_t(j1);
@@ -248,7 +257,7 @@ __global__ void __launch_bounds__(256) k_addr_fwd(AddrFwd a, int rows_per_block)
                 __float_as_uint(sigmoid(b1 - b2)));
             a.aw[rh] = aw;
             a.ar[rh] = ar;
-            if (!rst && t > 0) { sw += sigmoid(aw); }
+            if (prev) { sw += sigmoid(aw); }
             cw += gw;
             sr += sigmoid(ar);
             cr += gr;
@@ -290,6 +299,21 @@ __global__ void k_lru_step(const bf16* __restrict__ P,
     sb[size_t(r) * 2 * N + N + n] = __float2bfloat16(ni);
 }
 
+// truncated BPTT: each row's last state becomes the next batch's initial state (and its bf16 GEMM operand)
+__global__ void k_lru_carry(const float* __restrict__ s,
+                            float* __restrict__ h0,
+                            bf16* __restrict__ sb0,
+                            int B,
+                            int T,
+                            int S2) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * S2) { return; }
+    const int b = idx / S2, j = idx % S2;
+    const float v = s[(size_t(b) * T + T - 1) * S2 + j];
+    h0[idx] = v;
+    sb0[idx] = __float2bfloat16(v);
+}
+
 __global__ void k_store_rows(const bf16* __restrict__ G,
                              int ldG,
                              int cols,
@@ -324,6 +348,7 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
     for (int r = r0 + warp; r < r1; r += nw) {
         const int t = r % a.T;
         const bool rst = a.reset[r];
+        const bool prev = (t > 0 || a.dG0 != nullptr) && !rst;  // as addr_fwd: the token has a previous state
         const size_t rh = size_t(r) * H + h;
         const bool gw = a.gw[rh];
         float k[E], dk[E];
@@ -378,7 +403,11 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             const float dkp = (dk[c] - k[c] * kdk) / fmaxf(a.kn[rh], NORM_EPS);
             // k_pre at row r is G_k at row r - 1 (zero without a previous state); every G_k row gets written here:
             // row r - 1 by row r, a row's last token by itself (nothing reads it)
-            if (t > 0) { a.dG[size_t(r - 1) * a.ldG + size_t(h) * DH + d] = __float2bfloat16(rst ? 0.f : dkp); }
+            if (t > 0) {
+                a.dG[size_t(r - 1) * a.ldG + size_t(h) * DH + d] = __float2bfloat16(rst ? 0.f : dkp);
+            } else if (a.dG0 != nullptr) {  // the carried state's k_pre (W_k s_{-1}): W_s gets it, s_{-1} does not
+                a.dG0[size_t(r / a.T) * HD + size_t(h) * DH + d] = __float2bfloat16(rst ? 0.f : dkp);
+            }
             if (t == a.T - 1) { a.dG[size_t(r) * a.ldG + size_t(h) * DH + d] = __float2bfloat16(0.f); }
             atomicAdd(&dbk_s[d], dkp);
             const float dqp = (dq[c] - q[c] * qdq) / fmaxf(a.qn[rh], NORM_EPS);
@@ -390,7 +419,7 @@ __global__ void __launch_bounds__(256) k_addr_bwd(AddrBwd a, int rows_per_block)
             const float sr = sigmoid(a.ar[rh]);
             const float dar = (a.dgr[rh] + br) * sr * (1.f - sr);
             const float sw = sigmoid(a.aw[rh]);
-            const float daw = (rst || t == 0) ? 0.f : (dgw + bw) * sw * (1.f - sw);
+            const float daw = prev ? (dgw + bw) * sw * (1.f - sw) : 0.f;
             a.dG[size_t(r) * a.ldG + 2 * size_t(HD) + h] = __float2bfloat16(dar);
             a.dG[size_t(r) * a.ldG + 2 * size_t(HD) + H + h] = __float2bfloat16(daw);
             atomicAdd(&dg_s[0], dar);
@@ -526,9 +555,16 @@ void lru_fwd(const bf16* P,
              int B,
              int T,
              int N,
-             cudaStream_t st) {
+             cudaStream_t st,
+             const float* h0) {
     if ((T % LRU_UNROLL) != 0) { fail("lru_fwd", "T must be a multiple of 8", __FILE__, __LINE__); }
-    k_lru_fwd<<<(B * N + 127) / 128, 128, 0, st>>>(P, ldp, nu, theta, reset, s, sb, B, T, N);
+    k_lru_fwd<<<(B * N + 127) / 128, 128, 0, st>>>(P, ldp, nu, theta, reset, s, sb, B, T, N, h0);
+    LBC_CUDA(cudaGetLastError());
+}
+
+void lru_carry(const float* s, float* h0, bf16* sb0, int B, int T, int N, cudaStream_t st) {
+    const int S2 = 2 * N;
+    k_lru_carry<<<(B * S2 + 255) / 256, 256, 0, st>>>(s, h0, sb0, B, T, S2);
     LBC_CUDA(cudaGetLastError());
 }
 
@@ -546,8 +582,9 @@ void lru_bwd(const float* ds,
              int B,
              int T,
              int N,
-             cudaStream_t st) {
-    k_lru_bwd<<<(B * N + 127) / 128, 128, 0, st>>>(ds, s, P, ldp, nu, theta, reset, dP, lddp, dnu, dtheta, B, T, N);
+             cudaStream_t st,
+             const float* h0) {
+    k_lru_bwd<<<(B * N + 127) / 128, 128, 0, st>>>(ds, s, P, ldp, nu, theta, reset, dP, lddp, dnu, dtheta, B, T, N, h0);
     LBC_CUDA(cudaGetLastError());
 }
 

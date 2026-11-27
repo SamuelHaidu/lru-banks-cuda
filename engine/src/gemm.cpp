@@ -1,7 +1,9 @@
 #include "gemm.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 namespace lbc {
 
@@ -106,6 +108,28 @@ void Gemm::run(cudaStream_t stream,
     }
     LBC_CUBLAS(cublasLtMatmul(lt_, p.op, &alpha, B, p.a, A, p.b, &beta, D, p.d, D, p.d, &p.algo, workspace_,
                               workspace_bytes_, stream));
+}
+
+bf16* newton_schulz(Gemm& g, bf16* x, bf16* xn, bf16* wa, bf16* wb, int rows, int cols, int steps, cudaStream_t s) {
+    constexpr float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+    const int r = rows, cc = cols, k = std::min(rows, cols);
+    for (int it = 0; it < steps; ++it) {
+        if (r <= cc) {
+            g.run(s, false, true, r, r, cc, x, cc, x, cc, wa, r, Out::BF16);  // A = X X^T
+        } else {
+            g.run(s, true, false, cc, cc, r, x, cc, x, cc, wa, cc, Out::BF16);  // A = X^T X
+        }
+        LBC_CUDA(cudaMemcpyAsync(wb, wa, size_t(k) * k * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
+        g.run(s, false, false, k, k, k, wa, k, wa, k, wb, k, Out::BF16, b, c);  // B = b A + c A^2
+        LBC_CUDA(cudaMemcpyAsync(xn, x, size_t(r) * cc * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
+        if (r <= cc) {
+            g.run(s, false, false, r, cc, r, wb, r, x, cc, xn, cc, Out::BF16, a);  // X' = a X + B X
+        } else {
+            g.run(s, false, false, r, cc, cc, x, cc, wb, cc, xn, cc, Out::BF16, a);  // X' = a X + X B
+        }
+        std::swap(x, xn);
+    }
+    return x;
 }
 
 }  // namespace lbc

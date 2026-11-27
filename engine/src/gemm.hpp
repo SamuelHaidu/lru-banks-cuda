@@ -96,4 +96,10 @@ class Gemm {
     size_t workspace_bytes_ = size_t(32) << 20;
 };
 
+// Muon's orthogonalization (Jordan 2024): `steps` Newton-Schulz iterations X <- a X + (b A + c A^2) X, A = X X^T,
+// (a, b, c) = (3.4445, -4.7750, 2.0315), on the short side (A = X^T X and X <- a X + X (b A + c A^2) when rows > cols).
+// x (rows x cols, row-major, Frobenius norm <= 1) and xn are ping-pong buffers, wa and wb min(rows, cols)^2 work; bf16
+// operands with fp32 accumulation. Returns the buffer holding the result (x or xn).
+bf16* newton_schulz(Gemm& g, bf16* x, bf16* xn, bf16* wa, bf16* wb, int rows, int cols, int steps, cudaStream_t s);
+
 }  // namespace lbc
